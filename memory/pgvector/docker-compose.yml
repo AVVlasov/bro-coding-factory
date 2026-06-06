@@ -1,0 +1,22 @@
+# Postgres + pgvector for the agent vector-memory stack.
+# Local single instance; the volume lives in ./data — not committed (see .gitignore).
+
+services:
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: ${BCF_MEM_CONTAINER:-bcf-agent-memory}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bcf_agent_memory
+      POSTGRES_USER: bcf
+      POSTGRES_PASSWORD: ${BCF_PG_PASSWORD:-bcf_local_dev}
+    ports:
+      - "${BCF_PG_PORT:-5433}:5432"   # host port (default 5433) — set BCF_PG_PORT to avoid clashes
+    volumes:
+      - ./data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bcf -d bcf_agent_memory"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

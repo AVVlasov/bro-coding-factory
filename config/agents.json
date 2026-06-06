@@ -1,0 +1,18 @@
+{
+  "$comment": "Role -> agent-definition mapping. The harness invokes these by role; rename/repoint files freely. 'model' empty = inherit models.* from harness.json. The .md files are generic role templates — fill agents/PROJECT-KNOWLEDGE.md with your product specifics.",
+
+  "judge":              { "file": "agents/judge.md",                  "model": "" },
+
+  "testers": [
+    { "name": "architecture", "file": "agents/testers/architecture.md", "model": "" },
+    { "name": "api",          "file": "agents/testers/api.md",          "model": "" },
+    { "name": "performance",  "file": "agents/testers/performance.md",  "model": "" }
+  ],
+
+  "supervisor":         { "file": "agents/supervisor.md",             "model": "" },
+  "retrospector":       { "file": "agents/retrospector.md",           "model": "" },
+  "testAuthor":         { "file": "agents/test-author.md",            "model": "" },
+  "referenceDigester":  { "file": "agents/reference-digester.md",     "model": "" },
+
+  "visionCritic":       { "name": "ux-vision", "file": "agents/testers/ux-vision.md", "model": "" }
+}

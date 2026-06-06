@@ -1,0 +1,19 @@
+{
+  "_doc": "Friction triggers: edits that PAUSE the loop for human review before verify (irreversible / high-blast-radius changes). Patterns are matched against this iteration's diff (git, repo-relative paths with forward slashes). A task may opt specific paths out via a '**Triggers-allow:** a, b/**' line in its task file. Edit this list for your project.",
+
+  "bigDeletionThreshold": 50,
+
+  "pathTriggers": [
+    { "pattern": "(^|/)migrations/",                                   "reason": "DB migration",            "severity": "high" },
+    { "pattern": "^prisma/",                                           "reason": "Prisma schema/migration", "severity": "high" },
+    { "pattern": "^package\\.json$",                                   "reason": "JS deps changed",         "severity": "high" },
+    { "pattern": "(^|/)requirements\\.txt$",                           "reason": "Python deps changed",     "severity": "high" },
+    { "pattern": "(^|/)pyproject\\.toml$",                             "reason": "Python deps changed",     "severity": "high" },
+    { "pattern": "(^|/)Cargo\\.toml$",                                 "reason": "Rust deps changed",       "severity": "high" },
+    { "pattern": "(^|/)go\\.mod$",                                     "reason": "Go deps changed",         "severity": "high" },
+    { "pattern": "^\\.github/workflows/",                              "reason": "CI workflow",             "severity": "high" },
+    { "pattern": "(vite|webpack|rollup|playwright|jest|vitest)\\..*config\\.", "reason": "build/test config", "severity": "medium" },
+    { "pattern": "(^|/)Dockerfile$|(^|/)docker-compose",              "reason": "container build",         "severity": "medium" },
+    { "pattern": "^auth/|^permissions/|^roles/|(^|/)auth\\.",          "reason": "auth/permissions/roles",  "severity": "high" }
+  ]
+}

@@ -1,0 +1,38 @@
+# --- Secrets — NEVER commit ---
+.env
+*.local
+**/settings.local.json
+
+# --- Harness runtime artifacts ---
+loop/STATE.md
+loop/STATE.md.legacy-*
+loop/STOP
+loop/VERIFY-REQUEST
+loop/REVIEW.md
+loop/human-callout.md
+loop/loop.log
+loop/events.jsonl
+loop/.iter-*.out.jsonl
+loop/.iter-*.err.log
+loop/.verify/
+loop/state/STATE.json
+loop/retros/
+
+# --- Task working dirs (project-side; created at runtime) ---
+tasks/.verdicts/
+tasks/.bugs/
+tasks/CURRENT-FOCUS.md
+
+# --- Memory (data + local artifacts) ---
+memory/pgvector/data/
+memory/history/.venv/
+memory/history/*.db
+**/__pycache__/
+*.pyc
+
+# --- Node / build ---
+node_modules/
+dist/
+dist-electron/
+test-results/
+*.log

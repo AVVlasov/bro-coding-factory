@@ -1,0 +1,13 @@
+{
+  "$comment": "Connection + embedding config for the optional pgvector memory stack (memory/pgvector). The DB password is read from the environment variable named by 'password_env'; 'password_default' is a non-secret local-dev fallback only — set a real value via env for anything shared. embedding_dim MUST match the embedding model (bge-m3 = 1024).",
+  "host": "localhost",
+  "port": 5433,
+  "database": "bcf_agent_memory",
+  "user": "bcf",
+  "password_env": "BCF_PG_PASSWORD",
+  "password_default": "bcf_local_dev",
+  "schema": "agent_memory",
+  "embedding_dim": 1024,
+  "embedding_model": "text-embedding-bge-m3",
+  "embedding_endpoint": "http://localhost:1234/v1/embeddings"
+}

@@ -1,0 +1,10 @@
+{
+  "_doc": "MANDATORY deterministic checks per task — the authoritative source of the verdict. Authored OUTSIDE the agent (infra/owner); the agent cannot remove them: verify.ps1 merges these with the checks the agent proposes in VERIFY-REQUEST. This closes the 'agent writes its own plan -> trivial PASS' hole. Key = task id (matching harness.json taskIdPattern) or _default. Value = array of shell commands (exit 0 = green). Commands should cover the key DoD assertions that prove the feature — not just a type-check.",
+
+  "_default": [],
+  "_default_comment": "Add your always-on checks here, e.g. [\"npx --no-install tsc --noEmit\"]. Empty by default so a fresh clone does not fail spuriously — but an empty _default means a task with no per-task checks can PASS on the judge alone, which weakens the gate. Fill this in for real projects.",
+
+  "_example": {
+    "TASK-01": ["npx --no-install tsc --noEmit", "npm test -- TASK-01"]
+  }
+}

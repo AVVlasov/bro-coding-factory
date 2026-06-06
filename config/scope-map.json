@@ -1,0 +1,33 @@
+{
+  "_doc": "Scope maps. (1) testers: which LLM tester is relevant to which product paths — verify.ps1/loop.ps1 drops a tester from VERIFY-REQUEST when its paths were not touched by this iteration's diff (override with '# all-testers' in VERIFY-REQUEST). (2) vision: which visual slug depends on which paths — used to scope the optional visual phase. Edit both for your project; the entries below are generic examples.",
+
+  "testers": [
+    {
+      "tester": "architecture",
+      "_what_it_checks": "Layer boundaries, banned deps, orphan handlers, tech-stack drift. Structural analysis.",
+      "patterns": ["src/", "package.json", "tsconfig.json", "ARCHITECTURE.md"]
+    },
+    {
+      "tester": "api",
+      "_what_it_checks": "API/contract wiring (routes, handlers, schemas).",
+      "patterns": ["src/api/", "src/lib/ipc", "server/", "routes/"]
+    },
+    {
+      "tester": "performance",
+      "_what_it_checks": "Performance-sensitive paths.",
+      "patterns": ["src/perf/", "benchmarks/"]
+    }
+  ],
+
+  "vision": {
+    "_doc": "slug -> product paths. Slugs must match the targets of your visual test runner. If a change maps to no slug, the visual phase is skipped (incremental).",
+    "rules": [
+      { "slug": "home",     "patterns": ["src/pages/home/", "src/components/Home/"] },
+      { "slug": "settings", "patterns": ["src/pages/settings/", "src/components/Settings/"] }
+    ],
+    "shared": {
+      "_doc": "Changes under these paths touch ALL slugs (shared components, themes, layout) -> full visual run.",
+      "patterns": ["src/styles/", "src/lib/theme", "src/App.tsx", "tailwind.config", "src/index.css"]
+    }
+  }
+}

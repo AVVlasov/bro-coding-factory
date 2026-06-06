@@ -1,0 +1,74 @@
+{
+  "$comment": "Central harness config. All project-specific values live here — scripts read from this file, never hardcode. Copy and adapt for your project. No secrets here: API keys go in your environment / .env (never committed).",
+
+  "engine": "ralph",
+
+  "agent": {
+    "$comment": "Code-agent backend. {model} and {promptFile} are substituted at runtime. The prompt is also piped on stdin. To use a different backend (e.g. Claude Code) change 'command' and provide a matching stream adapter under loop/lib/adapters.",
+    "command": "opencode run --dangerously-skip-permissions --thinking --format json --model {model}",
+    "adapter": "opencode",
+    "promptStdin": true
+  },
+
+  "models": {
+    "$comment": "Model ids passed to the backend. Empty string = let the backend use its configured default.",
+    "code": "",
+    "tester": "",
+    "vision": "",
+    "judge": ""
+  },
+
+  "paths": {
+    "$comment": "Repo-relative locations. The harness dir itself is loop/ (where these scripts live).",
+    "tasks": "tasks",
+    "verdicts": "tasks/.verdicts",
+    "currentFocus": "tasks/CURRENT-FOCUS.md",
+    "bugs": "tasks/.bugs"
+  },
+
+  "productPaths": ["src"],
+  "$productPaths_comment": "Directories that count as 'product code'. Used for no-progress detection, scope-creep checks, and verify-skip. Add your source roots, e.g. [\"src\", \"app\", \"server\"].",
+
+  "taskIdPattern": "[A-Za-z][A-Za-z0-9]*-\\d+",
+  "taskIdPrefix": "TASK",
+
+  "net": {
+    "$comment": "Connectivity watchdog. Set probeHost to your model API host to enable SSE-stall + offline detection. Empty probeHost disables the net-watchdog entirely.",
+    "probeHost": "",
+    "probePort": 443
+  },
+
+  "timeouts": {
+    "iterSec": 900,
+    "streamStallSec": 150,
+    "netWaitMaxSec": 0,
+    "netStallRetryMax": 8,
+    "stepSec": 1800,
+    "silentSec": 600
+  },
+
+  "limits": {
+    "maxIterations": 40,
+    "noProgressLimit": 3,
+    "sprawlFileLimit": 40,
+    "sprawlIterLimit": 5
+  },
+
+  "judge": {
+    "name": "judge",
+    "outputSuffix": "-judge"
+  },
+
+  "features": {
+    "$comment": "Optional subsystems. Disabled by default so the loop runs with zero external deps. Enable per your setup. 'memory' requires the pgvector stack (memory/pgvector). 'vision' requires a visual test runner + a vision-capable model.",
+    "memory": false,
+    "bugSupervisor": false,
+    "hardCap": false,
+    "vision": false,
+    "visualContext": false,
+    "referenceDigest": false,
+    "redoTrigger": false
+  },
+
+  "envPrefix": "BCF"
+}
