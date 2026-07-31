@@ -14,8 +14,23 @@
 $force = $script:BcfArgs -contains '--force'
 $dry   = $script:BcfArgs -contains '--dry'
 $only  = ''
+
+# --only без значения или с чужим значением РАНЬШЕ молча означало полную установку —
+# то есть флаг сужения области делал ровно обратное тому, ради чего его написали.
+$ONLY_VALUES = @('claude', 'config', 'project')
 for ($i = 0; $i -lt $script:BcfArgs.Count; $i++) {
-    if ($script:BcfArgs[$i] -eq '--only') { $only = [string]$script:BcfArgs[$i + 1] }
+    if ($script:BcfArgs[$i] -ne '--only') { continue }
+    $only = if ($i + 1 -lt $script:BcfArgs.Count) { [string]$script:BcfArgs[$i + 1] } else { '' }
+    if (-not $only -or $only.StartsWith('-')) {
+        Write-BcfFail '--only требует значения'
+        Write-BcfNote "доступно: $($ONLY_VALUES -join ' | ')"
+        exit 2
+    }
+    if ($ONLY_VALUES -notcontains $only) {
+        Write-BcfFail "--only $only — неизвестная область"
+        Write-BcfNote "доступно: $($ONLY_VALUES -join ' | ')"
+        exit 2
+    }
 }
 
 $project = $script:BcfProject
@@ -89,14 +104,22 @@ if (-not $only -or $only -eq 'project') {
 # --- .gitignore: состояние прогонов и рабочие каталоги задач --------------------------
 $giPath = Join-Path $project '.gitignore'
 $giAdd = @('.bcf/', 'tasks/.verdicts/', 'tasks/.bugs/', 'tasks/CURRENT-FOCUS.md')
-if (-not $dry) {
-    $gi = if (Test-Path $giPath) { @(Get-Content -LiteralPath $giPath) } else { @() }
-    $missing = @($giAdd | Where-Object { $gi -notcontains $_ })
-    if ($missing.Count) {
-        $block = @('', '# --- bcf: состояние прогонов (создаётся во время работы) ---') + $missing
+$gi = if (Test-Path $giPath) { @(Get-Content -LiteralPath $giPath) } else { @() }
+$giMissing = @($giAdd | Where-Object { $gi -notcontains $_ })
+if ($giMissing.Count) {
+    # Сухой прогон обязан назвать И ЭТО. Показывать половину изменений — значит выдавать
+    # за план то, что планом не является: человек соглашается на одно, получает другое.
+    if ($dry) { $written += ".gitignore (+$($giMissing.Count) строк: $($giMissing -join ', '))" }
+    else {
+        $block = @('', '# --- bcf: состояние прогонов (создаётся во время работы) ---') + $giMissing
         Add-Content -LiteralPath $giPath -Value ($block -join "`n") -Encoding UTF8
-        $written += ".gitignore (+$($missing.Count) строк)"
+        $written += ".gitignore (+$($giMissing.Count) строк)"
     }
+}
+if ($dry) {
+    if (-not (Test-Path (Join-Path $project 'tasks')))          { $written += 'tasks/ (каталог)' }
+    if (-not (Test-Path (Join-Path $project 'tasks\.verdicts'))) { $written += 'tasks/.verdicts/ (каталог)' }
+    $written += '.bcf/project.json (карточка проекта)'
 }
 
 # --- карточка проекта -----------------------------------------------------------------
@@ -116,6 +139,26 @@ if (-not $dry) {
 Write-BcfLine "  ЗАПИСАНО  $($written.Count)" 'White'
 foreach ($w in ($written | Sort-Object)) { Write-BcfLine "    A  $w" 'Green' }
 if (-not $written.Count) { Write-BcfDim '(нечего писать)' }
+
+# Обвязка, лежащая ВНЕ .claude (старая раскладка: agents/ и hooks/ в корне). Молча
+# поставить рядом вторую копию — значит развести два набора ролей и хуков, из которых
+# правят один, а исполняется другой. Это не блокер, но человек обязан узнать об этом
+# сейчас, а не на прогоне, который пошёл по чужой роли.
+$legacyDirs = @()
+foreach ($d in @('agents', 'hooks')) {
+    $p2 = Join-Path $project $d
+    if (Test-Path $p2) {
+        $n = @(Get-ChildItem $p2 -Recurse -File -ErrorAction SilentlyContinue).Count
+        if ($n) { $legacyDirs += "$d/ ($n файлов)" }
+    }
+}
+if ($legacyDirs.Count -and -not $only) {
+    Write-Host ''
+    Write-BcfWarn "в проекте уже есть обвязка вне .claude: $($legacyDirs -join ', ')"
+    Write-BcfNote 'она осталась от старой раскладки. Роли и хуки теперь читаются из .claude/,'
+    Write-BcfNote 'то есть рядом появился ВТОРОЙ набор: правят один, исполняется другой.'
+    Write-BcfNote 'сверь их и удали лишнее; на что ссылается config/agents.json — проверь отдельно.'
+}
 
 if ($skipped.Count) {
     Write-Host ''

@@ -22,6 +22,10 @@ $memDir = Get-BcfMemoryDir
 $client = Join-Path $memDir 'pgvector\memory_client.py'
 $compose = Join-Path $memDir 'pgvector\docker-compose.yml'
 
+# Без этого диагностика клиента приходит в кодировке консоли и читается как мусор —
+# то есть теряется ровно там, где важнее всего: в сообщении о причине отказа.
+$env:PYTHONIOENCODING = 'utf-8'
+
 $sub = @($script:BcfArgs | Where-Object { $_ -notlike '-*' }) | Select-Object -First 1
 $rest = @($script:BcfArgs | Where-Object { $_ -notlike '-*' }) | Select-Object -Skip 1
 if (-not $sub) { $sub = 'status' }
@@ -78,6 +82,15 @@ switch ($sub) {
     Write-BcfTable -Headers @('что', 'сколько') -Widths @(26, 16) -Rows $rows
 
     Write-Host ''
+    # $null означает «таблицы нет», а не «нуль записей»: печатать их одинаково значит
+    # сказать «уроков 0» о базе, в которой негде их хранить, — и человек пойдёт чинить
+    # запись вместо схемы.
+    if ($null -eq $st.anti_patterns) {
+        Write-BcfFail 'таблицы уроков нет — схема не применена'
+        Write-BcfNote 'применить: bcf memory init (или memory/pgvector/init.sql руками)'
+        Write-Host ''
+        exit 1
+    }
     $ap = [int]$st.anti_patterns
     $week = $st.anti_patterns_last_7d
     if ($ap -le 1) {

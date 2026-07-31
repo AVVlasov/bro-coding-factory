@@ -73,10 +73,73 @@ foreach ($r in $survey) {
     }
 }
 
+# Бэкенды, объявленные ПРОЕКТОМ, но отсутствующие в каталоге фабрики.
+#
+# Без этого блока роль, сидящая на собственном бэкенде проекта (своя обёртка, локальная
+# модель, форк CLI), просто исчезала из вывода: doctor перебирал только знакомые имена и
+# докладывал «все роли отвечают», ни разу не взглянув на ту, которая и исполняет работу.
+$known = @((Get-BcfKnownBackends).Keys)
+$foreign = @($roleOf.Keys | Where-Object { $known -notcontains $_ })
+if ($foreign.Count) {
+    Write-Host ''
+    foreach ($b in $foreign) {
+        $entry = if ($cfg.graph.backends) { $cfg.graph.backends.PSObject.Properties[$b] } else { $null }
+        if (-not $entry) {
+            Write-BcfFail ("{0,-11} роли {1} ссылаются на бэкенд, которого НЕТ в config/harness.json → graph.backends" -f $b, ($roleOf[$b] -join ', '))
+            $bad++
+            continue
+        }
+        # Бинарь проверяем: путь в команде проекта может указывать на то, чего нет —
+        # особенно если он содержит версию сборки и приложение с тех пор обновилось.
+        $cmd = [string]$entry.Value.command
+        $exe = if ($cmd -match "^&\s*'([^']+)'") { $Matches[1] } else { ($cmd -split '\s+')[0] }
+        $ok = (Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue) -or [bool](Get-Command $exe -ErrorAction SilentlyContinue)
+        if ($ok) {
+            Write-BcfOk ("{0,-11} свой бэкенд проекта, бинарь на месте   (роли: {1})" -f $b, ($roleOf[$b] -join ', '))
+            Write-BcfNote 'его нет в каталоге фабрики: авторизацию и формат потока проверить нечем, только живой пробой.'
+            $warn++
+        } else {
+            Write-BcfFail ("{0,-11} свой бэкенд проекта, бинарь НЕ найден: {1}   (роли: {2})" -f $b, $exe, ($roleOf[$b] -join ', '))
+            $bad++
+        }
+    }
+}
+
+# То же для знакомых бэкендов: команда в конфиге проекта может указывать на путь, которого
+# уже нет (приложение обновилось — хэш сборки в пути сменился), а doctor при этом покажет
+# «✓» по бинарю, найденному в системе, но НЕ тому, который реально пропишется в узел.
+if ($cfg -and $cfg.graph -and $cfg.graph.backends) {
+    foreach ($p in $cfg.graph.backends.PSObject.Properties) {
+        if ($p.Name -eq '$comment' -or -not $roleOf.ContainsKey($p.Name)) { continue }
+        $cmd = [string]$p.Value.command
+        if ($cmd -notmatch "^&\s*'([^']+)'") { continue }
+        $pinned = $Matches[1]
+        if (-not (Test-Path -LiteralPath $pinned -ErrorAction SilentlyContinue)) {
+            Write-Host ''
+            Write-BcfFail ("{0}: в конфиге закреплён путь, которого нет: {1}" -f $p.Name, $pinned)
+            Write-BcfNote "роли $($roleOf[$p.Name] -join ', ') упрутся на первом же узле, даже если такой CLI есть в системе:"
+            Write-BcfNote 'узел запускается ИМЕННО этой командой. Обнови путь в config/harness.json → graph.backends.'
+            $bad++
+        }
+    }
+}
+
 # --- Живая проба ролей ----------------------------------------------------------------
 #
 # Здесь и только здесь тратятся токены. Один короткий запрос на роль: этого достаточно,
 # чтобы отличить «CLI отвечает» от «модель отвечает и её ответ разбирается».
+# Неназначенные роли — блокер, и он проверяется НЕЗАВИСИМО от того, гоняем ли мы живую
+# пробу. Раньше эта проверка жила в ветке else и с --no-probe не выполнялась: doctor на
+# проекте без ролей печатал «ГОТОВ» и отдавал ноль — то есть флаг «не тратить токены»
+# заодно выключал единственную проверку, которая ловит ненастроенный граф.
+if (-not $roleOf.Count) {
+    Write-Host ''
+    Write-BcfFail 'роли графа не назначены (config/harness.json → graph.roles)'
+    Write-BcfNote 'граф не знает, каким бэкендом исполнять узел, и упрётся на первом же.'
+    Write-BcfNote 'назначить: bcf init'
+    $bad++
+}
+
 if (-not $noProbe -and $roleOf.Count) {
     Write-Host ''
     Write-BcfLine '  ЖИВАЯ ПРОБА РОЛЕЙ' 'White'
@@ -92,10 +155,6 @@ if (-not $noProbe -and $roleOf.Count) {
 } elseif ($noProbe) {
     Write-Host ''
     Write-BcfDim 'живая проба пропущена (--no-probe): «бинарь есть» ещё не значит «модель отвечает».'
-} elseif (-not $roleOf.Count) {
-    Write-Host ''
-    Write-BcfWarn 'роли графа не назначены — пробовать нечего. Назначить: bcf init'
-    $warn++
 }
 
 # --- Память ---------------------------------------------------------------------------
@@ -108,6 +167,10 @@ Write-BcfLine '  ПАМЯТЬ' 'White'
 Write-Host ''
 
 $memClient = Join-Path (Get-BcfMemoryDir) 'pgvector\memory_client.py'
+
+# Без этого диагностика клиента приходит в кодировке консоли и читается как мусор —
+# то есть теряется ровно там, где важнее всего: в сообщении о причине отказа.
+$env:PYTHONIOENCODING = 'utf-8'
 $memOn = $cfg -and $cfg.features -and $cfg.features.memory
 if (-not (Test-Path $memClient)) {
     Write-BcfWarn "клиент памяти не найден: $memClient"
@@ -116,8 +179,28 @@ if (-not (Test-Path $memClient)) {
     Write-BcfDim 'выключена в config/harness.json → features.memory'
     Write-BcfNote 'без неё прогоны не учатся на прошлых ошибках: один и тот же провал повторяется каждый прогон.'
 } else {
+    # Причину отказа показываем ДОСЛОВНО и называем базу, к которой ходили. «Недоступна,
+    # поднять: bcf memory init» — совет, который чинит базу фабрики, тогда как проект мог
+    # быть настроен на собственную: человек поднимает не ту и не понимает, почему не помогло.
     $stats = ''
-    try { $stats = (& python $memClient stats 2>&1 | Out-String).Trim() } catch { $stats = '' }
+    $memErr = ''
+    try {
+        $stats = (& python $memClient stats 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { $memErr = $stats; $stats = '' }
+    } catch { $memErr = $_.Exception.Message; $stats = '' }
+
+    $memCfgPath = ''
+    foreach ($c in @((Join-Path $project 'config\memory.config.json'), (Join-Path (Get-BcfMemoryDir) 'memory.config.json'))) {
+        if (Test-Path $c) { $memCfgPath = $c; break }
+    }
+    $memWhere = ''
+    if ($memCfgPath) {
+        try {
+            $mc = Get-Content -Raw -LiteralPath $memCfgPath | ConvertFrom-Json
+            $memWhere = "$($mc.host):$($mc.port), контейнер $(if ($mc.container) { $mc.container } else { 'bcf-agent-memory' })"
+        } catch { }
+    }
+
     if ($stats -match '\{') {
         try {
             $j = $stats | ConvertFrom-Json
@@ -131,6 +214,11 @@ if (-not (Test-Path $memClient)) {
         } catch { Write-BcfOk 'доступна (счётчики не разобрались)' }
     } else {
         Write-BcfFail 'недоступна — уроки не отзываются и не пишутся, обучение выключено'
+        if ($memWhere) { Write-BcfNote "ходили в: $memWhere   (конфиг: $(Split-Path $memCfgPath -Leaf))" }
+        if ($memErr) {
+            $first = @($memErr -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+            Write-BcfNote "ответ клиента: $first"
+        }
         Write-BcfNote 'поднять: bcf memory init'
         $warn++
     }

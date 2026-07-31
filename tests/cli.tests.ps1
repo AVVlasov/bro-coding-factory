@@ -212,6 +212,29 @@ It 'повторный install не затирает правки владель
     Assert-Match $r.Out 'НЕ ТРОНУТО'
 }
 
+# Регрессия: --only без значения молча превращался в ПОЛНУЮ установку, то есть флаг
+# сужения области делал ровно обратное тому, ради чего его написали.
+It '--only без значения и с чужим значением отказывает' {
+    $p = New-Sandbox 'install-only'
+    $r1 = Bcf @('install', '--only', '--project', $p)
+    Assert-True ($r1.Code -eq 2) "ожидал отказ, получил $($r1.Code)"
+    Assert-True (-not (Test-Path (Join-Path $p 'config'))) '--only без значения поставил всё'
+
+    $r2 = Bcf @('install', '--only', 'nonsense', '--project', $p)
+    Assert-True ($r2.Code -eq 2) '--only с неизвестной областью принят молча'
+    Assert-Match $r2.Out 'claude \| config \| project'
+}
+
+# Регрессия: --dry показывал только копируемые файлы и умалчивал про .gitignore, tasks/
+# и карточку проекта — то есть выдавал за план половину изменений.
+It '--dry перечисляет и то, что не является копированием файла' {
+    $p = New-Sandbox 'install-dry-full'
+    $r = Bcf @('install', '--dry', '--project', $p)
+    Assert-Match $r.Out '\.gitignore'
+    Assert-Match $r.Out 'project\.json'
+    Assert-True (-not (Test-Path (Join-Path $p '.claude'))) 'сухой прогон записал .claude'
+}
+
 It '--dry ничего не пишет' {
     $p = New-Sandbox 'install-dry'
     $r = Bcf @('install', '--project', $p, '--dry')
