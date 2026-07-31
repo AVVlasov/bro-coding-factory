@@ -1093,6 +1093,11 @@ function Invoke-Node {
     }
 
     # 3. Сухой план: ничего не запускаем, только фиксируем намерение.
+    #
+    # ВНИМАНИЕ вызывающему графу: этот no-op спасает только от ВЫЗОВА агента. Всё, что
+    # граф делает ДО Invoke-Node — создание worktree, заявки на файлы, правки в дереве —
+    # он обязан пропускать сам, проверив $script:GraphCtx.DryPlan. Для таких мест есть
+    # Write-GraphNodePlan: строка в плане без единого побочного эффекта.
     if ($ctx.DryPlan) {
         Write-Host ("    · {0,-30} фаза={1,-12} роль={2,-8} {3} / {4}" -f $label, $phase, $Role, $rt.Backend, ($(if ($Model) { $Model } else { '(дефолт)' }))) -ForegroundColor DarkGray
         _GraphJournal @{ event = 'node-start'; key = $key; label = $label; phase = $phase; role = $Role; model = $Model; dry = $true }
@@ -1352,6 +1357,24 @@ function Invoke-Barrier {
     $srcs = @($Thunks | ForEach-Object { $_.ToString() })
     # Элемент = исходник ветки; единственная стадия просто исполняет его.
     return _GraphParallelMap -Items $srcs -Stages @({ param($v) & ([scriptblock]::Create($v)) }) -Throttle $t
+}
+
+# Строка сухого плана для шага, у которого есть побочные эффекты ВНЕ узла.
+#
+# Нужна потому, что «пропустить в сухом режиме» и «показать, что было бы» — разные
+# вещи, и без второго сухой план перестаёт быть планом: он молчит ровно про те шаги,
+# которые дороже всего (создание рабочих деревьев, заявки на файлы, слияния).
+function Write-GraphNodePlan {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [string]$Phase = '',
+        [string]$Detail = ''
+    )
+    if (-not $script:GraphCtx) { return }
+    $ph = if ($Phase) { $Phase } else { $script:GraphCtx.Phase }
+    Write-Host ("    · {0,-34} фаза={1,-14} ПЛАН     {2}" -f $Label, $ph, $Detail) -ForegroundColor DarkGray
+    _GraphJournal @{ event = 'node-start';  key = "plan:$Label"; label = $Label; phase = $ph; dry = $true; kind = 'plan' }
+    _GraphJournal @{ event = 'node-finish'; key = "plan:$Label"; label = $Label; phase = $ph; ok = $true; dry = $true; tokens = 0; result = $Detail }
 }
 
 function Complete-GraphRun {

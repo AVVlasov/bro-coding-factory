@@ -365,6 +365,42 @@ It 'ненастроенный проект не пускается в прог�
     Assert-True ($r.Code -eq 2) 'прогон без настройки обязан отказать до первого токена'
 }
 
+# Регрессия: сухой план создавал worktree и писал claims.json с pid. Проверка режима
+# стояла внутри исполнителя узла, а worktree и заявка делаются ДО него — то есть план
+# заявлял файлы, которые потом мешают настоящему прогону. План, меняющий состояние,
+# планом не является.
+It 'сухой план не создаёт worktree и не заявляет файлы' {
+    $p = New-Sandbox 'run-dry-clean'
+    Bcf @('init', '--yes', '--project', $p) | Out-Null
+    # роли обязаны быть заполнены, иначе прогон откажет раньше, чем дойдёт до стадий
+    $cfgPath = Join-Path $p 'config\harness.json'
+    $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
+    foreach ($r in @('planner', 'worker', 'arbiter', 'critic')) {
+        $cfg.graph.roles.$r = [pscustomobject]@{ backend = 'claude'; model = 'sonnet' }
+    }
+    if (-not $cfg.graph.backends.PSObject.Properties['claude']) {
+        $cfg.graph.backends | Add-Member -NotePropertyName 'claude' -NotePropertyValue ([pscustomobject]@{ command = 'claude -p --model {model}'; format = 'claude' }) -Force
+    }
+    ($cfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-01-x.md') -Value @"
+# TASK-01 — тест
+
+## Файлы
+- ``src/main.rs``
+
+## Вход
+—
+"@
+    $r = Bcf @('run', 'queue', '--dry-plan', '--yes', '--project', $p)
+    Assert-Match $r.Out 'ПЛАН' 'сухой план обязан показывать, что было бы сделано'
+
+    Assert-True (-not (Test-Path (Join-Path $p '.bcf\fleet\claims.json'))) 'сухой план заявил файлы'
+    Assert-True (-not (Test-Path "$p.wt")) 'сухой план создал каталог worktree'
+    $wt = @(& git -C $p worktree list 2>$null)
+    Assert-True ($wt.Count -le 1) "сухой план создал git worktree: $($wt -join '; ')"
+}
+
 # Регрессия: `exit (Invoke-Harness …)` съедал весь вывод прогона — PowerShell считает
 # вывод функции её результатом. Снаружи это выглядело как «отработало мгновенно и молча»,
 # то есть ход работы, ради которого прогон и запускают, не было видно вообще.

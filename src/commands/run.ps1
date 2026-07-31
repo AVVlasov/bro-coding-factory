@@ -64,16 +64,46 @@ if (-not $mode) {
 }
 
 # Прогон без настройки — самая дорогая из возможных ошибок: он поедет и упрётся на
-# первом узле, потратив время и часть бюджета.
-$card = Get-BcfProjectCard -Project $project
-if (-not $card) {
-    Write-BcfFail 'проект не настроен: нет .bcf/project.json'
-    Write-BcfNote 'сначала: bcf init'
-    exit 2
-}
+# первом узле, потратив время и часть бюджета. Поэтому проверка есть.
+#
+# Но проверять надо ТО, ЧТО НУЖНО ПРОГОНУ, а не то, проходил ли мастер настройки.
+# Наличие .bcf/project.json как условие отвергало проект с полностью рабочим боевым
+# конфигом только потому, что его настраивали не через `bcf init` — то есть требовало
+# переделать заново уже сделанное. Карточка — метаданные, а не допуск.
 $cfg = $null
 try { $cfg = Get-BcfHarnessConfig -Project $project } catch { Write-BcfFail $_.Exception.Message; exit 2 }
-if (-not $cfg) { Write-BcfFail 'config/harness.json не найден — bcf install'; exit 2 }
+if (-not $cfg) {
+    Write-BcfFail 'config/harness.json не найден — харнесс не настроен под этот проект'
+    Write-BcfNote 'настроить: bcf init   ·   поставить обвязку без опроса: bcf install'
+    exit 2
+}
+
+# У движков разные требования, и назвать надо именно недостающее.
+$missing = @()
+if ($mode -in @('queue', 'review')) {
+    $needed = if ($mode -eq 'review') { @('critic') } else { @('planner', 'worker', 'arbiter', 'critic') }
+    foreach ($r in $needed) {
+        $role = if ($cfg.graph -and $cfg.graph.roles) { $cfg.graph.roles.PSObject.Properties[$r] } else { $null }
+        if (-not $role -or -not $role.Value.backend) { $missing += "graph.roles.$r.backend" }
+        elseif (-not $cfg.graph.backends.PSObject.Properties[[string]$role.Value.backend]) {
+            $missing += "graph.backends.$([string]$role.Value.backend) (на него ссылается роль $r)"
+        }
+    }
+} else {
+    if (-not $cfg.agent -or -not $cfg.agent.command) { $missing += 'agent.command' }
+}
+if ($missing.Count) {
+    Write-BcfFail "в config/harness.json не заполнено: $($missing -join ', ')"
+    Write-BcfNote 'без этого прогон упрётся на первом же узле, потратив время и часть бюджета.'
+    Write-BcfNote 'заполнить опросом установленных CLI: bcf init   ·   проверить: bcf doctor'
+    exit 2
+}
+
+# Карточки может не быть — это не блокер, но сказать стоит: часть команд (например
+# сведения о том, когда и чем проект настраивали) опирается на неё.
+if (-not (Get-BcfProjectCard -Project $project)) {
+    Write-BcfDim 'карточки .bcf/project.json нет — проект настраивали не через bcf init. Прогон это не блокирует.'
+}
 
 $env:BCF_PROJECT_ROOT = $project
 $env:BCF_HOME = Get-BcfHome

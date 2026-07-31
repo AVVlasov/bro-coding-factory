@@ -198,6 +198,22 @@ while ($true) {
         {
             param($prev, $task)
             $root = Get-GraphVar root
+
+            # СУХОЙ ПЛАН НЕ ИМЕЕТ ПРАВА НИЧЕГО СОЗДАВАТЬ.
+            #
+            # Проверка стоит ЗДЕСЬ, а не только внутри исполнителя узла: worktree и заявка
+            # на файлы делаются ДО вызова агента, и no-op внутри Invoke-CommandNode их не
+            # отменяет. Наблюдалось живьём: `--dry-plan` на чужом проекте создал каталог
+            # worktree рядом с репозиторием и записал claims.json с pid — то есть сухой
+            # план заявил файлы, которые потом мешают настоящему прогону. План, меняющий
+            # состояние, планом не является.
+            if ($script:GraphCtx.DryPlan) {
+                $files = @(Get-TaskDeclaredFiles -TaskId $task -Root $root)
+                Write-GraphNodePlan -Label "работа-$task" -Phase 'Работа' `
+                    -Detail "worktree и заявка на $($files.Count) файлов — в сухом плане не создаются"
+                return @{ Task = $task; Ok = $false; Dry = $true; Reason = 'сухой план: узел не исполнялся' }
+            }
+
             $wt = New-TaskWorktree -Root $root -Task $task
             if (-not $wt) { return @{ Task = $task; Ok = $false; Reason = 'worktree не создан' } }
             Add-TaskClaim -TaskId $task -Root $root -UseCoupling
