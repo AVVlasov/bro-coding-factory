@@ -78,13 +78,21 @@ if (-not $cfg) { Write-BcfFail 'config/harness.json не найден — bcf in
 $env:BCF_PROJECT_ROOT = $project
 $env:BCF_HOME = Get-BcfHome
 
+# Код возврата уходит в переменную, а НЕ возвращается функцией.
+#
+# `exit (Invoke-Harness …)` выглядит естественно и молча ломает главное: PowerShell
+# считает весь вывод функции её результатом, поэтому всё, что печатал прогон — лента
+# графа, ход итераций, причины провалов — уходило в возвращаемое значение и не
+# показывалось вовсе. Снаружи это выглядело как «команда отработала мгновенно и молча».
+$script:HarnessExit = 0
+
 function Invoke-Harness {
     param([Parameter(Mandatory)][string]$Script, [string[]]$HarnessArgs)
     $full = Join-Path $harness $Script
     if (-not (Test-Path $full)) { Write-BcfFail "нет скрипта харнесса: $full"; exit 3 }
     $all = @('-NoProfile', '-File', $full) + $HarnessArgs + @('-ProjectRoot', $project)
     & pwsh @all
-    return $LASTEXITCODE
+    $script:HarnessExit = $LASTEXITCODE
 }
 
 switch ($mode) {
@@ -94,7 +102,8 @@ switch ($mode) {
         $a = @($task)
         if ($maxIter) { $a += @('-MaxIterations', $maxIter) }
         $a += $passthru
-        exit (Invoke-Harness -Script 'loop.ps1' -HarnessArgs $a)
+        Invoke-Harness -Script 'loop.ps1' -HarnessArgs $a
+        exit $script:HarnessExit
     }
 
     'night' {
@@ -108,7 +117,8 @@ switch ($mode) {
             Write-BcfNote 'остановить между задачами — создать файл .bcf/STOP'
             Write-BcfNote 'итог — .bcf/REVIEW.md, машиночитаемо — .bcf/run-all.status.json'
         }
-        exit (Invoke-Harness -Script 'run-all.ps1' -HarnessArgs $a)
+        Invoke-Harness -Script 'run-all.ps1' -HarnessArgs $a
+        exit $script:HarnessExit
     }
 
     { $_ -in @('queue', 'review') } {
@@ -120,7 +130,8 @@ switch ($mode) {
         if ($resume)           { $a += @('-ResumeFromRunId', $resume) }
         if ($task)             { $a += @('-ArgsJson', $task) }   # граф читает вход как JSON
         $a += $passthru
-        exit (Invoke-Harness -Script 'graph.ps1' -HarnessArgs $a)
+        Invoke-Harness -Script 'graph.ps1' -HarnessArgs $a
+        exit $script:HarnessExit
     }
 
     default {
