@@ -36,7 +36,7 @@ param(
   [switch]$AutoAdvance,
   [switch]$NoAutoRollback,          # M-09 E: отключить авто-откат регрессий tsc (default on)
   [switch]$Force,
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = "Continue"

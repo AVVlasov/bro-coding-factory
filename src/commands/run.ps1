@@ -1,0 +1,131 @@
+# bcf run — запуск работы. Два движка, разная экономика.
+#
+#   bcf run loop <TASK>     ЦИКЛ по одной задаче: свежий контекст каждую итерацию
+#   bcf run night           ЦИКЛ по всей очереди, автономно (ночной прогон)
+#   bcf run queue           ГРАФ: очередь волнами по зависимостям, слияния арбитром
+#   bcf run review          ГРАФ: разноракурсная приёмка по слитому дереву
+#
+# ЧЕМ ОНИ ОТЛИЧАЮТСЯ. Цикл — многопроходный: «работа задачи» и «её интеграция» это один
+# неделимый шаг, задачи идут по очереди. Граф разносит их по разным узлам и убирает
+# барьер: одна задача сливается и проверяется, пока другая ещё пишет код. Цикл дешевле и
+# предсказуемее на ночь; граф быстрее по стенным часам и дороже, потому что зовёт
+# арбитра и критиков.
+#
+# Общие флаги:
+#   --dry-plan          показать план, не запуская ни одного агента
+#   --yes               не спрашивать подтверждения (граф спрашивает: рой стоит денег)
+#   --budget <токены>   потолок на прогон (граф)
+#   --concurrency <N>   сколько узлов/задач одновременно
+#   --resume <runId>    доиграть оборванный прогон графа
+#   --max-iterations N  потолок итераций на задачу (цикл)
+
+$project = $script:BcfProject
+$harness = Get-BcfHarness
+
+$mode = ''
+$task = ''
+$passthru = @()
+$dryPlan = $false
+$budget = 0
+$conc = 0
+$resume = ''
+$maxIter = 0
+
+for ($i = 0; $i -lt $script:BcfArgs.Count; $i++) {
+    $a = [string]$script:BcfArgs[$i]
+    # break обязателен в каждой ветке: PowerShell-switch без него проверяет ОСТАЛЬНЫЕ
+    # условия тоже, и `--dry-plan` уходил ещё и в общую ветку '^-', то есть попадал в
+    # аргументы харнесса как неизвестный флаг.
+    switch -Regex ($a) {
+        '^--dry-plan$'       { $dryPlan = $true; break }
+        '^--budget$'         { $i++; $budget = [double]$script:BcfArgs[$i]; break }
+        '^--concurrency$'    { $i++; $conc = [int]$script:BcfArgs[$i]; break }
+        '^--resume$'         { $i++; $resume = [string]$script:BcfArgs[$i]; break }
+        '^--max-iterations$' { $i++; $maxIter = [int]$script:BcfArgs[$i]; break }
+        '^-'                 { $passthru += $a; break }
+        default {
+            if (-not $mode) { $mode = $a } elseif (-not $task) { $task = $a } else { $passthru += $a }
+        }
+    }
+}
+
+if (-not $mode) {
+    Write-BcfTitle 'ЧТО ЗАПУСКАЕМ' 'у движков разная экономика — выбор не косметический'
+    Write-BcfLine '    loop <TASK>   цикл по одной задаче: свежий контекст каждую итерацию' 'White'
+    Write-BcfNote 'дешевле и предсказуемее; работа и интеграция — один неделимый шаг'
+    Write-BcfLine '    night         цикл по всей очереди, автономно (ночной прогон)' 'White'
+    Write-BcfNote 'останов между задачами — файл .bcf/STOP; итог — .bcf/REVIEW.md'
+    Write-BcfLine '    queue         граф: волны по зависимостям, слияния арбитром' 'White'
+    Write-BcfNote 'быстрее по стенным часам, дороже: добавляются арбитр и критики'
+    Write-BcfLine '    review        граф: разноракурсная приёмка по слитому дереву' 'White'
+    Write-BcfNote 'каждая находка обязана пережить попытку её опровергнуть'
+    Write-Host ''
+    exit 2
+}
+
+# Прогон без настройки — самая дорогая из возможных ошибок: он поедет и упрётся на
+# первом узле, потратив время и часть бюджета.
+$card = Get-BcfProjectCard -Project $project
+if (-not $card) {
+    Write-BcfFail 'проект не настроен: нет .bcf/project.json'
+    Write-BcfNote 'сначала: bcf init'
+    exit 2
+}
+$cfg = $null
+try { $cfg = Get-BcfHarnessConfig -Project $project } catch { Write-BcfFail $_.Exception.Message; exit 2 }
+if (-not $cfg) { Write-BcfFail 'config/harness.json не найден — bcf install'; exit 2 }
+
+$env:BCF_PROJECT_ROOT = $project
+$env:BCF_HOME = Get-BcfHome
+
+function Invoke-Harness {
+    param([Parameter(Mandatory)][string]$Script, [string[]]$HarnessArgs)
+    $full = Join-Path $harness $Script
+    if (-not (Test-Path $full)) { Write-BcfFail "нет скрипта харнесса: $full"; exit 3 }
+    $all = @('-NoProfile', '-File', $full) + $HarnessArgs + @('-ProjectRoot', $project)
+    & pwsh @all
+    return $LASTEXITCODE
+}
+
+switch ($mode) {
+
+    'loop' {
+        if (-not $task) { Write-BcfFail 'нужен id задачи: bcf run loop TASK-01'; exit 2 }
+        $a = @($task)
+        if ($maxIter) { $a += @('-MaxIterations', $maxIter) }
+        $a += $passthru
+        exit (Invoke-Harness -Script 'loop.ps1' -HarnessArgs $a)
+    }
+
+    'night' {
+        $a = @()
+        if ($maxIter) { $a += @('-PerTaskMax', $maxIter) }
+        if ($conc)    { $a += @('-TaskConcurrency', $conc) }
+        if ($dryPlan) { $a += '-DryPlan' }
+        $a += $passthru
+        if (-not $dryPlan) {
+            Write-BcfTitle 'НОЧНОЙ ПРОГОН' 'идём по всей очереди, пока не закроется или не упрёмся'
+            Write-BcfNote 'остановить между задачами — создать файл .bcf/STOP'
+            Write-BcfNote 'итог — .bcf/REVIEW.md, машиночитаемо — .bcf/run-all.status.json'
+        }
+        exit (Invoke-Harness -Script 'run-all.ps1' -HarnessArgs $a)
+    }
+
+    { $_ -in @('queue', 'review') } {
+        $a = @($mode)
+        if ($dryPlan)          { $a += '-DryPlan' }
+        if (Get-BcfAssumeYes)  { $a += '-Yes' }
+        if ($budget -gt 0)     { $a += @('-Budget', $budget) }
+        if ($conc -gt 0)       { $a += @('-Concurrency', $conc) }
+        if ($resume)           { $a += @('-ResumeFromRunId', $resume) }
+        if ($task)             { $a += @('-ArgsJson', $task) }   # граф читает вход как JSON
+        $a += $passthru
+        exit (Invoke-Harness -Script 'graph.ps1' -HarnessArgs $a)
+    }
+
+    default {
+        Write-BcfFail "неизвестный режим: $mode"
+        Write-BcfNote 'доступно: loop <TASK> | night | queue | review'
+        exit 2
+    }
+}

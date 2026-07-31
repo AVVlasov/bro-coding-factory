@@ -6,8 +6,8 @@
 param(
   [Parameter(Position = 0)] [string]$Task = "",
   [string]$Model = "",                    # empty → resolved from config/harness.json (models.code)
-  [switch]$NoAutoRollback                  # disable auto-rollback of tsc regressions (default on),
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [switch]$NoAutoRollback,                 # disable auto-rollback of tsc regressions (default on)
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = "Stop"

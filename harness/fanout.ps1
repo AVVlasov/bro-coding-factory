@@ -22,7 +22,7 @@ param(
     [int]$StepTimeoutSec = 1800,
     [int]$SilentTimeoutSec = 300,
     [switch]$DryPlan,
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = 'Continue'

@@ -17,7 +17,7 @@ param(
     [switch] $Stats,
     [string] $ExportCsv  = '',
     [string] $SinceTs    = '',
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = 'Stop'

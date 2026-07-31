@@ -10,7 +10,7 @@ param(
     [switch]$Json,
     [switch]$Reindex,
     [int]$StaleSec = 300,
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = 'Continue'

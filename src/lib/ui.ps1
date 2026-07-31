@@ -53,14 +53,31 @@ function Write-BcfField {
 
 # Таблица без выравнивания по содержимому — колонки заданы заранее. Автоширина ломается
 # ровно тогда, когда нужна больше всего: одна длинная строка сдвигает всю таблицу.
+#
+# Строки собираются через New-BcfRows/Add-BcfRow, а не в обычный массив: `$rows += ,@(...)`
+# в PowerShell разворачивает вложенный массив, и таблица получает плоский список ячеек
+# вместо строк — падая на форматировании там, где ошибка уже не видна.
+# Запятая обязательна: PowerShell разворачивает перечисляемое на выходе функции, и
+# пустой список превращается в $null у вызывающего — то есть таблица падает ровно на
+# пустых данных, где ошибку заметить труднее всего.
+function New-BcfRows { return , (New-Object 'System.Collections.Generic.List[object]') }
+
+function Add-BcfRow {
+    param([Parameter(Mandatory)]$Rows, [Parameter(Mandatory)][object[]]$Cells)
+    $Rows.Add($Cells) | Out-Null
+}
+
 function Write-BcfTable {
-    param([string[]]$Headers, [int[]]$Widths, [object[]]$Rows, [string[]]$RowColors = @())
+    param([string[]]$Headers, [int[]]$Widths, $Rows, [string[]]$RowColors = @())
     $fmt = ($Widths | ForEach-Object -Begin { $i = 0 } -Process { $s = "{$i,-$_}"; $i++; $s }) -join ' '
     Write-BcfLine ('  ' + ($fmt -f $Headers)) 'DarkGray'
     Write-BcfLine ('  ' + ('─' * (($Widths | Measure-Object -Sum).Sum + $Widths.Count - 1))) 'DarkGray'
-    for ($r = 0; $r -lt $Rows.Count; $r++) {
+    # Count берём с самого объекта, а не через @($Rows): обёртка массива в PowerShell
+    # пытается сконвертировать вложенные массивы и падает на списке строк-массивов.
+    $n = if ($null -eq $Rows) { 0 } elseif ($Rows.PSObject.Properties['Count']) { [int]$Rows.Count } else { 1 }
+    for ($r = 0; $r -lt $n; $r++) {
         $c = if ($r -lt $RowColors.Count -and $RowColors[$r]) { $RowColors[$r] } else { '' }
-        Write-BcfLine ('  ' + ($fmt -f $Rows[$r])) $c
+        Write-BcfLine ('  ' + ($fmt -f @($Rows[$r]))) $c
     }
 }
 

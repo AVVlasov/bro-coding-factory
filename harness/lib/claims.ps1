@@ -61,6 +61,10 @@ function _Write-Json($path, $obj) {
 function Get-TaskDeclaredFiles {
     param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
 
+    # Пустой результат уходит вызывающему как $null (PowerShell разворачивает пустой
+    # массив на выходе функции). Вызывающие обёрнуты в @(), поэтому у них он снова
+    # становится пустым массивом; терпимость к $null нужна только тем, кто передаёт
+    # результат дальше параметром — см. Get-CoupledFiles.
     $tasksDir = Join-Path $Root 'tasks'
     $tf = Get-ChildItem $tasksDir -Filter "$TaskId-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $tf) { return @() }
@@ -150,8 +154,11 @@ function Update-CoChangeIndex {
 }
 
 function Get-CoupledFiles {
-    param([Parameter(Mandatory)][string[]]$Files)
+    # Не Mandatory: задача без объявленных файлов — законное состояние на входе, и
+    # отказывать ей должен планировщик с внятной причиной, а не привязка параметра.
+    param([string[]]$Files = @())
 
+    if (-not $Files -or -not $Files.Count) { return @() }
     $data = _Read-Json $script:CoChangeFile $null
     if (-not $data -or -not $data.index) { return @() }
     $out = @()

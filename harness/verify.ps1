@@ -41,7 +41,7 @@ param(
   # 600s (10 мин) — щедро для самого долгого fetch/thinking; короче — режет легитимно.
   [int]$SilentTimeoutSec = 600,
   [switch]$DryRun,
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = "Continue"

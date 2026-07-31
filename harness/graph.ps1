@@ -32,8 +32,8 @@ param(
     [string]$ResumeFromRunId = '',
     [int]$Concurrency = 0,
     [double]$Budget = 0,              # потолок токенов на прогон; 0 = без потолка
-    [switch]$Yes                      # не спрашивать подтверждения,
-  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+    [switch]$Yes,                     # не спрашивать подтверждения
+  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = 'Continue'

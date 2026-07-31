@@ -233,6 +233,15 @@ function Invoke-BcfDetect {
     $probes = @()
     if ($Probe) {
         foreach ($c in ($typechecks | Select-Object -Unique)) { $probes += (Test-BcfCommand -Command $c -Root $Root) }
+
+        # Пересобираем список воспроизводимых файлов ПОСЛЕ проб: пробный `cargo check` /
+        # `npm run typecheck` сам создаёт лок-файл, которого до него не было. Если считать
+        # список до проб, самый важный кандидат — тот, что породила сборка, — в него не
+        # попадёт, и однажды завалит слияние ровно потому, что харнесс о нём не знает.
+        $generated = @()
+        foreach ($e in $eco) {
+            $generated += @($e.generated | Where-Object { Test-Path (Join-Path $Root ($_ -replace '/', '\')) })
+        }
     }
 
     return [pscustomobject]@{
