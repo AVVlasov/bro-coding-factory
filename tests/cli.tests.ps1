@@ -123,6 +123,75 @@ It 'общий флаг не утекает в подкоманду' {
     Assert-Match $r.Out 'РАЗБОР ПРОЕКТА'
 }
 
+# --- bcf без аргументов ----------------------------------------------------------------
+Write-Host ''
+Write-Host '  запуск без аргументов' -ForegroundColor White
+
+It 'печатает карточку состояния, а не список команд' {
+    $p = New-Sandbox 'launch-banner'
+    Bcf @('install', '--project', $p) | Out-Null
+    $r = Bcf @('--project', $p)
+    Assert-Match $r.Out 'BRO CODING FACTORY'
+    foreach ($row in @('проект', 'бэкенды', 'память', 'тарифы', 'подписки')) {
+        Assert-Match $r.Out $row "в карточке нет строки «$row»"
+    }
+    # То, чего нет, называется словом «нет» и ценой, а не прячется и не выдумывается.
+    Assert-Match $r.Out 'тарифы\s+не заданы'
+    Assert-NoMatch $r.Out 'bcf <команда>' 'вместо состояния напечатана справка'
+}
+
+It 'без консоли уступает место печати и не падает на чтении клавиши' {
+    $p = New-Sandbox 'launch-noninteractive'
+    Bcf @('install', '--project', $p) | Out-Null
+    $r = Bcf @('--project', $p)
+    Assert-True ($r.Code -eq 0) "ожидал 0, получил $($r.Code)"
+    Assert-Match $r.Out 'интерактивный выбор недоступен'
+    Assert-Match $r.Out 'bcf doctor' 'doctor подан как режим run, хотя это своя команда'
+}
+
+# Кадр выбора иначе не покрыт ничем: крэш в его построении вылезал бы только у человека
+# за клавиатурой — там, где его нельзя ни залогировать, ни воспроизвести.
+It 'кадр выбора строится на непустом бэклоге' {
+    $p = New-Sandbox 'launch-screen'
+    Bcf @('install', '--project', $p) | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-01-base.md') -Value @"
+# TASK-01 — основа
+
+## Файлы
+- ``src/a.rs``
+"@
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-02-next.md') -Value @"
+# TASK-02 — следом
+
+**Gate-вход:** TASK-01
+
+## Файлы
+- ``src/b.rs``
+"@
+    $r = Bcf @('--screen', '--project', $p)
+    Assert-True ($r.Code -eq 0) "кадр не построился: $($r.Out)"
+    Assert-Match $r.Out 'что запускаем'
+    Assert-Match $r.Out '▸'
+    Assert-Match $r.Out '\[×\] TASK-01' 'готовая задача не отмечена по умолчанию'
+    Assert-Match $r.Out '\[ \] TASK-02' 'заблокированная задача отмечена'
+    Assert-Match $r.Out 'ждёт 01'
+    Assert-Match $r.Out 'сметы нет' 'без прогонов смета обязана отсутствовать, а не считаться из воздуха'
+}
+
+It 'кадр выбора строится и на пустом бэклоге' {
+    $p = New-Sandbox 'launch-screen-empty'
+    Bcf @('install', '--project', $p) | Out-Null
+    $r = Bcf @('--screen', '--project', $p)
+    Assert-True ($r.Code -eq 0) "кадр не построился на пустом бэклоге: $($r.Out)"
+    Assert-Match $r.Out 'очередь пуста'
+}
+
+It 'setup --check не меняет PATH и сообщает состояние' {
+    $r = Bcf @('setup', '--check')
+    Assert-Match $r.Out 'КОМАНДА bcf'
+    Assert-True ($r.Code -in @(0, 1)) "неожиданный код $($r.Code)"
+}
+
 # --- detect --------------------------------------------------------------------------
 Write-Host ''
 Write-Host '  detect' -ForegroundColor White

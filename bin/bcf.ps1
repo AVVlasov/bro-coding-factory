@@ -18,6 +18,7 @@ $BcfRoot = Split-Path $PSScriptRoot -Parent
 . (Join-Path $BcfRoot 'src\lib\ui.ps1')
 
 $COMMANDS = [ordered]@{
+    'setup'    = @{ file = 'setup.ps1';    help = 'сделать команду bcf доступной из любого каталога (PATH)' }
     'init'     = @{ file = 'init.ps1';     help = 'настроить фабрику под проект — восемь шагов, всё в текстовые файлы' }
     'install'  = @{ file = 'install.ps1';  help = 'записать/обновить обвязку в проекте: .claude, config, agents, tasks' }
     'migrate'  = @{ file = 'migrate.ps1';  help = 'перенести состояние прогонов из старого каталога loop/ в .bcf/' }
@@ -53,6 +54,9 @@ function Show-BcfHelp {
     Write-Host '    --no-color         вывод без цвета'
     Write-Host ''
     Write-BcfLine '  с чего начать' 'DarkGray'
+    Write-Host '    bcf setup          сделать команду bcf доступной из любого каталога'
+    Write-Host '    cd <проект>        дальше --project не нужен: берётся текущий репозиторий'
+    Write-Host '    bcf                карточка состояния и выбор запуска'
     Write-Host '    bcf init           настроить фабрику под проект'
     Write-Host '    bcf doctor         проверить, что прогон вообще поедет'
     Write-Host '    bcf run queue      первая волна'
@@ -75,13 +79,26 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
         '^(--help|-h)$'    { if (-not $cmd) { Show-BcfHelp; exit 0 } else { $rest += $a }; continue }
         '^(--version|-V)$' { Write-Host (Get-BcfVersion); exit 0 }
         default {
-            if (-not $cmd) { $cmd = $a } else { $rest += $a }
+            # Флаг ДО имени команды принадлежит команде по умолчанию (`launch`), а не
+            # является именем команды. Иначе `bcf --screen` жалуется на «неизвестную
+            # команду --screen» вместо того, чтобы передать флаг тому, кто его понимает.
+            if (-not $cmd -and $a.StartsWith('-')) { $rest += $a }
+            elseif (-not $cmd) { $cmd = $a }
+            else { $rest += $a }
         }
     }
 }
 
-if (-not $cmd -or $cmd -in @('help', '--help')) { Show-BcfHelp; exit 0 }
+# `bcf` без аргументов — НЕ справка, а карточка состояния и выбор запуска.
+#
+# Решение «что запускать» принимается по состоянию: сколько задач готово, отвечают ли
+# бэкенды, жива ли память, во что это обойдётся. Список команд ничего из этого не
+# показывает — человек всё равно идёт смотреть сам, а потом запускает по памяти.
+if (-not $cmd) { $cmd = 'launch' }
+if ($cmd -in @('help', '--help')) { Show-BcfHelp; exit 0 }
 if ($cmd -in @('version', '--version')) { Write-Host (Get-BcfVersion); exit 0 }
+
+if ($cmd -eq 'launch') { $COMMANDS['launch'] = @{ file = 'launch.ps1'; help = '' } }
 
 if (-not $COMMANDS.Contains($cmd)) {
     Write-BcfFail "Неизвестная команда: $cmd"
