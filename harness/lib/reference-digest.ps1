@@ -5,7 +5,7 @@
 # Repo root + digester invoker: env override, иначе repo-relative default.
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
 $script:RepoRoot = Get-BcfProjectRoot
-$script:Digester = if ($env:BCF_INVOKE_REFERENCE_DIGESTER) { $env:BCF_INVOKE_REFERENCE_DIGESTER } else { Join-Path $script:RepoRoot 'agents/bin/invoke-reference-digester.ps1' }
+$script:Digester = if ($env:BCF_INVOKE_REFERENCE_DIGESTER) { $env:BCF_INVOKE_REFERENCE_DIGESTER } else { Join-Path $script:RepoRoot '.claude/agents/bin/invoke-reference-digester.ps1' }
 
 function Get-OrCreate-ReferenceDigest {
     param(

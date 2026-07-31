@@ -63,7 +63,7 @@ if ($Cfg) {
   if (-not $PSBoundParameters.ContainsKey('SilentTimeoutSec') -and $Cfg.timeouts.silentSec){ $SilentTimeoutSec = [int]$Cfg.timeouts.silentSec }
 }
 $JudgeName     = if ($Cfg -and $Cfg.judge.name)      { [string]$Cfg.judge.name }     else { 'judge' }
-$JudgeAgentFile= if ($AgentsCfg -and $AgentsCfg.judge.file) { [string]$AgentsCfg.judge.file } else { 'agents/judge.md' }
+$JudgeAgentFile= if ($AgentsCfg -and $AgentsCfg.judge.file) { [string]$AgentsCfg.judge.file } else { '.claude/agents/judge.md' }
 $DefaultTesters= if ($AgentsCfg -and $AgentsCfg.testers) { @($AgentsCfg.testers | ForEach-Object { $_.name }) } else { @('architecture') }
 $FeatVision    = [bool]($Cfg -and $Cfg.features.vision)
 # Конфигурируемые vision-команды (Фаза D активна только при features.vision).
@@ -99,7 +99,9 @@ Get-ChildItem env: | Where-Object { $_.Name -like 'OPENCODE_*' } | ForEach-Objec
 # W5 (2026-05-24): claude -p больше не используется (судья перенесён на <model>).
 # ANTHROPIC_*-чистка снята как ненужная. Если кто-то вернёт claude в pipeline — добавить обратно.
 
-$agentsDir  = Join-Path $root "agents"
+# Роли живут в .claude/agents: там их читает и Claude Code как субагентов, и обвязка
+# при верификации. Вторая копия в agents/ означала бы, что однажды поправят не ту.
+$agentsDir  = Join-Path $root ".claudegents"
 $verdictDir = Join-Path $root "tasks\.verdicts"
 $workDir    = Join-Path $root ".bcf\verify"
 $logFile    = Join-Path $root ".bcf\loop.log"

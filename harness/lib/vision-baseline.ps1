@@ -9,7 +9,8 @@
 # Repo root + bug_tracker.py: env override, иначе repo-relative default.
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
 $script:RepoRoot   = Get-BcfProjectRoot
-$script:BugTracker = if ($env:BCF_BUG_TRACKER) { $env:BCF_BUG_TRACKER } else { Join-Path $script:RepoRoot 'memory/pgvector/bug_tracker.py' }
+$script:HomeRoot   = Get-BcfHomeRoot
+$script:BugTracker = if ($env:BCF_BUG_TRACKER) { $env:BCF_BUG_TRACKER } else { Join-Path $script:HomeRoot 'memory/pgvector/bug_tracker.py' }
 
 function _Resolve-VisionDir {
     param([string]$Repo, [string]$EnvVar, [string]$Default)

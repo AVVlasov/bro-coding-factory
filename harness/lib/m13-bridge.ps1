@@ -8,17 +8,26 @@
 #   Run-Retrospector      — после verdict: ретроспектор JSON → upsert в anti_patterns.
 #   Invoke-FindingGate    — между opencode-run и verify: блокирует non-verifiable dismiss.
 
-# Repo root: env override, иначе два уровня вверх от lib-каталога (REPO\harness\lib → REPO).
+# ДВА разных корня, и путать их дорого:
+#   RepoRoot  — проект, над которым идёт работа (там задачи, вердикты, .claude/);
+#   HomeRoot  — фабрика (там движок и ОДНА установка памяти на все проекты).
+# Клиент памяти искался в проекте, и на любом чужом проекте это выглядело как
+# «memory_client.py не найден» — то есть память молча выключалась на всём, кроме
+# самой фабрики.
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
 $script:RepoRoot     = Get-BcfProjectRoot
+$script:HomeRoot     = Get-BcfHomeRoot
 
 $script:M13Disabled  = ($env:BCF_MEMORY_DISABLED -eq '1')
-$script:MemClient    = if ($env:BCF_MEMORY_CLIENT)   { $env:BCF_MEMORY_CLIENT }   else { Join-Path $script:RepoRoot 'memory/pgvector/memory_client.py' }
-$script:Retrospector = if ($env:BCF_INVOKE_RETROSPECTOR) { $env:BCF_INVOKE_RETROSPECTOR } else { Join-Path $script:RepoRoot 'agents/bin/invoke-retrospector.ps1' }
-$script:FindingGate  = if ($env:BCF_FINDING_GATE)    { $env:BCF_FINDING_GATE }    else { Join-Path $script:RepoRoot 'hooks/subagent-finding-gate.sh' }
+$script:MemClient    = if ($env:BCF_MEMORY_CLIENT)   { $env:BCF_MEMORY_CLIENT }   else { Join-Path $script:HomeRoot 'memory/pgvector/memory_client.py' }
+$script:Retrospector = if ($env:BCF_INVOKE_RETROSPECTOR) { $env:BCF_INVOKE_RETROSPECTOR } else { Join-Path $script:RepoRoot '.claude/agents/bin/invoke-retrospector.ps1' }
+$script:FindingGate  = if ($env:BCF_FINDING_GATE)    { $env:BCF_FINDING_GATE }    else { Join-Path $script:RepoRoot '.claude/hooks/subagent-finding-gate.sh' }
 
-$script:MemCompose   = if ($env:BCF_MEM_COMPOSE)     { $env:BCF_MEM_COMPOSE }     else { Join-Path $script:RepoRoot 'memory/pgvector/docker-compose.yml' }
-$script:MemDbConfig  = if ($env:BCF_MEM_CONFIG)      { $env:BCF_MEM_CONFIG }      else { Join-Path $script:RepoRoot 'config/memory.config.json' }
+$script:MemCompose   = if ($env:BCF_MEM_COMPOSE)     { $env:BCF_MEM_COMPOSE }     else { Join-Path $script:HomeRoot 'memory/pgvector/docker-compose.yml' }
+# Конфиг памяти: проектный переопределяет фабричный, если проекту нужна своя база.
+$script:MemDbConfig  = if ($env:BCF_MEM_CONFIG) { $env:BCF_MEM_CONFIG }
+                       elseif (Test-Path (Join-Path $script:RepoRoot 'config/memory.config.json')) { Join-Path $script:RepoRoot 'config/memory.config.json' }
+                       else { Join-Path $script:HomeRoot 'memory/memory.config.json' }
 
 # Имя контейнера: из memory.config.json (ключ 'container'), иначе дефолт.
 $script:MemContainer = 'bcf-agent-memory'

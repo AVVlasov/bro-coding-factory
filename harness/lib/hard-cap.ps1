@@ -15,8 +15,9 @@
 # (REPO\harness\lib\hard-cap.ps1 → REPO).
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
 $script:RepoRoot = Get-BcfProjectRoot
+$script:HomeRoot = Get-BcfHomeRoot
 # bug_tracker.py: env override, иначе repo-relative default.
-$script:BugTracker = if ($env:BCF_BUG_TRACKER) { $env:BCF_BUG_TRACKER } else { Join-Path $script:RepoRoot 'memory/pgvector/bug_tracker.py' }
+$script:BugTracker = if ($env:BCF_BUG_TRACKER) { $env:BCF_BUG_TRACKER } else { Join-Path $script:HomeRoot 'memory/pgvector/bug_tracker.py' }
 
 function Get-SeverityScore {
     param([Parameter(Mandatory)][string]$TaskId)

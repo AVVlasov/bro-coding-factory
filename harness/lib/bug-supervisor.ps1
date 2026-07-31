@@ -4,9 +4,10 @@
 # Repo root: env override, иначе два уровня вверх от lib-каталога (REPO\harness\lib → REPO).
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
 $script:RepoRoot    = Get-BcfProjectRoot
-$script:BugTracker  = if ($env:BCF_BUG_TRACKER)     { $env:BCF_BUG_TRACKER }     else { Join-Path $script:RepoRoot 'memory/pgvector/bug_tracker.py' }
-$script:Invoker     = if ($env:BCF_INVOKE_SUPERVISOR) { $env:BCF_INVOKE_SUPERVISOR } else { Join-Path $script:RepoRoot 'agents/bin/invoke-supervisor.ps1' }
-$script:TestAuthor  = if ($env:BCF_INVOKE_TEST_AUTHOR) { $env:BCF_INVOKE_TEST_AUTHOR } else { Join-Path $script:RepoRoot 'agents/bin/invoke-test-author.ps1' }
+$script:HomeRoot    = Get-BcfHomeRoot
+$script:BugTracker  = if ($env:BCF_BUG_TRACKER)     { $env:BCF_BUG_TRACKER }     else { Join-Path $script:HomeRoot 'memory/pgvector/bug_tracker.py' }
+$script:Invoker     = if ($env:BCF_INVOKE_SUPERVISOR) { $env:BCF_INVOKE_SUPERVISOR } else { Join-Path $script:RepoRoot '.claude/agents/bin/invoke-supervisor.ps1' }
+$script:TestAuthor  = if ($env:BCF_INVOKE_TEST_AUTHOR) { $env:BCF_INVOKE_TEST_AUTHOR } else { Join-Path $script:RepoRoot '.claude/agents/bin/invoke-test-author.ps1' }
 
 function Author-RegressionTest {
     param(
