@@ -9,7 +9,7 @@ tools: ["Bash", "Read", "Glob", "Grep"]
 
 You verify two contract surfaces: the backend HTTP API and the cross-process channel layer.
 
-Project-specific knowledge (the channel namespace, the bridge/entrypoint/types file paths, the backend route layout, the health URL, the backend run command): see agents/PROJECT-KNOWLEDGE.md → "Module/contract map". Resolve the concrete names and ports below against it.
+Project-specific knowledge (the channel namespace, the bridge/entrypoint/types file paths, the backend route layout, the health URL, the backend run command): see .claude/agents/PROJECT-KNOWLEDGE.md → "Module/contract map". Resolve the concrete names and ports below against it.
 
 ## Triple-wiring rule (cross-process channels)
 

@@ -1,67 +1,156 @@
-# Configuration reference
+# Справочник конфигурации
 
-All project-specific values live in `config/`. Scripts read these — nothing is hardcoded.
+Всё проектное живёт в `config/` **внутри проекта**. Скрипты читают отсюда и не хардкодят
+ничего. Секретов здесь нет: ключи берутся из окружения.
+
+Аргументы командной строки перекрывают конфиг, конфиг перекрывает умолчание скрипта.
+
+---
 
 ## config/harness.json
 
-| Key | Meaning |
+| Ключ | Что это |
 |---|---|
-| `engine` | Cosmetic engine name (default `ralph`). |
-| `agent.command` | Backend command template. `{model}` is substituted; the prompt is also piped on stdin. Default: opencode. |
-| `agent.adapter` | Stream adapter under `loop/lib/adapters/` (default `opencode`). |
-| `models.code` / `.tester` / `.vision` / `.judge` | Model ids per role. Empty = backend default. |
-| `paths.tasks` / `.verdicts` / `.currentFocus` / `.bugs` | Repo-relative locations of the task system. |
-| `productPaths` | Source roots that count as "product code" (no-progress, scope, verify-skip, eslint targets). |
-| `taskIdPattern` / `taskIdPrefix` | Regex matching your task ids (default `[A-Za-z][A-Za-z0-9]*-\d+`). |
-| `net.probeHost` / `.probePort` | Connectivity watchdog target (your model API host). **Empty = watchdog disabled.** |
-| `timeouts.*` | `iterSec`, `streamStallSec`, `netWaitMaxSec`, `netStallRetryMax`, `stepSec`, `silentSec`. |
-| `limits.*` | `maxIterations`, `noProgressLimit`, `sprawlFileLimit`, `sprawlIterLimit`. |
-| `judge.name` / `.outputSuffix` | Judge role name + output-file suffix. |
-| `features.*` | Toggles: `memory`, `bugSupervisor`, `hardCap`, `vision`, `visualContext`, `referenceDigest`, `redoTrigger`. All off by default. |
-| `envPrefix` | Env-var prefix for harness toggles (default `BCF`). |
+| `engine` | Косметическое имя движка (по умолчанию `ralph`). |
+| `agent.command` | Команда бэкенда для ЦИКЛА. `{model}` подставляется, промпт идёт на stdin. |
+| `agent.adapter` | Разборщик потока из `harness/lib/adapters/`. |
+| `models.code` / `.tester` / `.vision` / `.judge` | Модели цикла. Пусто = умолчание бэкенда. |
+| `graph.backends.<имя>` | `{ command, format, env, probeModel, authCheck, authOkPattern }`. Заполняет `bcf init` по результатам опроса установленных CLI. |
+| `graph.roles.<роль>` | `{ backend, model }` для `planner` / `arbiter` / `critic` / `worker` (и опционально `researcher`). |
+| `paths.*` | Где живут задачи, вердикты, текущий фокус, баги. |
+| `productPaths` | Что считается продуктовым кодом. |
+| `generatedFiles` | Файлы, воспроизводимые сборкой. |
+| `taskIdPattern` / `taskIdPrefix` | Формат id задач (умолчание `[A-Za-z][A-Za-z0-9]*-\d+`, префикс `TASK`). |
+| `backpressure.typecheck` | Быстрые проверки после каждой итерации. Пустой массив = пропустить. |
+| `tests.*` | `runner` (cargo/vitest/jest/pytest/go/custom) плюс переопределения `command`, `packageFlag`, `passedPattern`, `failedPattern`. |
+| `net.probeHost` / `.probePort` | Сторож соединения (хост API модели). **Пусто = выключен.** |
+| `timeouts.*` | `iterSec`, `streamStallSec`, `netWaitMaxSec`, `netStallRetryMax`, `stepSec`, `silentSec`, `testerSilentSec`. |
+| `limits.*` | `taskConcurrency`, `agentConcurrency`, `fanoutConcurrency`, `testerConcurrency`, `maxIterations`, `noProgressLimit`, `sprawlFileLimit`, `sprawlIterLimit`. |
+| `judge.name` / `.outputSuffix` | Имя роли судьи и суффикс его файла вывода. |
+| `features.*` | `memory`, `bugSupervisor`, `hardCap`, `fanout`, `vision`, `visualContext`, `referenceDigest`, `redoTrigger`. По умолчанию всё выключено. |
+| `envPrefix` | Префикс переменных окружения (по умолчанию `BCF`). |
 
-CLI parameters to `loop.ps1` / `verify.ps1` always override config; config overrides the
-script's built-in default.
+### Четыре ключа, ошибка в которых стоит дороже прочих
+
+**`productPaths`** решает, где искать «прогресса нет» и расползание скоупа, и что вообще
+смотрит ревью. Ошибка здесь означает, что правки в доках засчитываются как работа над
+задачей — а цикл при этом честно докладывает о прогрессе.
+
+**`backpressure.typecheck`** вызывается КАЖДУЮ итерацию. Команда, которой не существует,
+делает гейт красным всегда, и агент начинает чинить несуществующее. Поэтому `bcf init`
+запускает кандидатов живьём и записывает только те, что отработали.
+
+**`generatedFiles`** — что не блокирует слияние. Один изменённый лок-файл в основном
+дереве однажды завалил слияние семи задач подряд, каждая из которых уже дошла до PASS:
+весь бюджет прогона сгорел из-за файла, который сборка перегенерирует за секунду.
+
+**`tests.runner`** — чем доказывается закрытая задача. Пока он пуст, гейт «фича доказана
+тестами» не работает: общий прогон тестов зелен и на пустом месте.
+
+### Про роли графа
+
+Три правила, которые `bcf init` не даёт нарушить молча:
+
+1. `critic` не сидит на модели `worker` — несколько агентов одной модели на одном
+   контексте приходят к одной ошибке и подтверждают её друг другу;
+2. `planner` и `critic` из разных семейств — критик не защищает решение своего
+   планировщика;
+3. роль, обязанная только смотреть, живёт на бэкенде с песочницей «только чтение».
+
+Ещё одно свойство, о котором стоит знать: у части бэкендов (`cursor`, `gemini`, `aider`)
+в потоке НЕТ события о расходе токенов. Узлы такой роли для бюджета нулевые, и потолок
+«до исчерпания» на ней не сработает никогда. `bcf doctor` и `bcf cost` называют это явно.
 
 ## config/agents.json
 
-Role → `{ file, model }`. `testers` is an array of `{ name, file, model }`. Empty `model`
-inherits `harness.json` `models.*`. The `.md` files are generic role templates — put product
-specifics in `agents/PROJECT-KNOWLEDGE.md`.
+Роль → `{ file, model }`; `testers` — массив `{ name, file, model }`. Пустая `model`
+наследует `models.*` из `harness.json`. Файлы ролей лежат в `.claude/agents/` — одно
+место и для Claude Code, и для верификации.
 
 ## config/checks.json
 
-Mandatory deterministic checks per task (the authoritative verdict source — the agent cannot
-remove them). Key = task id or `_default`; value = array of shell commands (exit 0 = green).
-Fill `_default` with your type-check/test command.
+Обязательные детерминированные проверки — **авторитетный источник вердикта**. Ключ = id
+задачи или `_default`, значение = массив shell-команд (exit 0 = зелено).
+
+Их пишет владелец, а не агент: verify объединяет их с планом из `VERIFY-REQUEST`, и убрать
+их агент не может. Это и закрывает дыру «агент пишет себе план и получает тривиальный
+PASS».
+
+Пустой `_default` — это не «нет проверок», а «задача без собственных проверок может
+получить PASS на одном судье».
 
 ## config/triggers.json
 
-Friction triggers that pause the loop for human review. `bigDeletionThreshold` (lines) +
-`pathTriggers[]` of `{ pattern, reason, severity }` matched against the iteration diff.
+Триггеры трения: на чём цикл обязан остановиться и позвать человека.
+`bigDeletionThreshold` (строк) и `pathTriggers[]` из `{ pattern, reason, severity }`,
+сопоставляемых с диффом итерации.
 
 ## config/scope-map.json
 
-- `testers[]` — `{ tester, patterns }`: which tester is relevant to which paths (irrelevant
-  testers are dropped from a VERIFY-REQUEST based on the diff).
-- `vision.rules[]` — `{ slug, patterns }` and `vision.shared.patterns` — scope the visual phase.
+- `testers[]` — `{ tester, patterns }`: какой тестер относится к каким путям. Тестеры, не
+  относящиеся к диффу, из плана верификации выбрасываются — тестер на чужой поверхности
+  докладывает «чисто» бесплатно.
+- `vision.rules[]` и `vision.shared.patterns` — скоуп визуальной фазы.
+
+## config/review-lenses.json (опционально)
+
+Ракурсы для `bcf run review` — массив `{ key, ask }`. Дефолт намеренно общий
+(корректность, отказы, границы, честность тестов): он ловит то, что ломается в любом коде,
+и не притворяется, что знает предметную область. Проект, у которого есть свои характерные
+классы дефектов, переопределяет их здесь.
+
+## config/pricing.json (опционально)
+
+Тарифы для `bcf cost`, цена за 1M токенов:
+
+```json
+{ "updated": "2026-07-31", "currency": "USD", "rate": 1.0,
+  "models": { "opus": { "input": 15, "output": 75 } } }
+```
+
+`updated` печатается вместе с суммой: прайсы меняются, а файл — нет. Модель без тарифа
+показывается прочерком, а не нулём.
+
+Если файла нет в проекте, берётся `memory/pricing.json` фабрики.
 
 ## config/memory.config.json
 
-pgvector connection + embedding: `host`, `port`, `database`, `user`, `password_env`,
-`password_default` (non-secret local fallback), `schema`, `embedding_dim`/`_model`/`_endpoint`.
-The real password comes from the env var named by `password_env` (`BCF_PG_PASSWORD`).
+Подключение к pgvector и эмбеддинги: `host`, `port`, `database`, `user`, `password_env`,
+`password_default` (несекретный локальный фолбэк), `schema`, `embedding_dim` / `_model` /
+`_endpoint`, `connect_timeout_sec`.
 
-## hooks/hooks-config.json
+Порядок поиска: `BCF_MEM_CONFIG` → `<project>/config/memory.config.json` →
+`<factory>/memory/memory.config.json`. Одна установка pgvector обслуживает много проектов,
+поэтому фабричный конфиг — база, а проектный только переопределяет его.
 
-Optional project-specific gate checks (all no-op until filled): `ipc_*` (handler triple-wiring),
-`migration_*` (registration / ALTER-safety), `wrapper_allowed` / `wrapper_key_pattern`
-(no-hardcoded-API-key check), `console_check_dirs`, `banned_ui_patterns`, `ts_targets`,
-`py_targets`.
+`embedding_dim` ОБЯЗАН совпадать с моделью (bge-m3 = 1024): иначе база отвергает записи,
+и выглядит это как «память пустая».
 
-## Environment variables
+## .claude/hooks/hooks-config.json
 
-See `.env.example`. Key ones: `BCF_API_KEY` / `BCF_API_HOST` (agent backend), `BCF_PG_PASSWORD`
-(pgvector), `MEMORY_EMBED_*` (embedding server), and toggles `BCF_MEMORY_DISABLED`,
-`BCF_PROJECT_ROOT`, `BCF_BASH`, `BCF_VISION_*`. **No secrets are committed — keys live only in
-`.env` (gitignored).**
+Проектные проверки гейтов, все no-op пока не заполнены:
+
+| Ключ | Что включает |
+|---|---|
+| `ipc_dirs`, `ipc_preload_file`, `ipc_types_file` | Проверка тройной проводки канала: зарегистрирован, есть в мосте, есть в типизированном клиенте. Канал, проведённый в одном месте из трёх, компилируется и падает только в рантайме. |
+| `migration_*` | Регистрация миграций и безопасность `ALTER`. |
+| `wrapper_allowed`, `wrapper_key_pattern` | Гейт «в код не добавили литерал ключа API». |
+| `console_check_dirs`, `banned_ui_patterns` | Правила lint-gate. |
+| `product_paths` | Каталоги, которые сканирует детектор посторонних алфавитов в UI-строках. |
+| `renderer_dir`, `renderer_forbidden_import` | Запрет пересечения архитектурной границы импортом. |
+
+## Переменные окружения
+
+См. `.env.example`. Ключевые:
+
+| | |
+|---|---|
+| `BCF_PROJECT_ROOT` | над каким проектом работает движок. Выставляет `bcf`; вручную нужен только при прямом запуске скриптов харнесса. |
+| `BCF_HOME` | корень фабрики. |
+| `BCF_PG_PASSWORD` | пароль pgvector. |
+| `BCF_MEM_CONFIG` | явный путь к конфигу памяти. |
+| `BCF_MEMORY_DISABLED=1` | выключить память для одного прогона. |
+| `BCF_NO_COLOR=1` | вывод без цвета. |
+| `BCF_VISION_*` | команды визуальной фазы. |
+
+Секреты не коммитятся: ключи живут только в `.env` (в `.gitignore`).

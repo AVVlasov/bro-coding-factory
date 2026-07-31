@@ -1,59 +1,129 @@
-# Setup
+# Установка
 
-## Prerequisites
+## Что нужно
 
-| Need | For | Notes |
+| Что | Зачем | Оговорки |
 |---|---|---|
-| **PowerShell 7+** (`pwsh`) | the harness (all `.ps1`) | Cross-platform: Windows, Linux, macOS. |
-| **git** | WIP snapshots, diffs, triggers | Must be on PATH; run from inside a git repo. |
-| **A CLI coding agent** | the actual code edits | Default [`opencode`](https://github.com/sst/opencode). Any CLI agent works via `config/harness.json` → `agent.command`. |
-| **Python 3.10+** | memory subsystems (optional) | Only if you enable `features.memory` or use `memory/history`. |
-| **Docker** | pgvector memory (optional) | Only for `memory/pgvector`. |
-| **An embedding server** | vector memory (optional) | LM Studio or any OpenAI-compatible `/v1/embeddings`. bge-m3 (1024-dim) for pgvector; nomic-embed-text (768-dim) for history. |
+| **PowerShell 7+** (`pwsh`) | движок и CLI | Кросс-платформенный: Windows, Linux, macOS. Windows PowerShell 5 не подходит. |
+| **git** | снапшоты работы, диффы, worktree | На PATH. Проект обязан быть репозиторием: без этого слияния и восстановление итерации невозможны. |
+| **Кодовый CLI-агент** | собственно правки кода | Хотя бы один: `claude`, `opencode`, `codex`, `cursor-agent`. `bcf init` опросит установленные. |
+| **Python 3.10+** | память (опционально) | Только при `features.memory` или `memory/history`. |
+| **Docker** | pgvector (опционально) | Только для `memory/pgvector`. |
+| **Сервер эмбеддингов** | векторная память (опционально) | LM Studio или любой OpenAI-совместимый `/v1/embeddings`. bge-m3 (1024) для pgvector, nomic-embed-text (768) для истории. |
 
-## Minimal run (no memory, no vision)
-
-1. `cp .env.example .env` and set `BCF_API_KEY` / `BCF_API_HOST` for your agent backend.
-2. Edit `config/harness.json`: set `agent.command`, `models.code`, and `productPaths`
-   (your source roots, e.g. `["src","server"]`). Add your always-on checks to
-   `config/checks.json` (`_default`, e.g. `["npx --no-install tsc --noEmit"]`).
-3. `cp agents/PROJECT-KNOWLEDGE.example.md agents/PROJECT-KNOWLEDGE.md` and fill it in.
-4. Create a task file `tasks/<TASK-ID>-<slug>.md`; point `tasks/CURRENT-FOCUS.md` at it.
-5. `pwsh loop/loop.ps1 <TASK-ID>`
-
-`features.*` in `config/harness.json` are all **off** by default, so the loop runs with zero
-external dependencies beyond the agent backend.
-
-## Enabling the vector memory (pgvector)
+## Установка фабрики
 
 ```bash
-# 1. start the DB
-cd memory/pgvector
-docker compose up -d
-pwsh smoke-test.ps1          # container healthy + schema present
-
-# 2. point an embedding server (e.g. LM Studio) at bge-m3 on http://localhost:1234
-pwsh smoke-test-client.ps1   # embed -> upsert -> recall round-trip
+git clone <repo> bro-coding-factory
+cd bro-coding-factory
 ```
 
-Then set `features.memory: true` in `config/harness.json` and `BCF_PG_PASSWORD` in `.env`.
-Connection + embedding settings live in `config/memory.config.json`.
+Добавь `bin/` в PATH — или зови напрямую:
 
-## Enabling the SQLite history memory
+```bash
+pwsh bin/bcf.ps1 --help          # Linux / macOS / Windows
+bin\bcf.cmd --help               # Windows, cmd
+```
+
+Проверка, что фабрика на месте: `bcf --version` и `pwsh tests/cli.tests.ps1`.
+
+## Настройка проекта
+
+```bash
+cd /path/to/your/project
+bcf init
+```
+
+Восемь шагов, ни один токен не тратится, кроме живой пробы ролей. Что появится:
+
+```
+.claude/     хуки, скилы, команды, роли, settings.json
+config/      harness.json, checks.json, agents.json, triggers.json, scope-map.json
+tasks/       каркас бэклога + шаблон задачи
+CLAUDE.md    заготовка правил проекта
+.bcf/        состояние прогонов (добавляется в .gitignore)
+```
+
+После init обязательно посмотри две вещи, которые он назовёт сам:
+
+1. **Список «без этого прогон не поедет».** Как правило это грязное дерево (первое же
+   слияние затянет чужие правки в задачу) и падающая быстрая проверка (она вызывается
+   каждую итерацию, и гейт будет красным всегда).
+2. **`CLAUDE.md`.** Заготовка приходит с `TODO`. Пока он не заполнен, приёмке нечем
+   обосновать блокировку, и ревью превращается в спор о вкусах.
+
+Затем:
+
+```bash
+bcf doctor        # живая проба всех ролей — до того, как от них начнёт зависеть прогон
+bcf tasks         # что в бэклоге, есть ли коллизии владения файлами
+```
+
+### Что придётся дописать руками
+
+`bcf init` заполняет то, что можно вывести из файлов. Три вещи он вывести не может:
+
+- **`config/harness.json` → `graph.roles.*.model`** — имя модели задаёт подписка, и
+  общепринятого умолчания у большинства бэкендов нет.
+- **`config/checks.json` → `_default`** — чем доказывается закрытая задача. Пустой
+  `_default` означает, что задача без собственных проверок может получить PASS на одном
+  судье.
+- **`config/harness.json` → `tests.runner`** — если стек экзотический. Без него гейт
+  «фича доказана тестами» не работает: общий прогон тестов зелен и на пустом месте.
+
+## Векторная память
+
+```bash
+bcf memory init     # поднимет контейнер, проверит эмбеддинги, включит features.memory
+bcf memory status   # счётчики: сколько уроков, багов, отзывов
+```
+
+`init` откажется стартовать, если порт занят чужим контейнером. Это не педантизм: иначе
+клиент подключится к чужой базе, получит отказ авторизации, и выглядеть это будет как
+поломка нашей памяти. Порт правится в `memory/memory.config.json` (и `BCF_PG_PORT`).
+
+Сервер эмбеддингов поднимается отдельно (например, LM Studio) — без него запись работает,
+а отзыв нет, и снаружи это выглядит как «память пустая».
+
+Проверка счётчиков после первого боевого прогона обязательна: если число уроков не
+выросло, значит чтение работает, а запись — нет.
+
+### История разработки (SQLite, независимо от pgvector)
 
 ```bash
 cd memory/history
-pwsh install.ps1             # venv + deps + db init
-python ask.py "some query" --k 3
+pwsh install.ps1
+python ask.py "какой-то запрос" --k 3
 ```
 
-## Enabling the visual phase
+## Визуальная фаза
 
-Set `features.vision: true` and provide your visual test commands via env
-(`BCF_VISION_BUILD_CMD`, `BCF_VISION_CONTRACT_CMD`, `BCF_VISION_CONTRACT_DIR`) — see
-[CONFIG.md](CONFIG.md). Map slugs → paths in `config/scope-map.json` (`vision`).
+Требует визуального харнесса (снятие скриншотов → сравнение → агрегат) и дизайн-эталона.
+Включать её без них — значит получить зелёный гейт на пустоте. Когда они есть:
+`features.vision: true` плюс команды через окружение (`BCF_VISION_BUILD_CMD`,
+`BCF_VISION_CONTRACT_CMD`, `BCF_VISION_CONTRACT_DIR`), см. [CONFIG.md](CONFIG.md).
 
-## Scheduling (optional)
+## Ночные прогоны
 
-The runner is foreground/bounded by design (stops at PASS). To run unattended, wrap
-`loop/run-all.ps1` in cron (Linux/macOS) or Task Scheduler (Windows).
+```bash
+bcf run night                    # вся очередь, автономно
+bcf run night --max-iterations 30
+```
+
+Остановить между задачами — создать файл `.bcf/STOP`. Итог — `.bcf/REVIEW.md`,
+машиночитаемо — `.bcf/run-all.status.json`, одним экраном — `bcf report`.
+
+Для запуска по расписанию заверни `bcf run night` в cron или Планировщик задач Windows.
+Прогон завершается ненулевым кодом, если очередь закрылась не вся, — на это можно
+опираться в автоматизации.
+
+## Несколько проектов
+
+Одна установка фабрики обслуживает любое число репозиториев:
+
+```bash
+bcf doctor --project D:\projects\alpha
+bcf run queue --project D:\projects\beta
+```
+
+Реестр и история аудита ведутся в фабрике: `bcf meta register`, `bcf meta list`.

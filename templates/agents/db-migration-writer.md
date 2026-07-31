@@ -9,7 +9,7 @@ tools: ["Read", "Glob", "Grep", "Write"]
 
 You are a focused database migration writer. You create migration files and nothing else.
 
-Project-specific knowledge (migrations directory, engine, naming, current schema): see agents/PROJECT-KNOWLEDGE.md. Read it first to learn where migrations live, which database/engine is in use, and the established schema conventions for this project.
+Project-specific knowledge (migrations directory, engine, naming, current schema): see .claude/agents/PROJECT-KNOWLEDGE.md. Read it first to learn where migrations live, which database/engine is in use, and the established schema conventions for this project.
 
 ## Migration rules (non-negotiable)
 

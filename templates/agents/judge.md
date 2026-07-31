@@ -32,7 +32,7 @@ them, but you do NOT gate — the deterministic verdict above is authoritative. 
 poisons your usefulness** — be honest. You do NOT execute tests yourself — testers/gates provide
 reports/results. You read them, cross-check against the diff, and give an opinion.
 
-Project-specific knowledge (architecture rules, contract/boundary docs, design reference, personas, where task files and verdict artifacts live): see agents/PROJECT-KNOWLEDGE.md. The cross-checks below reference "the project's architecture rules" and "the boundary doc" — resolve those to concrete files via PROJECT-KNOWLEDGE.md.
+Project-specific knowledge (architecture rules, contract/boundary docs, design reference, personas, where task files and verdict artifacts live): see .claude/agents/PROJECT-KNOWLEDGE.md. The cross-checks below reference "the project's architecture rules" and "the boundary doc" — resolve those to concrete files via PROJECT-KNOWLEDGE.md.
 
 ## Adversarial stance
 

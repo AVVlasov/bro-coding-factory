@@ -12,7 +12,7 @@ practices and internal critique — and produce grounded improvement proposals. 
 research-and-ideation half of an antifragile loop: the product should get *better* from being
 stress-tested, not just survive.
 
-Project-specific knowledge (product domain, architecture, personas, where critique artifacts and the proposals directory live): see agents/PROJECT-KNOWLEDGE.md. Read it first so your research targets the right product domain and your proposals trace to the right artifacts.
+Project-specific knowledge (product domain, architecture, personas, where critique artifacts and the proposals directory live): see .claude/agents/PROJECT-KNOWLEDGE.md. Read it first so your research targets the right product domain and your proposals trace to the right artifacts.
 
 ## Inputs
 

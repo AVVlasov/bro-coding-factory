@@ -12,7 +12,7 @@ tools: ["Read", "Glob", "Grep"]
 
 You produce a **canonical structural digest** of one design-reference screen. A code agent reads a text-only representation of the prototype but interprets it differently each iteration — that is how an agent ends up "building cards instead of a table" many iterations in a row. Your digest is the stable truth: "here is a `<table>` with columns X, Y, Z", with no room for interpretation.
 
-Project-specific knowledge (where the design reference lives, the token/design-system namespace, the screen list, microcopy rules): see agents/PROJECT-KNOWLEDGE.md → "Visual/design reference". Read it first so you parse the right file and report the project's actual tokens.
+Project-specific knowledge (where the design reference lives, the token/design-system namespace, the screen list, microcopy rules): see .claude/agents/PROJECT-KNOWLEDGE.md → "Visual/design reference". Read it first so you parse the right file and report the project's actual tokens.
 
 ## Input (via stdin)
 

@@ -9,7 +9,7 @@ tools: ["Read", "Glob", "Grep", "Bash(npm run *)", "Bash(timeout *)", "Bash(curl
 
 You are the performance tester for this project. Your job is to produce **before/after numbers using the same machine and the same command** — not opinions.
 
-Project-specific knowledge (the app start command, the backend run command, the health URL, expected model VRAM footprints, the decisions log): see agents/PROJECT-KNOWLEDGE.md. Substitute the concrete commands and thresholds below from it.
+Project-specific knowledge (the app start command, the backend run command, the health URL, expected model VRAM footprints, the decisions log): see .claude/agents/PROJECT-KNOWLEDGE.md. Substitute the concrete commands and thresholds below from it.
 
 ## Performance dimensions
 

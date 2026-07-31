@@ -1,65 +1,189 @@
-# Architecture
+# Устройство
 
-## The loop (per iteration)
+## Два корня, и путать их дорого
+
+| | что это | где живёт |
+|---|---|---|
+| **фабрика** (`BCF_HOME`) | движок, шаблоны, мета-слой, память | одна установка на машину |
+| **проект** (`BCF_PROJECT_ROOT`) | код, `config/`, `tasks/`, `.claude/`, `.bcf/` | сколько угодно |
+
+Движок в проект не копируется. `bcf` резолвит корень проекта один раз — из `--project`,
+иначе из `BCF_PROJECT_ROOT`, иначе из верха git-репозитория — и передаёт дальше
+переменной окружения. Всё состояние прогонов пишется в `<project>/.bcf/` и целиком
+принадлежит проекту.
+
+Ошибка в этом месте молчалива и стоит дорого: клиент памяти, который ищется в проекте,
+не находится — и память просто отключается на всех проектах, кроме самой фабрики. Поэтому
+`harness/lib/bcf-context.ps1` разводит `Get-BcfProjectRoot` и `Get-BcfHomeRoot`, и каждый
+путь использует свой.
 
 ```
-┌─ loop/loop.ps1 ────────────────────────────────────────────────┐
-│ 1. read loop/STATE.md (last iter result + backpressure)        │
-│ 2. run the agent ONE step in a FRESH context                   │
-│      agent.command from config/harness.json, prompt = PROMPT.md │
-│      + STATE.md, piped on stdin                                 │
-│ 3. backpressure: type-check + lint-gate + friction-triggers    │
-│      failures → written back into STATE.md for the next iter    │
-│ 4. agent drops loop/VERIFY-REQUEST when code is ready           │
-│ 5. runner invokes loop/verify.ps1 (Phases C–E)                 │
-│ 6. verdict written to tasks/.verdicts/<TASK>.md                │
-│      PASS → stop for human review (bounded mode)               │
+bin/bcf.ps1          диспетчер: разбирает общие флаги, резолвит проект, зовёт подкоманду
+src/lib/             paths · ui · detect · backends · journal · pricing
+src/commands/        по файлу на команду
+harness/             движок (см. ниже)
+templates/           payload: что попадает в проект
+meta/                что фабрика знает о проектах; в проект не копируется
+memory/              pgvector + история; одна установка на все проекты
+```
+
+---
+
+## Цикл (одна итерация)
+
+```
+┌─ harness/loop.ps1 ─────────────────────────────────────────────┐
+│ 1. читает .bcf/STATE.md (итог прошлой итерации + backpressure) │
+│ 2. один шаг агента в СВЕЖЕМ контексте                          │
+│      команда из config/harness.json → agent.command,           │
+│      промпт = PROMPT.md + STATE.md на stdin                    │
+│ 3. backpressure: быстрая проверка + lint-gate + триггеры       │
+│      провалы уходят в STATE.md для следующей итерации          │
+│ 4. агент кладёт .bcf/VERIFY-REQUEST, когда код готов           │
+│ 5. раннер зовёт harness/verify.ps1 (фазы C–E)                  │
+│ 6. вердикт → tasks/.verdicts/<TASK>.md                         │
+│      PASS → остановка для ревью человеком                      │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-Safety rails: iteration timeout (process-tree kill), optional network/SSE-stall watchdog,
-loop-detection (same error ×N → stop), no-progress detection (N iters without product-code
-change → stop), MaxIterations ceiling, `loop/STOP` file, durable git WIP snapshots
-(`refs/loop/wip/<task>`), idempotency gate (skip verify when nothing changed).
+Свежий контекст каждую итерацию — не оптимизация, а способ не дать контексту сгнить:
+результат прошлой попытки приходит фактами (что упало, на какой строке), а не историей
+диалога, в которой ошибка обрастает объяснениями.
 
-The agent only ever runs phases **0 → A.5 → A → B** (plan, contract, implement, self-verify).
-Phases **C → D → E** are executed by the harness, never the agent.
+**Предохранители:** таймаут итерации с убийством дерева процессов; сторож сети и
+зависшего SSE-стрима; детект зацикливания (одна и та же ошибка ×N); детект отсутствия
+прогресса (N итераций без изменений продуктового кода); потолок `MaxIterations`; файл
+`.bcf/STOP`; долговечные git-снапшоты работы (`refs/bcf/wip/<task>`); идемпотентный гейт
+(не гонять verify, когда ничего не менялось).
 
-## Verification (loop/verify.ps1)
+Агент проходит только фазы **0 → A.5 → A → B** (план, контракт, реализация,
+самопроверка). Фазы **C → D → E** исполняет обвязка — никогда не агент.
 
-- **Phase C — testers:** each configured LLM tester runs isolated, in a fresh context, with
-  the diff + task scope. Heartbeat / silent-timeout protection; orphan-process reaper.
-- **Phase D — visual (optional, `features.vision`):** deterministic visual contract run +
-  optional LLM vision critic.
-- **Phase E — judge:** an isolated adversarial judge ("PASS only if I can't find a reason to
-  fail"). **Advisory only.**
-- **Verdict is deterministic:** PASS ⟺ every gate is green (checks exit 0 + lint + in-scope
-  visual). The judge's opinion influences remediation, not the verdict. Result + machine-
-  collected evidence → `tasks/.verdicts/<TASK>.md`.
+## Верификация (harness/verify.ps1)
 
-## Event sourcing
+- **Фаза C — тестеры:** каждый LLM-тестер идёт изолированно, в свежем контексте, с диффом
+  и скоупом задачи. Heartbeat, таймаут тишины, сбор осиротевших процессов.
+- **Фаза D — визуальная** (опционально, `features.vision`): детерминированный контракт
+  плюс LLM-критик по скриншотам.
+- **Фаза E — судья:** изолированный состязательный судья («PASS, только если не найду
+  причины провалить»). **Совещательный.**
+- **Вердикт детерминирован:** PASS ⟺ все гейты зелёные (проверки exit 0 + линт + визуальный
+  контракт в скоупе). Мнение судьи влияет на список remediation, а не на вердикт.
 
-`loop/lib/event-bus.ps1` appends every event to `loop/events.jsonl` (append-only). State is a
-derived projection (`loop/state/STATE.json`) recomputable from the log. `loop/inspect.ps1`
-queries/replays it.
+Обязательные проверки берутся из `config/checks.json` **проекта** и объединяются с планом,
+который агент написал в `VERIFY-REQUEST`. Убрать их агент не может — это и закрывает дыру
+«агент пишет себе план и получает тривиальный PASS».
 
-## Memory (optional, two independent stores)
+## Граф (harness/graph.ps1)
+
+Граф — это обычный `.ps1` из `harness/graphs/`, устроенный так:
+
+```powershell
+$Meta = @{ name = '…'; description = '…'; phases = @(@{ title = '…'; detail = '…' }) }
+if ($GraphMetaOnly) { return }
+… тело: Set-Phase / Invoke-Node / Invoke-Pipeline / Invoke-Barrier …
+```
+
+Разделение на «мету» и «тело» нужно ровно для одного: показать состав фаз ДО того, как
+что-то запустится. Прогон роя стоит денег, и решение «запускать ли» принимается по списку
+фаз, а не по факту уже потраченного бюджета.
+
+**queue** — очередь как граф. Волна это барьер, и он осознанный: готовность задачи зависит
+от того, какие предшественники только что закрылись. Внутри волны барьеров нет — задача,
+закончившая писать код, идёт сливаться, не дожидаясь соседок.
+
+Два узла, которых у цикла нет вовсе:
+- **арбитр слияния** — конфликт больше не равен «задача уходит человеку»: маркеры остаются
+  в дереве, и их сводит отдельный агент. Прежний путь (`merge --abort`) стирал
+  единственный контекст, по которому конфликт вообще разрешим;
+- **разноракурсная приёмка** — несколько критиков на одном слитом дереве, у каждого свой
+  угол. Одинаковые критики на одной модели дают согласованную чушь промышленного
+  масштаба, поэтому ракурсы разные, а не количество больше.
+
+**review** — поиск дефектов с состязательной проверкой. Три правила, без которых это не
+работает: искатели смотрят разными глазами; проверяющих просят ОПРОВЕРГНУТЬ, а не
+«оценить»; дедуп идёт по всему увиденному, включая отклонённое, иначе цикл не сходится.
+
+**research** — один узел только на чтение, пишет ровно один файл.
+
+### Владение файлами и допуск
+
+git worktree изолирует деревья, но не предупреждает, что две ветки правят одни файлы:
+конфликт всплывает на слиянии, когда оба агента уже приняли несовместимые решения.
+Поэтому здесь не лок на время работы (долгие локи — известный провал: 20 агентов дают
+пропускную способность 2–3), а **допуск на старте** плюс накопление фактов:
+
+1. `claims.json` — какие файлы держат запущенные задачи;
+2. **co-change** — какие файлы исторически меняются вместе (по git log): декларация врёт,
+   агент правит один файл, а ломает соседний, который его зовёт;
+3. `conflicts.json` — какие пары задач реально сталкивались. Планировщик больше не сводит
+   их в параллель, даже если декларации чисты.
+
+Задача без секции «## Файлы» к работе не допускается: без декларации проверить, что она
+не залезет в чужой файл, нечем, и расползание скоупа обнаружится только на слиянии.
+
+## Журнал и возобновление
+
+Каждый узел графа пишется в `.bcf/graph/<runId>/journal.jsonl` — append-only и
+единственный источник правды о прогоне. `bcf runs/board/report/cost` читают ОТСЮДА:
+отдельная сводка рядом с журналом рано или поздно начинает с ним расходиться, и
+расходится молча.
+
+Оборванный прогон доигрывается: `--resume <runId>` берёт завершившиеся узлы из журнала и
+не пересчитывает их.
+
+Цикл ведёт свой журнал: `harness/lib/event-bus.ps1` пишет в `.bcf/events.jsonl`, состояние
+(`.bcf/state/STATE.json`) — производная проекция, пересчитываемая из лога
+(`harness/inspect.ps1 --replay`).
+
+## Память (опционально, два независимых хранилища)
 
 | | `memory/history` | `memory/pgvector` |
 |---|---|---|
-| Backend | SQLite + sqlite-vec | Postgres 16 + pgvector (Docker) |
-| Purpose | development history (decisions, failures, retros) | agent anti-patterns + bug-ledger |
-| Embeddings | nomic-embed-text (768-dim) | bge-m3 (1024-dim) |
-| Written by | manual / verdict ingestion | retrospector / supervisor agents |
-| Read by | `ask.py` queries | pre-task injection hook |
+| Бэкенд | SQLite | Postgres 16 + pgvector (Docker) |
+| Что хранит | история разработки (решения, провалы, ретро) | анти-паттерны агентов + реестр багов |
+| Эмбеддинги | nomic-embed-text (768) | bge-m3 (1024) |
+| Кто пишет | вручную / из вердиктов | ретроспектор, супервизор, узлы графа |
+| Кто читает | `ask.py` | хук предзагрузки контекста, `Invoke-Node -Recall` |
 
-They share nothing. Both degrade gracefully when their embedding/LLM backend is absent.
-The pgvector schema (`memory/pgvector/init.sql`) includes `anti_patterns`, `recall_events`,
-`proposals`, and `bugs` (bug-ledger, with `UNIQUE(task_id, short_id)`).
+Общего у них нет ничего. Оба деградируют мягко: без бэкенда эмбеддингов харнесс работает,
+просто не учится.
 
-## Agents
+**Что в цикле обучения ломалось раньше и как это чинится здесь.** Замер на прогоне из
+14 задач: `anti_patterns = 1`, `bugs = 0`, `recall_events = 57` — механизм жил, но выучил
+единственную заметку и потом 57 раз перечитывал её же. Две причины, обе молчаливые:
+запрос собирался из строки-заглушки вместо реального текста узла, и писал уроки только
+ретроспектор после вердикта, а вердиктов почти не было. Здесь отзыв идёт по настоящему
+промпту узла, а пишут не только успехи: провал узла, провал задачи и подтверждённая
+находка критика — все становятся уроками. Перед записью — дедуп по similarity: граф пишет
+на порядок больше цикла, и без дедупа таблица за пару прогонов превращается в шум.
 
-Generic role templates in `agents/` (`judge`, `retrospector`, `supervisor`, `test-author`,
-`reference-digester`, `testers/*`). Each keeps universal role logic and points to
-`agents/PROJECT-KNOWLEDGE.md` for product specifics you provide. `config/agents.json` maps
-roles → files + models. Invokers in `agents/bin/` call them over an OpenAI-compatible endpoint.
+Всякий вызов памяти ограничен по времени. Без таймаута вспомогательная подсистема
+превращается в жёсткую зависимость: наблюдалось живьём — Docker не был запущен, `recall`
+висел на подключении, и прогон замер без единого события, снаружи выглядя как «граф
+молчит».
+
+## Роли
+
+Роли — файлы `.claude/agents/*.md` в проекте: их читает и Claude Code как субагентов, и
+обвязка при верификации. Одно место, а не два: вторая копия означала бы, что однажды
+поправят не ту. Связь «роль → файл → модель» — в `config/agents.json`.
+
+Три правила расстановки, за которые заплачено осознанно:
+
+1. **critic не сидит на модели worker** — несколько агентов одной модели на одном
+   контексте приходят к одной ошибке и подтверждают её друг другу;
+2. **planner и critic из разных семейств** — критик не защищает решение собственного
+   планировщика;
+3. **кто только смотрит — живёт на песочнице «только чтение»**: иначе однажды что-нибудь
+   поправит «по пути».
+
+## Мета-слой
+
+`meta/` знает о проектах, но в проекты не попадает. Реестр, append-only журналы аудита,
+вики типичных ошибок, судьи со своим фикстурным харнессом.
+
+Главное правило: кодовый агент не должен знать о существовании фабрики. Изоляция
+обеспечивается рабочей директорией агента, а НЕ deny-правилом, называющим внешнюю папку —
+само такое правило уже утечка. `bcf meta audit` считает найденную в проекте ссылку на
+фабрику дефектом.

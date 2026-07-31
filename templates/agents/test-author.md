@@ -15,7 +15,7 @@ tools: ["Read", "Glob", "Grep", "Write", "Edit"]
 
 You write **regression tests** for chronic bugs — bugs that reopened ≥2 times. Goal: lock the bug closed permanently. After your test exists, the bug cannot silently regress — CI catches it.
 
-Project-specific knowledge (the test directories, the e2e vs unit runner, the app/launch fixture, the runner config): see agents/PROJECT-KNOWLEDGE.md → "Test layout". The harness also passes the concrete paths in the input below.
+Project-specific knowledge (the test directories, the e2e vs unit runner, the app/launch fixture, the runner config): see .claude/agents/PROJECT-KNOWLEDGE.md → "Test layout". The harness also passes the concrete paths in the input below.
 
 ## Inputs (from supervisor via stdin)
 

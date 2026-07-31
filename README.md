@@ -1,87 +1,140 @@
-# bro-coding-factory
+# bro coding factory
 
-A **project-agnostic autonomous coding harness** — the "Ralph" loop pattern, hardened and
-generalized for open source. It drives any CLI coding agent to work a task to completion in
-**bounded, self-correcting iterations**, then gates the result behind a deterministic
-verification + adversarial judge, and (optionally) learns from its own failures.
+**Фабрика обвязки для кодовых агентов.** Ставит в любой проект `.claude/` (хуки, скилы,
+роли, судьи), настраивает конфиг под его стек, подключает векторную память — и водит
+работу двумя способами: **циклом** (ночной прогон одной задачи за другой) или **графом**
+(волны по зависимостям, слияния арбитром, разноракурсная приёмка).
 
-Everything project-specific lives in `config/` and `agents/PROJECT-KNOWLEDGE.md`. The harness
-itself contains **no project specifics and no secrets** — point it at your repo, set a few
-config values, bring your own agent backend + API key (via `.env`), and run.
+Всё делается одной командой `bcf`. Всё, что она пишет, — текстовые файлы под git.
 
-> Runtime: **PowerShell 7** (cross-platform — Windows / Linux / macOS) + **Python 3.10+**
-> (only for the optional memory subsystems). No build step.
+```
+bcf init            настроить фабрику под проект — восемь шагов
+bcf doctor          живая проба: бэкенды, авторизации, память, гейты
+bcf run night       ночной цикл по всей очереди
+bcf run queue       граф: волны по зависимостям
+bcf report          итог одним экраном
+```
+
+> Требуется **PowerShell 7** (`pwsh`, кросс-платформенный), git и хотя бы один кодовый
+> CLI-агент. Python 3.10+ и Docker — только для памяти (она опциональна).
 
 ---
 
-## What it does
+## Зачем это
 
-Each iteration starts with a **fresh agent context** (no context-window rot), the agent does
-**one step** of the active task, and the runner applies **backpressure**:
+Одиночный запуск агента упирается в три вещи, и все три лечатся не промптом, а обвязкой:
 
-- **Loop runner** (`loop/loop.ps1`) — fresh-context iterations; iteration timeout with
-  process-tree kill; optional network/SSE-stall watchdog; loop-detection (same error ×N);
-  no-progress detection; durable git WIP snapshots; verdict-gate stop for human review.
-- **Verification + judge** (`loop/verify.ps1`) — runs LLM testers and deterministic checks,
-  an optional visual phase, and an isolated adversarial judge. The verdict is **deterministic**
-  (PASS ⟺ all gates green); the judge is advisory.
-- **Self-learning memory** (optional) — two independent stores: a lightweight SQLite
-  "development history" (`memory/history`) and a pgvector "anti-pattern + bug-ledger"
-  (`memory/pgvector`). Past failures are recalled into the next iteration so the agent
-  doesn't repeat them. Embeddings are served by a local **[LM Studio](https://lmstudio.ai)**
-  instance (or any OpenAI-compatible `/v1/embeddings` endpoint) — bge-m3 (1024-dim) for
-  pgvector, nomic-embed-text (768-dim) for history.
-- **Friction triggers / hooks** — pause for human review on irreversible edits (migrations,
-  deps, CI, auth…), config-driven.
+**Контекст гниёт.** Поэтому каждая итерация цикла начинается со СВЕЖЕГО контекста, а
+результат прошлой попытки приходит к агенту не историей диалога, а фактами: что упало,
+на какой строке, какие проверки красные.
 
-## Repo layout
+**Агент оценивает сам себя.** Поэтому вердикт PASS/FAIL считается ДЕТЕРМИНИРОВАННО по
+зелёным гейтам, а не по мнению модели. Судья остаётся, но он совещательный, а
+обязательные проверки задаёт владелец в `config/checks.json` — агент не может сузить их
+до тривиально зелёных.
+
+**Провал ничему не учит.** Поэтому провал узла, провал задачи и подтверждённая находка
+критика пишутся в векторную память, и следующий узел получает их в контекст ДО работы.
+
+## Два движка, разная экономика
+
+| | цикл (`bcf run night`) | граф (`bcf run queue`) |
+|---|---|---|
+| Как идёт | задача за задачей, многопроходно | волнами по зависимостям |
+| Работа и интеграция | один неделимый шаг | разные узлы, барьера между ними нет |
+| Конфликт слияния | задача уходит человеку | сводит арбитр |
+| Приёмка | тестеры + судья | несколько критиков разными ракурсами |
+| Чем платишь | временем | деньгами: арбитр и критики стоят дороже |
+
+Цикл предсказуемее на ночь. Граф быстрее по стенным часам. Выбор не косметический,
+поэтому `bcf run` без аргумента объясняет разницу, а не показывает список.
+
+## Быстрый старт
+
+```bash
+git clone <this repo> && cd bro-coding-factory
+# добавь bin/ в PATH (или зови pwsh bin/bcf.ps1)
+
+cd /path/to/your/project
+bcf init          # разбор проекта, опрос установленных CLI, роли, модели
+bcf doctor        # живая проба — до того, как от бэкендов начнёт зависеть прогон
+bcf memory init   # опционально: без памяти прогоны не учатся на прошлых ошибках
+bcf run queue     # первая волна
+```
+
+`bcf init` не зовёт агентов и не тратит токены (кроме живой пробы ролей). Каждый его шаг
+заканчивается текстовым файлом, который можно открыть и поправить руками; у каждого
+предложения виден источник — **проверено** (запускали), **уверенно** (следует из файлов
+на диске), **догадка** (вывели по косвенным признакам).
+
+## Что попадает в проект
 
 ```
-config/      harness.json · agents.json · triggers.json · checks.json · scope-map.json · memory.config.json
-loop/        loop.ps1 · verify.ps1 · triggers.ps1 · lint-gate.ps1 · start.ps1 · run-all.ps1 · inspect.ps1
-             PROMPT.md   (the per-iteration prompt)
-             lib/        event-bus · harness-guard · evidence · hard-cap · memory bridge · …
-             lib/adapters/  opencode stream renderer (swap for a different backend)
-agents/      generic role templates (judge, retrospector, supervisor, test-author, testers/…)
-             PROJECT-KNOWLEDGE.example.md  (copy → PROJECT-KNOWLEDGE.md, fill in your specifics)
-             bin/        invoke-*.ps1  (role invokers)
-hooks/       done-gate · agent-infra-protect · pre-task-memory-inject · finding-gate + hooks-config.json
-memory/      pgvector/ (Docker + Postgres+pgvector)   history/ (SQLite + embeddings)
-docs/        ARCHITECTURE.md · SETUP.md · CONFIG.md
+<project>/
+├── .claude/
+│   ├── hooks/        14 гейтов: деструктивные команды, формат DoD, моки-как-реальность,
+│   │                 защита обвязки от правок кодовым агентом
+│   ├── skills/       протокол выполнения задачи, самопроверка, декомпозиция, разведка
+│   ├── commands/     /prime /feature /review /verify /build-check /red-team /start /evolve
+│   ├── agents/       роли: судья, тестеры (архитектура/api/производительность/ux),
+│   │                 ретроспектор, супервизор, автор тестов
+│   └── settings.json проводка хуков
+├── config/           harness.json · checks.json · agents.json · triggers.json · scope-map.json
+├── tasks/            бэклог: <PREFIX>-NN-<slug>.md + вердикты
+├── CLAUDE.md         правила проекта (заготовка — заполнить)
+└── .bcf/             состояние прогонов; в git не попадает
 ```
 
-## Quick start
+Движок в проект **не копируется**: он живёт в фабрике и получает адрес проекта через
+`BCF_PROJECT_ROOT`. Одна установка обслуживает любое число репозиториев, и обновление
+фабрики не требует обхода проектов.
 
-1. **Prereqs:** PowerShell 7 (`pwsh`), git, and a CLI coding agent on PATH (default: `opencode`).
-   For the optional memory: Python 3.10+, Docker (pgvector), and [LM Studio](https://lmstudio.ai)
-   serving an embedding model (or any OpenAI-compatible `/v1/embeddings` endpoint).
-   See [docs/SETUP.md](docs/SETUP.md).
-2. **Configure:** edit `config/harness.json` — set `agent.command`, `models.*`, and
-   `productPaths`. Copy `.env.example` → `.env` and add your agent API key. Copy
-   `agents/PROJECT-KNOWLEDGE.example.md` → `agents/PROJECT-KNOWLEDGE.md` and fill it in.
-3. **Define a task:** create `tasks/<TASK-ID>-<slug>.md` and point `tasks/CURRENT-FOCUS.md` at it.
-4. **Run:**
-   ```powershell
-   pwsh loop/start.ps1 <TASK-ID>      # background launcher
-   # or directly:
-   pwsh loop/loop.ps1 <TASK-ID>
-   ```
-   Progress: `loop/loop.log`. Inspect events: `pwsh loop/inspect.ps1 --task <TASK-ID>`.
-   The loop stops at `verdict: PASS` for your review.
+## Команды
 
-See [docs/CONFIG.md](docs/CONFIG.md) for every config knob and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-for how the pieces fit together.
+| | |
+|---|---|
+| `bcf init` | настроить фабрику под проект (8 шагов) |
+| `bcf install` | записать/обновить обвязку; существующее не трогает без `--force` |
+| `bcf detect` | разбор проекта, ничего не пишет |
+| `bcf doctor` | живая проба бэкендов, авторизаций, памяти и гейтов |
+| `bcf tasks` | бэклог: готово / ждёт / закрыто, коллизии владения файлами |
+| `bcf run loop\|night\|queue\|review` | прогон |
+| `bcf runs` · `bcf board` · `bcf report` | журналы, доска, итог |
+| `bcf cost` | расход: токены → деньги, по ролям и фазам |
+| `bcf memory status\|init\|ask` | векторная память |
+| `bcf research <TASK>` | разведка задачи до работы, только чтение |
+| `bcf prd` | четыре вопроса о продукте → `docs/PRD.md` |
+| `bcf meta list\|register\|audit\|wiki\|log` | мета-слой: реестр проектов и аудит обвязки |
 
-## Bring your own backend
+Подробно — [docs/CLI.md](docs/CLI.md).
 
-The agent backend is a configurable command template (`config/harness.json` → `agent.command`,
-with `{model}` substituted; the prompt is piped on stdin). It ships defaulting to
-[opencode](https://github.com/sst/opencode) (provider-agnostic, open source). To use another
-CLI agent, change `agent.command` and provide a matching stream adapter under
-`loop/lib/adapters/`.
+## Устройство фабрики
 
-## Status & provenance
+```
+bin/         bcf.ps1 (+ обёртки для cmd и sh)
+src/         lib/ (paths · ui · detect · backends · journal · pricing) + commands/
+harness/     движок: loop.ps1 · verify.ps1 · run-all.ps1 · graph.ps1 · graphs/ · lib/
+templates/   payload: claude/ (хуки, скилы, команды, settings) · config/ · agents/ · project/
+meta/        мета-слой: реестр, аудит, вики, судьи — в проект не копируется
+memory/      pgvector + история (одна установка на все проекты)
+tests/       дымовые тесты CLI
+```
 
-Extracted and generalized from a private project's battle-tested harness. The control logic
-(timeouts, loop/no-progress detection, deterministic verdict gate, WIP snapshots) is preserved;
-all project identifiers, paths, model ids, and keys were removed. MIT licensed.
+Подробно — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), настройка —
+[docs/SETUP.md](docs/SETUP.md), все ключи конфига — [docs/CONFIG.md](docs/CONFIG.md).
+
+## Тесты
+
+```bash
+pwsh tests/cli.tests.ps1                     # дымовые тесты CLI, без сети и моделей
+pwsh harness/tests/graph-runtime.tests.ps1   # рантайм графа
+pwsh harness/tests/merge-integration.tests.ps1
+```
+
+## Происхождение
+
+Собрано из четырёх наработок: цикл Ralph и организация `.claude`, движок графа агентов,
+управляющий мета-слой и дизайн CLI. Всё проектное живёт в конфигах и `CLAUDE.md`; сама
+фабрика не содержит ни специфики, ни секретов.
+
+MIT.
