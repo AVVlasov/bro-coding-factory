@@ -1,0 +1,134 @@
+# ui.ps1 — вывод CLI.
+#
+# Правило вывода, из-за которого этот файл вообще существует: у каждого утверждения
+# должен быть виден ИСТОЧНИК. «Проверено» (запускали и смотрели) и «догадка» (вывели из
+# структуры проекта) печатаются по-разному, потому что подписываться под ними человек
+# будет по-разному. Второе правило: опасное место называется ПОСЛЕДСТВИЕМ, а не
+# статусом — «затянет чужие правки в задачу», а не «дерево грязное».
+
+$script:BcfNoColor = [bool]$env:BCF_NO_COLOR
+
+function Write-BcfLine {
+    param([string]$Text = '', [string]$Color = '')
+    if ($Color -and -not $script:BcfNoColor) { Write-Host $Text -ForegroundColor $Color }
+    else { Write-Host $Text }
+}
+
+function Write-BcfTitle {
+    param([Parameter(Mandatory)][string]$Text, [string]$Sub = '')
+    Write-Host ''
+    Write-BcfLine "  $Text" 'Cyan'
+    if ($Sub) { Write-BcfLine "  $Sub" 'DarkGray' }
+    Write-Host ''
+}
+
+function Write-BcfRule { param([int]$Width = 78) Write-BcfLine ('  ' + ('─' * $Width)) 'DarkGray' }
+
+function Write-BcfOk    { param([string]$T) Write-BcfLine "  ✓ $T" 'Green' }
+function Write-BcfWarn  { param([string]$T) Write-BcfLine "  ⚠ $T" 'Yellow' }
+function Write-BcfFail  { param([string]$T) Write-BcfLine "  ✗ $T" 'Red' }
+function Write-BcfDim   { param([string]$T) Write-BcfLine "  · $T" 'DarkGray' }
+function Write-BcfNote  { param([string]$T) Write-BcfLine "    $T" 'DarkGray' }
+
+# Источник вывода. Печатается рядом со значением, а не в легенде внизу: легенду не
+# читают, а решение принимают по строке.
+function Get-BcfSourceTag {
+    param([ValidateSet('проверено', 'уверенно', 'догадка')][string]$Source)
+    switch ($Source) {
+        'проверено' { return @{ text = 'проверено'; color = 'Green' } }
+        'уверенно'  { return @{ text = 'уверенно';  color = 'DarkCyan' } }
+        default     { return @{ text = 'догадка';   color = 'Yellow' } }
+    }
+}
+
+function Write-BcfField {
+    param([string]$Name, [string]$Value, [string]$Source = '', [int]$NameWidth = 16)
+    $line = "  {0,-$NameWidth} {1}" -f $Name, $Value
+    if (-not $Source) { Write-Host $line; return }
+    $tag = Get-BcfSourceTag $Source
+    Write-Host $line -NoNewline
+    if ($script:BcfNoColor) { Write-Host "   [$($tag.text)]" }
+    else { Write-Host "   $($tag.text)" -ForegroundColor $tag.color }
+}
+
+# Таблица без выравнивания по содержимому — колонки заданы заранее. Автоширина ломается
+# ровно тогда, когда нужна больше всего: одна длинная строка сдвигает всю таблицу.
+function Write-BcfTable {
+    param([string[]]$Headers, [int[]]$Widths, [object[]]$Rows, [string[]]$RowColors = @())
+    $fmt = ($Widths | ForEach-Object -Begin { $i = 0 } -Process { $s = "{$i,-$_}"; $i++; $s }) -join ' '
+    Write-BcfLine ('  ' + ($fmt -f $Headers)) 'DarkGray'
+    Write-BcfLine ('  ' + ('─' * (($Widths | Measure-Object -Sum).Sum + $Widths.Count - 1))) 'DarkGray'
+    for ($r = 0; $r -lt $Rows.Count; $r++) {
+        $c = if ($r -lt $RowColors.Count -and $RowColors[$r]) { $RowColors[$r] } else { '' }
+        Write-BcfLine ('  ' + ($fmt -f $Rows[$r])) $c
+    }
+}
+
+# Список ручной работы. Разделён на «без этого не поедет» и «можно позже» намеренно:
+# один общий список из восьми пунктов человек не разбирает, он его закрывает.
+function Write-BcfManualActions {
+    param([object[]]$Blocking = @(), [object[]]$Later = @())
+    if ($Blocking.Count) {
+        Write-Host ''
+        Write-BcfLine "  ⚠ БЕЗ ЭТОГО ПРОГОН НЕ ПОЕДЕТ   $($Blocking.Count)" 'Red'
+        $i = 0
+        foreach ($b in $Blocking) {
+            $i++
+            Write-BcfLine "  $i  $($b.what)" 'Red'
+            if ($b.why) { Write-BcfNote $b.why }
+            if ($b.fix) { Write-BcfLine "     $($b.fix)" 'White' }
+        }
+    }
+    if ($Later.Count) {
+        Write-Host ''
+        Write-BcfLine "  · МОЖНО ПОЗЖЕ, НО ЗАПОМНИ   $($Later.Count)" 'DarkGray'
+        foreach ($l in $Later) { Write-BcfDim $l }
+    }
+}
+
+# --- Ввод ---------------------------------------------------------------------------
+#
+# Все запросы проходят через эти две функции, чтобы неинтерактивный режим (--yes, CI,
+# ночной прогон) вёл себя предсказуемо: он не «отвечает за человека», а берёт дефолт и
+# ГОВОРИТ, что взял. Молчаливый дефолт в мастере настройки — способ получить конфиг,
+# которого никто не выбирал.
+$script:BcfAssumeYes = $false
+function Set-BcfAssumeYes { param([bool]$Value) $script:BcfAssumeYes = $Value }
+function Get-BcfAssumeYes { return $script:BcfAssumeYes }
+
+function Read-BcfChoice {
+    param([string]$Question, [string[]]$Options, [int]$Default = 0)
+    if ($script:BcfAssumeYes) {
+        Write-BcfDim "$Question → $($Options[$Default]) (по умолчанию, режим без вопросов)"
+        return $Default
+    }
+    Write-Host ''
+    Write-BcfLine "  $Question" 'White'
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        $mark = if ($i -eq $Default) { '▸' } else { ' ' }
+        Write-Host ("    $mark [{0}] {1}" -f ($i + 1), $Options[$i])
+    }
+    $ans = Read-Host "  выбор [1-$($Options.Count)], enter = $($Default + 1)"
+    if (-not $ans) { return $Default }
+    $n = 0
+    if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le $Options.Count) { return $n - 1 }
+    return $Default
+}
+
+function Read-BcfConfirm {
+    param([string]$Question, [bool]$Default = $true)
+    if ($script:BcfAssumeYes) { return $Default }
+    $hint = if ($Default) { '[Y/n]' } else { '[y/N]' }
+    $ans = Read-Host "  $Question $hint"
+    if (-not $ans) { return $Default }
+    return ($ans -match '^(y|yes|д|да)$')
+}
+
+function Read-BcfText {
+    param([string]$Question, [string]$Default = '')
+    if ($script:BcfAssumeYes) { return $Default }
+    $suffix = if ($Default) { " [$Default]" } else { '' }
+    $ans = Read-Host "  $Question$suffix"
+    if (-not $ans) { return $Default }
+    return $ans.Trim()
+}

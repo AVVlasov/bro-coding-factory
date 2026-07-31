@@ -1,25 +1,41 @@
 {
-  "$comment": "Central harness config. All project-specific values live here — scripts read from this file, never hardcode. Copy and adapt for your project. No secrets here: API keys go in your environment / .env (never committed).",
+  "$comment": "Центральный конфиг обвязки. Все проектные значения — здесь; скрипты читают отсюда и не хардкодят. Секретов тут нет: ключи живут в окружении / .env и в git не попадают. Пишется командой `bcf init`, дальше правится руками — это обычный JSON.",
 
   "engine": "ralph",
 
   "agent": {
-    "$comment": "Code-agent backend. {model} and {promptFile} are substituted at runtime. The prompt is also piped on stdin. To use a different backend (e.g. Claude Code) change 'command' and provide a matching stream adapter under loop/lib/adapters.",
+    "$comment": "Бэкенд кодового агента для ЦИКЛА (одна задача, много итераций). {model} подставляется на запуске, промпт идёт на stdin. Для другого CLI поменяй command и положи разборщик его потока в harness/lib/adapters.",
     "command": "opencode run --dangerously-skip-permissions --thinking --format json --model {model}",
     "adapter": "opencode",
     "promptStdin": true
   },
 
   "models": {
-    "$comment": "Model ids passed to the backend. Empty string = let the backend use its configured default.",
+    "$comment": "Модели цикла. Пустая строка = взять то, что настроено в самом бэкенде.",
     "code": "",
     "tester": "",
     "vision": "",
     "judge": ""
   },
 
+  "graph": {
+    "$comment": "Движок ГРАФА (harness/graph.ps1). Роли — не синонимы: экономика роя держится на том, что рамочных решений мало и они дорогие, а исполнения много и оно дешёвое. Одна модель на всё = планировочная цена за каждый токен исполнения. Проверить проводку живьём: bcf doctor.",
+
+    "backends": {
+      "$comment": "Заполняется `bcf init` по результатам опроса установленных CLI. Каждый бэкенд — своя команда и свой формат событий (format выбирает разборщик в harness/lib/graph-runtime.ps1)."
+    },
+
+    "roles": {
+      "$comment": "Три правила, за которые тут заплачено осознанно: (1) critic сидит НЕ на модели worker — несколько агентов одной модели на одном контексте приходят к одной ошибке и подтверждают её друг другу; (2) planner и critic из разных семейств, чтобы критик не защищал решение собственного планировщика; (3) роль, обязанная только смотреть, живёт на бэкенде с песочницей только на чтение.",
+      "planner": { "backend": "", "model": "" },
+      "arbiter": { "backend": "", "model": "" },
+      "critic":  { "backend": "", "model": "" },
+      "worker":  { "backend": "", "model": "" }
+    }
+  },
+
   "paths": {
-    "$comment": "Repo-relative locations. The harness dir itself is loop/ (where these scripts live).",
+    "$comment": "Пути относительно корня ПРОЕКТА. Состояние прогонов живёт в .bcf/ и в git не попадает.",
     "tasks": "tasks",
     "verdicts": "tasks/.verdicts",
     "currentFocus": "tasks/CURRENT-FOCUS.md",
@@ -27,13 +43,30 @@
   },
 
   "productPaths": ["src"],
-  "$productPaths_comment": "Directories that count as 'product code'. Used for no-progress detection, scope-creep checks, and verify-skip. Add your source roots, e.g. [\"src\", \"app\", \"server\"].",
+  "$productPaths_comment": "Что считается продуктовым кодом. Отсюда берётся детекция «прогресса нет» и расползания скоупа, и по этому же списку ревью решает, что вообще смотреть. Ошибка здесь означает, что правки в доках засчитываются как работа над задачей.",
+
+  "generatedFiles": [],
+  "$generatedFiles_comment": "Файлы, воспроизводимые сборкой (локи, автогенерация). Их грязность в основном дереве НЕ блокирует слияние: один изменённый лок-файл однажды завалил слияние семи задач подряд, каждая из которых уже дошла до PASS.",
 
   "taskIdPattern": "[A-Za-z][A-Za-z0-9]*-\\d+",
   "taskIdPrefix": "TASK",
 
+  "backpressure": {
+    "$comment": "Быстрая проверка после КАЖДОЙ итерации, до верификации. Пустой массив = пропустить. Тяжёлым прогонам здесь не место. Команда, которой не существует, делает гейт красным всегда — и агент начинает чинить несуществующее.",
+    "typecheck": []
+  },
+
+  "tests": {
+    "$comment": "Чем доказывается закрытая задача. runner: cargo|vitest|jest|pytest|go|custom. Пресеты команд и разбора вывода — в harness/require-tests.ps1; здесь можно переопределить любое поле. Без runner гейт «фича доказана тестами» не работает: общий прогон тестов зелен и на пустом месте.",
+    "runner": "",
+    "command": "",
+    "packageFlag": "",
+    "passedPattern": "",
+    "failedPattern": ""
+  },
+
   "net": {
-    "$comment": "Connectivity watchdog. Set probeHost to your model API host to enable SSE-stall + offline detection. Empty probeHost disables the net-watchdog entirely.",
+    "$comment": "Сторож соединения: probeHost = хост API модели. Пустой probeHost выключает сетевой watchdog целиком.",
     "probeHost": "",
     "probePort": 443
   },
@@ -42,12 +75,20 @@
     "iterSec": 900,
     "streamStallSec": 150,
     "netWaitMaxSec": 0,
-    "netStallRetryMax": 8,
+    "$netStallRetryMax_comment": "Ретраи итерации не тратят бюджет, поэтому их потолок = сколько времени можно сжечь впустую. При зависаниях по ~10 минут восемь попыток это 80 минут на одну итерацию.",
+    "netStallRetryMax": 3,
     "stepSec": 1800,
-    "silentSec": 600
+    "silentSec": 600,
+    "$testerSilentSec_comment": "Порог тишины для LLM-шагов верификации. Ниже основного: агент может законно молчать во время долгой сборки, а тестер либо стримит, либо его стрим завис.",
+    "testerSilentSec": 120
   },
 
   "limits": {
+    "$parallel_comment": "taskConcurrency — сколько задач очереди идут одновременно (1 = последовательно). Реальный ограничитель тут не CPU, а пересечение файлов: задача не стартует, пока её файлы держит другая. agentConcurrency — общий потолок агентских процессов: параллелизм упирается в rate-limit провайдера раньше, чем в машину.",
+    "taskConcurrency": 1,
+    "agentConcurrency": 4,
+    "fanoutConcurrency": 2,
+    "testerConcurrency": 3,
     "maxIterations": 40,
     "noProgressLimit": 3,
     "sprawlFileLimit": 40,
@@ -60,10 +101,11 @@
   },
 
   "features": {
-    "$comment": "Optional subsystems. Disabled by default so the loop runs with zero external deps. Enable per your setup. 'memory' requires the pgvector stack (memory/pgvector). 'vision' requires a visual test runner + a vision-capable model.",
+    "$comment": "Опциональные подсистемы. Выключены по умолчанию, чтобы цикл ехал без внешних зависимостей. memory требует pgvector + сервер эмбеддингов (bcf memory init). vision требует визуальный харнесс и дизайн-эталон: включать её без них значит получить зелёный гейт на пустоте.",
     "memory": false,
     "bugSupervisor": false,
     "hardCap": false,
+    "fanout": false,
     "vision": false,
     "visualContext": false,
     "referenceDigest": false,

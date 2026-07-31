@@ -167,7 +167,7 @@ py_re="$(ext_regex "$py_targets")"
 # Filter to files that matter (skip generated/vendored + the harness's own agent definitions).
 match_re="$ts_re|$py_re"
 [ -n "$migration_dir" ] && match_re="$match_re|^$migration_dir/"
-relevant=$(echo "$changed_files" | grep -E "$match_re" | grep -vE '^(node_modules|dist|dist-electron|\.claude/(skills|agents|hooks|commands)/)' || true)
+relevant=$(echo "$changed_files" | grep -E "$match_re" | grep -vE '^(node_modules|dist[^/]*|target|build|out|\.bcf|\.claude/(skills|agents|hooks|commands)/)' || true)
 
 if [ -z "$relevant" ]; then
   exit 0

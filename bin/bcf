@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# bcf — обёртка для Linux/macOS. Движок требует PowerShell 7.
+if ! command -v pwsh >/dev/null 2>&1; then
+  echo "bcf: нужен PowerShell 7 (pwsh). См. https://learn.microsoft.com/powershell/scripting/install/installing-powershell" >&2
+  exit 127
+fi
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec pwsh -NoProfile -File "$DIR/bcf.ps1" "$@"

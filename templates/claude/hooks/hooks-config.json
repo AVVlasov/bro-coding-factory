@@ -1,9 +1,9 @@
 {
   "_doc": {
     "purpose": "Configuration for the done-gate (and other) backpressure hooks. The done-gate's universal checks (verdict-file PASS, type-check, py-compile, no-API-key-literals-introduced) always run. The project-specific checks below NO-OP until you fill these fields, so the gate is safe to ship with empty defaults.",
-    "ipc_dirs": "List of repo-relative path prefixes that hold IPC handler definitions (e.g. ['electron']). When set, the gate verifies that every NEW ipcMain.handle('channel', ...) added this session is also wired into a preload bridge and a typed client. See ipc_preload_file / ipc_types_file. Empty = IPC triple-wiring check disabled.",
-    "ipc_preload_file": "Repo-relative path to the preload bridge file that must reference each new IPC channel (e.g. 'electron/preload.ts'). Empty = check disabled.",
-    "ipc_types_file": "Repo-relative path to the typed IPC client/surface that must reference each new IPC channel (e.g. 'src/lib/ipc.ts'). Empty = check disabled.",
+    "ipc_dirs": "List of repo-relative path prefixes that hold cross-process channel handlers (e.g. ['main'] for a desktop shell, ['server/rpc'] for an RPC surface). When set, the gate verifies that every NEW channel registered this session is also wired into the bridge file and the typed client — a channel wired in one place out of three compiles fine and fails only at runtime. See ipc_preload_file / ipc_types_file. Empty = triple-wiring check disabled.",
+    "ipc_preload_file": "Repo-relative path to the bridge file that must reference each new channel (e.g. 'main/preload.ts'). Empty = check disabled.",
+    "ipc_types_file": "Repo-relative path to the typed client/surface that must reference each new channel (e.g. 'src/lib/rpc.ts'). Empty = check disabled.",
     "migration_dir": "Repo-relative directory holding SQL/DB migration files (e.g. 'src/lib/migrations'). When set, the gate checks: (a) new migration files are registered in migration_index_file; (b) ALTER TABLE ... ADD COLUMN is guarded by a column-existence check; (c) the index calls the per-migration version recorder once per migration. Empty = all migration checks disabled.",
     "migration_index_file": "Repo-relative path to the migration registry/index that lists migrations and records applied versions (e.g. 'src/lib/migrations/index.ts'). Empty = registration + version-recorder checks disabled.",
     "migration_version_fn": "Name of the function the index must call once per migration to persist the schema version (e.g. 'insertSchemaVersion'). Empty = version-recorder check disabled.",
@@ -13,7 +13,10 @@
     "ts_targets": "File extensions treated as TypeScript for the type-check (tsc --noEmit) and wrapper checks.",
     "py_targets": "File extensions treated as Python for py_compile and wrapper checks.",
     "console_check_dirs": "(lint-gate) Repo-relative dirs where console.* is forbidden (e.g. main/IPC/server code that must not pollute stdout). Empty = check disabled.",
-    "banned_ui_patterns": "(lint-gate) List of regexes that must NOT appear in product source (e.g. platform-specific UI you forbid). Empty = check disabled."
+    "banned_ui_patterns": "(lint-gate) List of regexes that must NOT appear in product source (e.g. platform-specific UI you forbid). Empty = check disabled.",
+    "product_paths": "(non-target-script-detector) Repo-relative dirs treated as product code when scanning UI copy for stray writing systems. Keep it narrow: a detector that scans the whole repo trips on fixtures and gets switched off entirely. Defaults to ['src'].",
+    "renderer_dir": "(post-write-check) The UI/renderer directory that must not reach across an architectural boundary (e.g. 'src'). Empty = cross-layer import check disabled.",
+    "renderer_forbidden_import": "(post-write-check) Regex matching imports forbidden inside renderer_dir (e.g. \"from 'electron'\" or \"from '\\\\.\\\\./server/\"). Empty = check disabled."
   },
 
   "ipc_dirs": [],
@@ -32,5 +35,9 @@
   "py_targets": [".py"],
 
   "console_check_dirs": [],
-  "banned_ui_patterns": []
+  "banned_ui_patterns": [],
+
+  "product_paths": ["src"],
+  "renderer_dir": "",
+  "renderer_forbidden_import": ""
 }

@@ -1,0 +1,62 @@
+{
+  "_doc": "Проводка хуков Claude Code. Порядок внутри matcher значим: сначала блокирующие гейты, потом информационные. PreToolUse Bash — pre-bash-guard (деструктивные команды). PreToolUse Write|Edit — agent-infra-protect (кодовый агент не правит собственную обвязку: субагентов, хуки, судей, скилы, settings, CLAUDE.md) и task-progression-gate (задача не объявляется закрытой без вердикта). PreToolUse Task — pre-task-memory-inject (поднимает в контекст уроки из векторной памяти). PostToolUse Write|Edit — быстрые детекторы качества. Stop — done-gate и валидаторы DoD: единственное место, где сессия не может завершиться на невыполненном.",
+
+  "permissions": {
+    "allow": [
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ]
+  },
+
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/pre-bash-guard.sh" }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/agent-infra-protect.sh" },
+          { "type": "command", "command": "bash .claude/hooks/task-progression-gate.sh" }
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/pre-task-memory-inject.sh" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/post-write-check.sh" },
+          { "type": "command", "command": "bash .claude/hooks/mock-as-real-detector.sh" },
+          { "type": "command", "command": "bash .claude/hooks/skill-lint.sh" },
+          { "type": "command", "command": "bash .claude/hooks/non-target-script-detector.sh" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bash .claude/hooks/done-gate.sh" },
+          { "type": "command", "command": "bash .claude/hooks/dod-format-validator.sh" },
+          { "type": "command", "command": "bash .claude/hooks/duplicate-taskid-check.sh" },
+          { "type": "command", "command": "bash .claude/hooks/dod-immutability-check.sh" },
+          { "type": "command", "command": "bash .claude/hooks/stop-verify.sh" },
+          { "type": "command", "command": "bash .claude/hooks/subagent-finding-gate.sh" }
+        ]
+      }
+    ]
+  }
+}
