@@ -328,18 +328,43 @@ if (-not $dry) {
     $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
     $kept = @()
 
-    function _SetIfEmpty([string]$Name, $Current, $New, [scriptblock]$Apply) {
-        $isEmpty = ($null -eq $Current) -or ($Current -is [string] -and -not $Current) -or
-                   ($Current -is [array] -and -not @($Current).Count)
-        if ($isEmpty -or $reconfigure) { & $Apply; return $true }
-        $script:kept += $Name
-        return $false
+    # Конфиг проекта СТАРШЕ фабрики: в нём может не быть секций, появившихся позже
+    # (tests, backpressure, graph). Обращение к отсутствующей секции роняет весь шаг
+    # записи — и падение выглядит как «init сработал», потому что конфиг остаётся
+    # нетронутым. Именно так и вышло при первой проверке на боевом конфиге.
+    function _EnsureSection([string]$Name) {
+        if (-not $cfg.PSObject.Properties[$Name]) {
+            $cfg | Add-Member -NotePropertyName $Name -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        return $cfg.$Name
+    }
+    function _EnsureKey($Obj, [string]$Name, $Default) {
+        if (-not $Obj.PSObject.Properties[$Name]) {
+            $Obj | Add-Member -NotePropertyName $Name -NotePropertyValue $Default -Force
+        }
     }
 
-    _SetIfEmpty 'productPaths' $cfg.productPaths @($productPaths) { $cfg.productPaths = @($productPaths) } | Out-Null
-    _SetIfEmpty 'generatedFiles' $cfg.generatedFiles @($d.Generated) { $cfg.generatedFiles = @($d.Generated) } | Out-Null
-    _SetIfEmpty 'backpressure.typecheck' $cfg.backpressure.typecheck @($typechecks) { $cfg.backpressure.typecheck = @($typechecks) } | Out-Null
-    if ($d.Tests.runner) { _SetIfEmpty 'tests.runner' $cfg.tests.runner $d.Tests.runner { $cfg.tests.runner = $d.Tests.runner } | Out-Null }
+    _EnsureKey $cfg 'productPaths' @()
+    _EnsureKey $cfg 'generatedFiles' @()
+    $bp = _EnsureSection 'backpressure'; _EnsureKey $bp 'typecheck' @()
+    $ts = _EnsureSection 'tests';        _EnsureKey $ts 'runner' ''
+    $md = _EnsureSection 'models';       foreach ($k in @('code','tester','judge','vision')) { _EnsureKey $md $k '' }
+    $ag = _EnsureSection 'agent';        foreach ($k in @('command','adapter')) { _EnsureKey $ag $k '' }
+    $gr = _EnsureSection 'graph'
+    _EnsureKey $gr 'backends' ([pscustomobject]@{})
+    _EnsureKey $gr 'roles'    ([pscustomobject]@{})
+
+    function _SetIfEmpty([string]$Name, $Current, [scriptblock]$Apply) {
+        $isEmpty = ($null -eq $Current) -or ($Current -is [string] -and -not $Current) -or
+                   ($Current -is [array] -and -not @($Current).Count)
+        if ($isEmpty -or $reconfigure) { & $Apply; return }
+        $script:kept += $Name
+    }
+
+    _SetIfEmpty 'productPaths' $cfg.productPaths { $cfg.productPaths = @($productPaths) }
+    _SetIfEmpty 'generatedFiles' $cfg.generatedFiles { $cfg.generatedFiles = @($d.Generated) }
+    _SetIfEmpty 'backpressure.typecheck' $cfg.backpressure.typecheck { $cfg.backpressure.typecheck = @($typechecks) }
+    if ($d.Tests.runner) { _SetIfEmpty 'tests.runner' $cfg.tests.runner { $cfg.tests.runner = $d.Tests.runner } }
 
     # Бэкенды дополняем, а не заменяем: у проекта может быть свой, которого нет в
     # каталоге фабрики (собственная обёртка, локальная модель).
@@ -360,17 +385,17 @@ if (-not $dry) {
     # от того, как её запустили.
     $workerBackend = [string]$cfg.graph.roles.worker.backend
     if ($workerBackend -and $cfg.graph.backends.PSObject.Properties[$workerBackend]) {
-        _SetIfEmpty 'agent.command' $cfg.agent.command $cfg.graph.backends.$workerBackend.command {
+        _SetIfEmpty 'agent.command' $cfg.agent.command {
             $cfg.agent.command = $cfg.graph.backends.$workerBackend.command
             $cfg.agent.adapter = $cfg.graph.backends.$workerBackend.format
-        } | Out-Null
+        }
     }
     $workerModel = [string]$cfg.graph.roles.worker.model
     $criticModel = [string]$cfg.graph.roles.critic.model
-    if ($workerModel) { _SetIfEmpty 'models.code' $cfg.models.code $workerModel { $cfg.models.code = $workerModel } | Out-Null }
+    if ($workerModel) { _SetIfEmpty 'models.code' $cfg.models.code { $cfg.models.code = $workerModel } }
     if ($criticModel) {
-        _SetIfEmpty 'models.tester' $cfg.models.tester $criticModel { $cfg.models.tester = $criticModel } | Out-Null
-        _SetIfEmpty 'models.judge'  $cfg.models.judge  $criticModel { $cfg.models.judge  = $criticModel } | Out-Null
+        _SetIfEmpty 'models.tester' $cfg.models.tester { $cfg.models.tester = $criticModel }
+        _SetIfEmpty 'models.judge'  $cfg.models.judge  { $cfg.models.judge  = $criticModel }
     }
 
     ($cfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8

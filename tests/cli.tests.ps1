@@ -200,6 +200,41 @@ It '.gitignore получает каталог состояния' {
     Assert-Match (Get-Content -Raw -LiteralPath (Join-Path $p '.gitignore')) '\.bcf/'
 }
 
+# Регрессия: init переписывал уже настроенный проект своими догадками, а на конфиге без
+# новых секций (tests/graph) падал посреди записи — и падение выглядело как успех, потому
+# что конфиг оставался нетронутым.
+It 'init не переписывает заполненный конфиг и дополняет недостающие секции' {
+    $p = New-Sandbox 'init-preserve'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'config') | Out-Null
+    # конфиг «старого» вида: боевые роли, никаких tests/backpressure
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'config\harness.json') -Value @"
+{
+  "productPaths": ["crates"],
+  "taskIdPrefix": "TASK",
+  "models": { "code": "my-pinned-model" },
+  "agent": { "command": "my-agent --model {model}", "adapter": "custom" },
+  "graph": {
+    "backends": { "mine": { "command": "my-agent --model {model}", "format": "text" } },
+    "roles": { "worker": { "backend": "mine", "model": "my-pinned-model" } }
+  }
+}
+"@
+    & git -C $p add -A 2>&1 | Out-Null
+    & git -C $p -c user.name=t -c user.email=t@local commit -qm cfg 2>&1 | Out-Null
+
+    $r = Bcf @('init', '--yes', '--project', $p)
+    Assert-Match $r.Out 'ОСТАВЛЕНО КАК БЫЛО' 'init молчит о том, что сохранил'
+
+    $cfg = Get-Content -Raw -LiteralPath (Join-Path $p 'config\harness.json') | ConvertFrom-Json
+    Assert-True ($cfg.graph.roles.worker.backend -eq 'mine') "роль перезаписана: $($cfg.graph.roles.worker.backend)"
+    Assert-True ($cfg.models.code -eq 'my-pinned-model') "модель перезаписана: $($cfg.models.code)"
+    Assert-True ($cfg.agent.command -like 'my-agent*') 'команда агента перезаписана'
+    Assert-True (@($cfg.productPaths) -contains 'crates') 'productPaths перезаписан'
+    # чужой бэкенд остался, недостающие секции добавлены
+    Assert-True ($null -ne $cfg.graph.backends.mine) 'свой бэкенд проекта потерян'
+    Assert-True ($null -ne $cfg.tests) 'секция tests не добавлена — init упал бы на её отсутствии'
+}
+
 # --- tasks ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host '  tasks' -ForegroundColor White
