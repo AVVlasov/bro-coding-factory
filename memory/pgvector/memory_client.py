@@ -30,22 +30,47 @@ try:
 except ImportError:
     sys.exit("memory_client: pip install 'psycopg[binary]'")
 
-# config/memory.config.json lives at the repo root; this script is at
-# <repo>/memory/pgvector/, so the config is two levels up + /config.
-DEFAULT_CFG = Path(__file__).resolve().parents[2] / "config" / "memory.config.json"
+# Порядок поиска конфига важен: одна установка pgvector обслуживает МНОГО проектов,
+# поэтому фабричный конфиг — база, а проектный только переопределяет его, если проекту
+# нужна своя база или своя модель эмбеддингов. Жёсткий путь «два уровня вверх» ломался
+# ровно при этом сценарии: клиент запускался из фабрики, а конфиг искал в проекте.
+FACTORY_CFG = Path(__file__).resolve().parents[1] / "memory.config.json"
+
+
+def _config_candidates() -> list[Path]:
+    out = []
+    if os.environ.get("BCF_MEM_CONFIG"):
+        out.append(Path(os.environ["BCF_MEM_CONFIG"]))
+    if os.environ.get("BCF_PROJECT_ROOT"):
+        out.append(Path(os.environ["BCF_PROJECT_ROOT"]) / "config" / "memory.config.json")
+    out.append(FACTORY_CFG)
+    return out
 
 
 def load_config() -> dict[str, Any]:
-    cfg_path = Path(os.environ.get("BCF_MEM_CONFIG", DEFAULT_CFG))
-    return json.loads(cfg_path.read_text(encoding="utf-8"))
+    tried = []
+    for cand in _config_candidates():
+        tried.append(str(cand))
+        if cand.is_file():
+            return json.loads(cand.read_text(encoding="utf-8"))
+    sys.exit("memory_client: конфиг не найден. Искали: " + ", ".join(tried))
 
 
 def db_conn(cfg: dict) -> psycopg.Connection:
+    """Соединение с базой памяти.
+
+    connect_timeout обязателен. Без него недоступная база не даёт ошибку, а ВИСИТ: на
+    localhost клиент сначала пробует ::1 и ждёт на нём десятки секунд. Память —
+    вспомогательная подсистема, и её недоступность обязана выглядеть как быстрый отказ,
+    а не как зависший харнесс: наблюдалось живьём — прогон замирал без единого события,
+    снаружи неотличимо от «граф молчит».
+    """
     pw_env = cfg.get("password_env") or "BCF_PG_PASSWORD"
     password = os.environ.get(pw_env, cfg.get("password_default", ""))
     return psycopg.connect(
         host=cfg["host"], port=cfg["port"], dbname=cfg["database"],
         user=cfg["user"], password=password, autocommit=True,
+        connect_timeout=int(cfg.get("connect_timeout_sec", 5)),
     )
 
 
@@ -227,6 +252,37 @@ def cmd_harvest_proposals(args, cfg):
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+def cmd_stats(args, cfg):
+    """Что в памяти НА САМОМ ДЕЛЕ.
+
+    «Память доступна» — бесполезный признак: она бывает доступна и при этом содержать
+    один-единственный урок, который перечитывается полсотни раз (наблюдалось: 1 урок,
+    57 отзывов за прогон). Живое обучение — это РОСТ чисел от прогона к прогону, поэтому
+    здесь печатаются сами числа, а не «ок».
+    """
+    out = {"anti_patterns": 0, "bugs": 0, "recalls": 0, "proposals": 0}
+    with db_conn(cfg) as conn, conn.cursor() as cur:
+        for key, table in (("anti_patterns", "anti_patterns"), ("bugs", "bugs"),
+                           ("recalls", "recall_events"), ("proposals", "proposals")):
+            try:
+                cur.execute(f"SELECT count(*) FROM agent_memory.{table}")
+                out[key] = int(cur.fetchone()[0])
+            except Exception:
+                # Таблицы может не быть (схема старее клиента) — это не повод падать:
+                # отсутствующий счётчик честнее выдуманного нуля только вместе с фактом,
+                # что таблицы нет, поэтому помечаем отдельно.
+                out[key] = None
+        try:
+            cur.execute("""
+                SELECT count(*) FROM agent_memory.anti_patterns
+                WHERE created_at > now() - interval '7 days'
+            """)
+            out["anti_patterns_last_7d"] = int(cur.fetchone()[0])
+        except Exception:
+            out["anti_patterns_last_7d"] = None
+    print(json.dumps(out, ensure_ascii=False))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -238,22 +294,41 @@ def main(argv=None):
     pr.add_argument("--k", type=int, default=3); pr.add_argument("--threshold", type=float, default=0.55)
     pr.add_argument("--iteration-id", dest="iteration_id", default="")
     sub.add_parser("recall-from-retrospector")
+    sub.add_parser("stats")
     ph = sub.add_parser("harvest-proposals")
     ph.add_argument("--status", default="new")   # new | triaged | done | rejected | all
     ph.add_argument("--limit", type=int, default=30)
 
     args = p.parse_args(argv)
     cfg = load_config()
+    # Недоступная база — ожидаемое состояние, а не аварийная ситуация: память
+    # опциональна. Трейсбек на пол-экрана здесь только мешает: вызывающий (хук, харнесс,
+    # bcf memory) читает stderr и показывает его человеку.
+    try:
+        return _dispatch(args, cfg)
+    except psycopg.OperationalError as e:
+        first = str(e).strip().splitlines()[0] if str(e).strip() else "нет соединения"
+        print(f"memory_client: база недоступна ({first})", file=sys.stderr)
+        return 1
+
+
+def _dispatch(args, cfg):
     if args.cmd == "embed": cmd_embed(args, cfg)
     elif args.cmd == "upsert": cmd_upsert(args, cfg)
     elif args.cmd == "recall": cmd_recall(args, cfg)
     elif args.cmd == "recall-from-retrospector": cmd_from_retrospector(args, cfg)
+    elif args.cmd == "stats": cmd_stats(args, cfg)
     elif args.cmd == "harvest-proposals": cmd_harvest_proposals(args, cfg)
+    return 0
 
 
 if __name__ == "__main__":
+    # Код возврата обязан доходить до вызывающего: харнесс отличает «память ответила
+    # пусто» (валидный результат recall) от «память не ответила» именно по нему.
     try:
-        main()
+        sys.exit(main() or 0)
+    except SystemExit:
+        raise
     except Exception as e:
         sys.stderr.write(f"memory_client: {type(e).__name__}: {e}\n")
         sys.exit(1)
