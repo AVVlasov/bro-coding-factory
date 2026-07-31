@@ -64,11 +64,10 @@ foreach ($f in (Get-ChildItem (Join-Path $root 'tasks') -Filter "$prefix-*.md" -
     $id = "$prefix-$($Matches[1])"
     $body = Get-Content -Raw -LiteralPath $f.FullName
 
-    $preds = @()
-    $gm = [regex]::Match($body, '(?m)^\*\*Gate-вход[^:]*:\**\s*(.+)$')
-    if ($gm.Success -and $gm.Groups[1].Value -notmatch '^\s*нет\b') {
-        $preds = @([regex]::Matches($gm.Groups[1].Value, $predRx) | ForEach-Object { $_.Value } | Select-Object -Unique | Where-Object { $_ -ne $id })
-    }
+    # Разбор предшественников — общей функцией (harness/lib/claims.ps1), той же, что у
+    # цикла и у CLI. Собственная копия регекспа здесь однажды разъедется с ними, и
+    # разъедется молча: каждый разборщик по отдельности работает.
+    $preds = @(Get-TaskPredecessors -TaskId $id -Root $root -Prefix $prefix)
     $files = @(Get-TaskDeclaredFiles -TaskId $id -Root $root)
     $tasks += [pscustomobject]@{ Id = $id; Num = $num; Preds = $preds; Files = $files; Pass = (Get-Verdict $id) }
 }

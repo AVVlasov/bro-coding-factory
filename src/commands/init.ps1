@@ -97,8 +97,11 @@ if (-not $d.Typechecks.Count) { Write-BcfField 'backpressure' '(быстрой �
 
 Write-BcfField 'generatedFiles' $(if ($d.Generated.Count) { $d.Generated -join ', ' } else { '(нет)' }) `
                $(if ($d.Generated.Count) { 'уверенно' } else { 'догадка' }) 18
-Write-BcfField 'tests.runner' $(if ($d.Tests.runner) { $d.Tests.runner } else { '(не определился)' }) `
-               $(if ($d.Tests.runner) { 'уверенно' } else { 'догадка' }) 18
+$runnerVal = if (-not $d.Tests.runner) { '(не определился)' }
+             elseif ($d.Runners.Count -gt 1) { "$($d.Tests.runner)   ← найдено $($d.Runners.Count): $((($d.Runners | ForEach-Object { "$($_.Runner)$(if ($_.Scope) { " в $($_.Scope)" })" }) -join ', '))" }
+             else { $d.Tests.runner }
+Write-BcfField 'tests.runner' $runnerVal `
+               $(if (-not $d.Tests.runner) { 'догадка' } elseif ($d.Runners.Count -gt 1) { 'догадка' } else { 'уверенно' }) 18
 
 Write-Host ''
 Write-BcfNote 'productPaths решает, где искать «прогресса нет» и расползание скоупа.'
@@ -106,6 +109,9 @@ Write-BcfNote 'generatedFiles — что не блокирует слияние:
 
 if (-not $d.Tests.runner) {
     $later += 'раннер тестов не определился (config/harness.json → tests.runner): пока он пуст, задача может получить PASS без единого нового теста.'
+}
+if ($d.Runners.Count -gt 1) {
+    $later += "раннеров тестов найдено $($d.Runners.Count) ($((($d.Runners | ForEach-Object { $_.Runner }) -join ', '))), а гейт «фича доказана тестами» одноместный: задачи второго стека будут проверяться чужим раннером. Выбери основной в config/harness.json → tests.runner и закрой второй стек явными командами в config/checks.json."
 }
 
 # =====================================================================================
@@ -309,27 +315,63 @@ if (-not $dry) {
                         --project $project $(if (Get-BcfAssumeYes) { '--yes' }) 2>&1 | Out-String
 
     # 2. Дописываем в конфиг то, что выяснили разбором и опросом.
+    #
+    # ПРАВИЛО: init ЗАПОЛНЯЕТ ПУСТОЕ, а не переписывает заполненное.
+    #
+    # Проект мог настраиваться руками или прошлой версией фабрики, и там уже стоят
+    # выверенные бэкенды с моделями — включая те, которые init угадать не может (имя
+    # модели задаёт подписка). Молча заменить их своими догадками значит сломать рабочую
+    # конфигурацию мастером, который человек запустил «просто посмотреть». Замена делается
+    # только по явной просьбе: bcf init --reconfigure.
+    $reconfigure = $script:BcfArgs -contains '--reconfigure'
     $cfgPath = Join-Path $project 'config\harness.json'
     $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
+    $kept = @()
 
-    $cfg.productPaths = @($productPaths)
-    $cfg.generatedFiles = @($d.Generated)
-    $cfg.backpressure.typecheck = @($typechecks)
-    if ($d.Tests.runner) { $cfg.tests.runner = $d.Tests.runner }
-
-    $cfg.graph.backends = (New-BcfBackendConfig -Survey $survey)
-    foreach ($k in $roles.Keys) {
-        $cfg.graph.roles.$k = [ordered]@{ backend = $roles[$k].backend; model = $roles[$k].model }
+    function _SetIfEmpty([string]$Name, $Current, $New, [scriptblock]$Apply) {
+        $isEmpty = ($null -eq $Current) -or ($Current -is [string] -and -not $Current) -or
+                   ($Current -is [array] -and -not @($Current).Count)
+        if ($isEmpty -or $reconfigure) { & $Apply; return $true }
+        $script:kept += $Name
+        return $false
     }
+
+    _SetIfEmpty 'productPaths' $cfg.productPaths @($productPaths) { $cfg.productPaths = @($productPaths) } | Out-Null
+    _SetIfEmpty 'generatedFiles' $cfg.generatedFiles @($d.Generated) { $cfg.generatedFiles = @($d.Generated) } | Out-Null
+    _SetIfEmpty 'backpressure.typecheck' $cfg.backpressure.typecheck @($typechecks) { $cfg.backpressure.typecheck = @($typechecks) } | Out-Null
+    if ($d.Tests.runner) { _SetIfEmpty 'tests.runner' $cfg.tests.runner $d.Tests.runner { $cfg.tests.runner = $d.Tests.runner } | Out-Null }
+
+    # Бэкенды дополняем, а не заменяем: у проекта может быть свой, которого нет в
+    # каталоге фабрики (собственная обёртка, локальная модель).
+    $surveyed = New-BcfBackendConfig -Survey $survey
+    foreach ($bk in $surveyed.Keys) {
+        if ($cfg.graph.backends.PSObject.Properties[$bk] -and -not $reconfigure) { continue }
+        $cfg.graph.backends | Add-Member -NotePropertyName $bk -NotePropertyValue ([pscustomobject]$surveyed[$bk]) -Force
+    }
+
+    foreach ($k in $roles.Keys) {
+        $cur = $cfg.graph.roles.PSObject.Properties[$k]
+        if ($cur -and $cur.Value.backend -and -not $reconfigure) { $kept += "graph.roles.$k"; continue }
+        $cfg.graph.roles | Add-Member -NotePropertyName $k -NotePropertyValue ([pscustomobject]@{ backend = $roles[$k].backend; model = $roles[$k].model }) -Force
+    }
+
     # Цикл (одна задача, много итераций) исполняется тем же бэкендом, что и worker графа:
     # два разных исполнителя означали бы, что задача ведёт себя по-разному в зависимости
     # от того, как её запустили.
-    if ($roles.worker.backend -and $cfg.graph.backends.($roles.worker.backend)) {
-        $cfg.agent.command = $cfg.graph.backends.($roles.worker.backend).command
-        $cfg.agent.adapter = $cfg.graph.backends.($roles.worker.backend).format
+    $workerBackend = [string]$cfg.graph.roles.worker.backend
+    if ($workerBackend -and $cfg.graph.backends.PSObject.Properties[$workerBackend]) {
+        _SetIfEmpty 'agent.command' $cfg.agent.command $cfg.graph.backends.$workerBackend.command {
+            $cfg.agent.command = $cfg.graph.backends.$workerBackend.command
+            $cfg.agent.adapter = $cfg.graph.backends.$workerBackend.format
+        } | Out-Null
     }
-    if ($roles.worker.model) { $cfg.models.code = $roles.worker.model }
-    if ($roles.critic.model) { $cfg.models.tester = $roles.critic.model; $cfg.models.judge = $roles.critic.model }
+    $workerModel = [string]$cfg.graph.roles.worker.model
+    $criticModel = [string]$cfg.graph.roles.critic.model
+    if ($workerModel) { _SetIfEmpty 'models.code' $cfg.models.code $workerModel { $cfg.models.code = $workerModel } | Out-Null }
+    if ($criticModel) {
+        _SetIfEmpty 'models.tester' $cfg.models.tester $criticModel { $cfg.models.tester = $criticModel } | Out-Null
+        _SetIfEmpty 'models.judge'  $cfg.models.judge  $criticModel { $cfg.models.judge  = $criticModel } | Out-Null
+    }
 
     ($cfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     $writtenFiles += 'config/harness.json'
@@ -376,6 +418,14 @@ if (-not $dry) {
     }
     foreach ($w in $writtenFiles) { Write-BcfLine "    M  $w" 'Cyan' }
     Write-BcfLine '    A  .bcf/  (прогоны, заявки на файлы, журналы — в git не попадает)' 'Green'
+
+    if ($kept.Count) {
+        Write-Host ''
+        Write-BcfLine "  ОСТАВЛЕНО КАК БЫЛО  $($kept.Count)" 'DarkCyan'
+        Write-BcfNote 'эти значения уже были заполнены — init их не трогает:'
+        foreach ($k in ($kept | Sort-Object -Unique)) { Write-BcfDim $k }
+        Write-BcfNote 'заменить своими догадками: bcf init --reconfigure (существующее будет потеряно).'
+    }
 } else {
     Write-BcfWarn 'сухой прогон: на диск ничего не записано.'
 }

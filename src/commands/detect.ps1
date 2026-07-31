@@ -33,7 +33,10 @@ Write-BcfField 'сборка' $(if ($d.Ecosystems.Count) { $d.Ecosystems -join '
 if ($d.Git.IsGit) {
     $dirty = if ($d.Git.Dirty.Count) { "$($d.Git.Dirty.Count) грязных" } else { 'чисто' }
     $hooks = if ($d.Git.Hooks.Count) { "git-хуков $($d.Git.Hooks.Count)" } else { 'git-хуков нет' }
-    Write-BcfField 'git' "$($d.Git.Branch) · $dirty · worktree поддерживается · $hooks"
+    # Про worktree говорим то, что ИЗМЕРИЛИ: все прогоны идут через него, и безусловная
+    # строка «поддерживается» — утверждение, за которое никто не отвечает.
+    $wt = if ($d.Git.Worktree) { 'worktree работает' } else { 'worktree НЕ отвечает' }
+    Write-BcfField 'git' "$($d.Git.Branch) · $dirty · $wt · $hooks"
 } else {
     Write-BcfField 'git' 'НЕ репозиторий'
 }
@@ -62,8 +65,13 @@ if (-not $d.Typechecks.Count) {
 
 Write-BcfField 'generatedFiles' $(if ($d.Generated.Count) { $d.Generated -join ', ' } else { '(нет)' }) `
                $(if ($d.Generated.Count) { 'уверенно' } else { 'догадка' }) 18
-Write-BcfField 'tests.runner' $(if ($d.Tests.runner) { $d.Tests.runner } else { '(не определился)' }) `
-               $(if ($d.Tests.runner) { 'уверенно' } else { 'догадка' }) 18
+# Несколько раннеров — не деталь, а разрыв гарантии: гейт «фича доказана тестами»
+# одноместный, и половина задач будет проверяться чужим раннером.
+$runnerVal = if (-not $d.Tests.runner) { '(не определился)' }
+             elseif ($d.Runners.Count -gt 1) { "$($d.Tests.runner)   ← найдено $($d.Runners.Count): $((($d.Runners | ForEach-Object { "$($_.Runner)$(if ($_.Scope) { " в $($_.Scope)" })" }) -join ', '))" }
+             else { $d.Tests.runner }
+Write-BcfField 'tests.runner' $runnerVal `
+               $(if (-not $d.Tests.runner) { 'догадка' } elseif ($d.Runners.Count -gt 1) { 'догадка' } else { 'уверенно' }) 18
 
 Write-Host ''
 Write-BcfNote 'productPaths решает, где искать «прогресса нет» и расползание скоупа.'
@@ -92,6 +100,9 @@ foreach ($p in $d.Probes) {
 
 if (-not $d.Tests.runner) {
     $later += 'раннер тестов не определился: гейт «фича доказана тестами» не работает — задача может получить PASS без единого нового теста (config/harness.json → tests.runner).'
+}
+if ($d.Runners.Count -gt 1) {
+    $later += "раннеров тестов найдено $($d.Runners.Count) ($((($d.Runners | ForEach-Object { $_.Runner }) -join ', '))), а гейт «фича доказана тестами» одноместный: задачи второго стека будут проверяться чужим раннером. Выбери основной в config/harness.json → tests.runner и закрой второй стек явными командами в config/checks.json."
 }
 if (-not $d.Typechecks.Count) {
     $later += 'быстрой проверки нет: ошибки компиляции всплывут только на верификации, то есть на несколько итераций позже.'

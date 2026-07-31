@@ -117,6 +117,36 @@ It 'проект без git назван блокером с последств�
     Assert-Match $r.Out 'восстановить'  'блокер обязан называть цену, а не только факт'
 }
 
+# Регрессия: продуктовые каталоги брались из захардкоженного списка, и крейт воркспейса
+# вне crates/ (например app/src-tauri) терялся. Итерация, правившая только его, была бы
+# засчитана как «прогресса нет» — при источнике вывода «уверенно».
+It 'члены cargo-воркспейса попадают в productPaths, вложенные пути не дублируются' {
+    $p = New-Sandbox 'detect-workspace'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'app\src-tauri\src') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'crates\core\src') | Out-Null
+    Set-Content -LiteralPath (Join-Path $p 'app\src-tauri\src\lib.rs') -Value 'pub fn x() {}' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $p 'crates\core\src\lib.rs') -Value 'pub fn y() {}' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $p 'Cargo.toml') -Encoding UTF8 -Value @"
+[workspace]
+members = ["crates/core", "app/src-tauri"]
+"@
+    $j = (Bcf @('detect', '--project', $p, '--json')).Out | ConvertFrom-Json
+    $pp = @($j.ProductPaths)
+    Assert-True ($pp -contains 'app/src-tauri/src') "член воркспейса потерян: $($pp -join ', ')"
+    Assert-True (-not ($pp -contains 'crates/core/src')) "вложенный путь не схлопнут: $($pp -join ', ')"
+}
+
+It 'второй раннер тестов назван, а источник понижен до догадки' {
+    $p = New-Sandbox 'detect-runners'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'app') | Out-Null
+    Set-Content -LiteralPath (Join-Path $p 'app\package.json') -Encoding UTF8 -Value '{"name":"a","scripts":{"test":"vitest run"}}'
+    $r = Bcf @('detect', '--project', $p)
+    Assert-Match $r.Out 'найдено 2' 'второй раннер проглочен молча'
+    Assert-Match $r.Out 'vitest'
+    $j = (Bcf @('detect', '--project', $p, '--json')).Out | ConvertFrom-Json
+    Assert-True (@($j.Runners).Count -eq 2) 'в JSON не оба раннера'
+}
+
 It '--json отдаёт разбираемый JSON' {
     $p = New-Sandbox 'detectjson'
     $r = Bcf @('detect', '--project', $p, '--json')
@@ -199,6 +229,67 @@ It 'коллизия владения названа последствием' {
     $r = Bcf @('tasks', '--project', $p)
     Assert-Match $r.Out 'КОЛЛИЗИИ ВЛАДЕНИЯ'
     Assert-Match $r.Out 'арбитр'  'коллизия обязана объяснять, чем она обернётся'
+}
+
+# Регрессия и она же самая дорогая из найденных: CLI читал секцию «## Вход», а
+# планировщик — строку «**Gate-вход:**». На реальном проекте это дало одиннадцать задач
+# «готова» при пяти заблокированных плюс совет «запустить готовые»: запуск задачи, у
+# которой не сделан ни один вход, стоит целого прогона.
+It 'предшественники читаются в обоих форматах, тем же разборщиком, что у планировщика' {
+    $p = New-Sandbox 'tasks-preds'
+    Bcf @('install', '--project', $p) | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-01-base.md') -Value @"
+# TASK-01 — основа
+
+## Файлы
+- ``src/a.rs``
+"@
+    # формат харнесса и старых проектов
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-02-gate.md') -Value @"
+# TASK-02 — через Gate-вход
+
+**Gate-вход:** TASK-01
+
+## Файлы
+- ``src/b.rs``
+"@
+    # формат шаблона задачи фабрики
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-03-section.md') -Value @"
+# TASK-03 — через секцию
+
+## Файлы
+- ``src/c.rs``
+
+## Вход
+
+TASK-01
+"@
+    $r = Bcf @('tasks', '--project', $p)
+    Assert-Match $r.Out 'TASK-02\s+ждёт TASK-01' 'формат **Gate-вход:** не распознан'
+    Assert-Match $r.Out 'TASK-03\s+ждёт TASK-01' 'формат секции ## Вход не распознан'
+    Assert-Match $r.Out 'готово к работе 1' 'заблокированные задачи посчитаны готовыми'
+
+    $j = (Bcf @('tasks', '--project', $p, '--json')).Out | ConvertFrom-Json
+    $t2 = @($j | Where-Object { $_.Id -eq 'TASK-02' })[0]
+    Assert-True (@($t2.Preds).Count -eq 1) 'в JSON у TASK-02 нет предшественника'
+}
+
+It 'tasks читает paths.tasks и paths.verdicts из конфига' {
+    $p = New-Sandbox 'tasks-paths'
+    Bcf @('install', '--project', $p) | Out-Null
+    $cfgPath = Join-Path $p 'config\harness.json'
+    $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
+    $cfg.paths.tasks = 'backlog'
+    $cfg.paths.verdicts = 'backlog/.verdicts'
+    ($cfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'backlog\.verdicts') | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'backlog\TASK-01-x.md') -Value "# TASK-01 — x`n`n## Файлы`n- ``src/a.rs```n"
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'backlog\.verdicts\TASK-01.md') -Value "verdict: PASS`n"
+
+    $r = Bcf @('tasks', '--project', $p)
+    Assert-Match $r.Out 'всего 1'
+    Assert-Match $r.Out 'закрыто 1' 'вердикт по настроенному пути не найден'
 }
 
 It 'задача без секции Файлы отмечена как непроверяемая' {

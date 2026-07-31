@@ -66,6 +66,7 @@ if ($Cfg) {
 # Производные настройки из конфига (с дефолтами).
 $ProductPaths     = if ($Cfg -and $Cfg.productPaths)        { @($Cfg.productPaths) }        else { @('src') }
 $TaskIdPattern    = if ($Cfg -and $Cfg.taskIdPattern)       { [string]$Cfg.taskIdPattern }  else { '[A-Za-z][A-Za-z0-9]*-\d+' }
+$TaskIdPrefix     = if ($Cfg -and $Cfg.taskIdPrefix)        { [string]$Cfg.taskIdPrefix }   else { 'TASK' }
 $JudgeName        = if ($Cfg -and $Cfg.judge.name)          { [string]$Cfg.judge.name }     else { 'judge' }
 $NetWatchdogOn    = [bool]$NetProbeHost
 # Фичи → env-тумблеры, которые уважают lib-модули (по умолчанию выключены = ноль внешних зависимостей).
@@ -378,11 +379,13 @@ if ($Task) {
   $tf = Get-ChildItem (Join-Path $root "tasks") -Filter "$Task-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $tf) { Log "ОШИБКА: задача $Task не найдена в tasks/."; exit 1 }
 
-  $gateLine = (Select-String -Path $tf.FullName -Pattern '^\*\*Gate-вход' | Select-Object -First 1)
-  $gateValue = ""
-  if ($gateLine -and $gateLine.Line -match 'Gate-вход[^:]*:\**\s*(.+)$') { $gateValue = $Matches[1].Trim() }
-  if ($gateLine -and $gateValue -notmatch '^\s*нет\b') {
-    $preds = [regex]::Matches($gateValue, $TaskIdPattern) | ForEach-Object { $_.Value } | Select-Object -Unique
+  # Разбор предшественников — общей функцией (harness/lib/claims.ps1). До этого их было
+  # три копии — здесь, в run-all и в графе — плюс четвёртая в CLI, и та читала другое
+  # поле: на реальном проекте `bcf tasks` показал одиннадцать задач «готова» при пяти
+  # заблокированных. Один разборщик — единственный способ не повторить это.
+  . (Join-Path $PSScriptRoot 'lib\claims.ps1')
+  $preds = @(Get-TaskPredecessors -TaskId $Task -Root $root -Prefix $TaskIdPrefix)
+  if ($preds.Count) {
     foreach ($p in $preds) {
       if (-not (Verdict-Pass $p)) {
         Log "БЛОК: предшественник $p не имеет verdict: PASS. Закрой $p или запусти с -Force."

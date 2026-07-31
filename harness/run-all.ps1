@@ -69,20 +69,14 @@ function Verdict-Pass($t, $atRoot) {
   return [bool](Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
 }
 
-# Префикс-предшественники из «**Gate-вход:**» (как в loop.ps1: только <PREFIX>-\d+; иные
-# гейты вроде decision-record игнорируются — loop.ps1 на них тоже не блокирует).
+# Предшественники разбирает ОДНА функция на весь проект (harness/lib/claims.ps1).
+# Второй разборщик рядом означает, что однажды они разойдутся — и разойдутся молча:
+# каждый по отдельности работает, а увидеть расхождение можно только сверив вывод с
+# вердиктами руками.
+. (Join-Path $PSScriptRoot 'lib\claims.ps1')
 $predRegex = [regex]::Escape($taskIdPrefix) + '-\d+'
 function Get-GatePreds($t) {
-  $tf = Get-ChildItem (Join-Path $root "tasks") -Filter "$t-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $tf) { return @() }
-  $line = Select-String -Path $tf.FullName -Pattern '^\*\*Gate-вход' | Select-Object -First 1
-  if (-not $line) { return @() }
-  if ($line.Line -match 'Gate-вход[^:]*:\**\s*(.+)$') {
-    $val = $Matches[1]
-    if ($val -match '^\s*нет\b') { return @() }
-    return @([regex]::Matches($val, $predRegex) | ForEach-Object { $_.Value } | Select-Object -Unique | Where-Object { $_ -ne $t })
-  }
-  return @()
+  return @(Get-TaskPredecessors -TaskId $t -Root $root -Prefix $taskIdPrefix)
 }
 
 # --- Транзитивное сведе́ние каскад-гейта к КОРНЮ (задаче, которая реально требует человека).

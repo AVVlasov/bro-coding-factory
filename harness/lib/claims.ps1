@@ -85,6 +85,48 @@ function Get-TaskDeclaredFiles {
     return @($files | Select-Object -Unique)
 }
 
+# --- Предшественники задачи ------------------------------------------------------------
+#
+# ОДИН разборщик на всех, и это не вкусовщина. Пока их было два — CLI читал секцию
+# «## Вход», а планировщик строку «**Gate-вход:**» — на реальном проекте `bcf tasks`
+# показал 11 задач «готова» при пяти заблокированных и предложил «запустить готовые».
+# Совет запустить задачу, у которой не сделан ни один из шести входов, стоит целого
+# прогона. Расхождение двух парсеров молчаливо по построению: каждый по отдельности
+# работает, и увидеть его можно только сравнив вывод с вердиктами вручную.
+#
+# Поддерживаются ОБА формата, потому что оба живут в реальных проектах:
+#   **Gate-вход:** TASK-02 TASK-03      (как пишет харнесс и старые проекты)
+#   ## Вход \n TASK-02, TASK-03         (как в шаблоне задачи фабрики)
+# «нет» / «—» / «-» означают отсутствие предшественников.
+function Get-TaskPredecessors {
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$Root,
+        [string]$Prefix = 'TASK'
+    )
+
+    $tasksDir = Join-Path $Root 'tasks'
+    $tf = Get-ChildItem $tasksDir -Filter "$TaskId-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $tf) { return @() }
+    $body = Get-Content -Raw -LiteralPath $tf.FullName -ErrorAction SilentlyContinue
+    if (-not $body) { return @() }
+
+    $rx = [regex]::Escape($Prefix) + '-\d+'
+    $value = ''
+
+    $gate = [regex]::Match($body, '(?m)^\*\*Gate-вход[^:]*:\**\s*(.+)$')
+    if ($gate.Success) { $value = $gate.Groups[1].Value }
+    else {
+        $sec = [regex]::Match($body, '(?ms)^##[^\r\n]*Вход.*?(?=^##\s|\z)')
+        if ($sec.Success) { $value = $sec.Value }
+    }
+    if (-not $value) { return @() }
+    if ($value -match '^\s*(нет|—|-|–)\s*$') { return @() }
+
+    return @([regex]::Matches($value, $rx) | ForEach-Object { $_.Value } |
+             Select-Object -Unique | Where-Object { $_ -ne $TaskId })
+}
+
 # --- Связность из истории: какие файлы ходят в коммитах вместе с данными ---
 #
 # Декларация врёт: агент правит scan.rs, а ломает main.rs, который его зовёт.

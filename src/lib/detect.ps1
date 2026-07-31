@@ -70,6 +70,32 @@ $script:BcfEcosystems = @(
        tests = @{ runner = '' }; generated = @() }
 )
 
+# Члены cargo-воркспейса. Разбирать их обязательно: в воркспейсе крейт может лежать где
+# угодно, и захардкоженные 'src'/'crates' его не найдут. Пропущенный продуктовый каталог
+# означает, что итерация, правившая ТОЛЬКО его, будет засчитана как «прогресса нет».
+function Get-BcfCargoMembers {
+    param([Parameter(Mandatory)][string]$Root)
+
+    $manifest = Join-Path $Root 'Cargo.toml'
+    if (-not (Test-Path $manifest)) { return @() }
+    $raw = Get-Content -Raw -LiteralPath $manifest -ErrorAction SilentlyContinue
+    if (-not $raw) { return @() }
+
+    $m = [regex]::Match($raw, '(?ms)^\[workspace\](.*?)(?=^\[|\z)')
+    if (-not $m.Success) { return @() }
+    $mm = [regex]::Match($m.Groups[1].Value, '(?ms)members\s*=\s*\[(.*?)\]')
+    if (-not $mm.Success) { return @() }
+
+    $out = @()
+    foreach ($q in [regex]::Matches($mm.Groups[1].Value, '"([^"]+)"')) {
+        $path = $q.Groups[1].Value.Trim()
+        if (-not $path -or $path -match '[*?]') { continue }   # глобы не разворачиваем
+        $src = Join-Path $Root (($path + '/src') -replace '/', '\')
+        if (Test-Path $src) { $out += "$path/src" }
+    }
+    return @($out | Select-Object -Unique)
+}
+
 function Get-BcfEcosystems {
     param([Parameter(Mandatory)][string]$Root)
     $found = @()
@@ -197,6 +223,15 @@ function Test-BcfCommand {
     }
 }
 
+function _BcfDropNested {
+    param([string[]]$Paths)
+    $norm = @($Paths | ForEach-Object { ($_ -replace '\\', '/').Trim('/') } | Where-Object { $_ } | Select-Object -Unique)
+    return @($norm | Where-Object {
+        $me = $_
+        -not ($norm | Where-Object { $_ -ne $me -and $me.StartsWith("$_/") })
+    })
+}
+
 # Сводный разбор. -Probe включает живой запуск кандидатов в backpressure: он занимает
 # секунды и десятки секунд, зато отличает «команда есть» от «команда работает».
 function Invoke-BcfDetect {
@@ -210,14 +245,20 @@ function Invoke-BcfDetect {
     $product = @()
     $generated = @()
     $typechecks = @()
-    $tests = @{ runner = '' }
+    # Раннеров может быть НЕСКОЛЬКО, и молча брать первый нельзя: в полиглот-репозитории
+    # это значит, что половина задач доказывается чужим раннером. Собираем все, а решение
+    # «какой основной» принимает вызывающий — уже зная, что их больше одного.
+    $runners = @()
 
     foreach ($e in $eco) {
         foreach ($p in $e.product) { if (Test-Path (Join-Path $Root ($p -replace '/', '\'))) { $product += $p } }
         $generated += @($e.generated | Where-Object { Test-Path (Join-Path $Root ($_ -replace '/', '\')) })
         if ($e.typecheck) { $typechecks += $e.typecheck }
-        if ($e.tests.runner -and -not $tests.runner) { $tests = @{ runner = $e.tests.runner } }
+        if ($e.tests.runner) { $runners += [pscustomobject]@{ Runner = $e.tests.runner; Scope = '' } }
     }
+
+    # Крейты воркспейса вне 'src'/'crates' — например app/src-tauri в Tauri-проекте.
+    $product += @(Get-BcfCargoMembers -Root $Root)
 
     # Node: команда быстрой проверки существует, только если в package.json есть скрипт.
     # Придумывать её самим — прямой путь к вечно красному гейту.
@@ -228,11 +269,15 @@ function Invoke-BcfDetect {
         $name = @('typecheck', 'type-check', 'tsc', 'check') | Where-Object { $scripts -and $scripts.PSObject.Properties[$_] } | Select-Object -First 1
         if ($name) { $typechecks += "$pfx run $name --silent" }
         $tname = @('test', 'test:unit') | Where-Object { $scripts -and $scripts.PSObject.Properties[$_] } | Select-Object -First 1
-        if ($tname -and -not $tests.runner) {
+        if ($tname) {
             $raw = [string]$scripts.$tname
-            $tests = @{ runner = $(if ($raw -match 'vitest') { 'vitest' } elseif ($raw -match 'jest') { 'jest' } else { '' }) }
+            $r = if ($raw -match 'vitest') { 'vitest' } elseif ($raw -match 'jest') { 'jest' } else { '' }
+            if ($r) { $runners += [pscustomobject]@{ Runner = $r; Scope = $(if ($prefix) { "$prefix/" } else { '' }) } }
         }
     }
+
+    $runners = @($runners | Sort-Object Runner -Unique)
+    $tests = @{ runner = $(if ($runners.Count) { $runners[0].Runner } else { '' }) }
 
     $probes = @()
     if ($Probe) {
@@ -254,10 +299,13 @@ function Invoke-BcfDetect {
         Ecosystems  = @($eco | ForEach-Object { $_.key })
         Git         = $git
         Docs        = $docs
-        ProductPaths= @($product | Select-Object -Unique)
+        # Вложенные пути выбрасываем: `crates` уже покрывает `crates/bgc-core/src`, а
+        # список из шести строк вместо двух человек не проверяет — он его пролистывает.
+        ProductPaths= @(_BcfDropNested @($product | Select-Object -Unique))
         Generated   = @($generated | Select-Object -Unique)
         Typechecks  = @($typechecks | Select-Object -Unique)
         Tests       = $tests
+        Runners     = @($runners)
         Probes      = $probes
     }
 }
