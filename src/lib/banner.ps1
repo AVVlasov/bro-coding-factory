@@ -90,21 +90,50 @@ function Get-BcfBannerStatus {
     }
 }
 
+# Знак — как в дизайне: BCF блочными глифами. Ширина букв там разная (B и C по четыре
+# столбца, F по пять), и выравнивать их «на глаз» нельзя — знак перестаёт читаться.
 $script:BcfLogo = @(
-    '  ████   ████  ████ '
-    '  █   █ █      █    '
-    '  ████  █      ████ '
-    '  █   █ █      █    '
-    '  ████   ████  █    '
+    '████   ████  █████'
+    '█  █  █      █    '
+    '████  █      ████ '
+    '█  █  █      █    '
+    '████   ████  █    '
 )
+
+# Маскот. В дизайн-макете его не было — там только знак; но у инструмента, который зовут
+# «bro», лицо на месте знака работает лучше слова: по нему узнают окно, не читая.
+# Он же несёт состояние: выражение меняется по тому, поедет прогон или нет, — и это
+# единственная строка баннера, которую видно боковым зрением.
+$script:BcfMascotFaces = @{
+    ok    = @('  ___  ', ' / _ \ ', '|  ^ ^|', '|  ␣␣ |', ' \___/ ')
+    warn  = @('  ___  ', ' / _ \ ', '|  o o|', '|  ~~ |', ' \___/ ')
+    bad   = @('  ___  ', ' / _ \ ', '|  x x|', '|  ∩∩ |', ' \___/ ')
+}
+
+function Get-BcfMascotMood {
+    param([Parameter(Mandatory)]$Status)
+    # Настроение — не украшение: оно повторяет вердикт карточки. Ролей нет — прогон не
+    # поедет вовсе (bad); нет памяти или тарифов — поедет с оговорками (warn).
+    if (-not $Status.Roles.Count) { return 'bad' }
+    if (-not $Status.Tasks.Count) { return 'warn' }
+    if ($Status.MemoryOn -and $null -eq $Status.Memory) { return 'warn' }
+    if (-not $Status.MemoryOn) { return 'warn' }
+    return 'ok'
+}
 
 function Write-BcfBanner {
     param([Parameter(Mandatory)]$Status)
 
+    $mood = Get-BcfMascotMood -Status $Status
+    $face = $script:BcfMascotFaces[$mood]
+    $faceColor = switch ($mood) { 'ok' { 'Green' } 'warn' { 'Yellow' } default { 'Red' } }
+
     Write-Host ''
-    foreach ($l in $script:BcfLogo) { Write-BcfLine $l 'DarkCyan' }
+    for ($i = 0; $i -lt $script:BcfLogo.Count; $i++) {
+        Write-Host ('  ' + (Ink $face[$i] $faceColor) + '   ' + (Ink $script:BcfLogo[$i] 'Cyan'))
+    }
     Write-Host ''
-    Write-BcfLine "  BRO CODING FACTORY v$(Get-BcfVersion)" 'Cyan'
+    Write-Host ('  ' + (Ink 'BRO CODING FACTORY' 'White') + ' ' + (Ink "v$(Get-BcfVersion)" 'DarkGray'))
     Write-BcfLine '  кодовая фабрика: граф агентов вместо цикла' 'DarkGray'
     Write-Host ''
 

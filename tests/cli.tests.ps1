@@ -192,6 +192,66 @@ It 'setup --check не меняет PATH и сообщает состояние'
     Assert-True ($r.Code -in @(0, 1)) "неожиданный код $($r.Code)"
 }
 
+# --- init: экраны мастера ---------------------------------------------------------------
+Write-Host ''
+Write-Host '  init — восемь экранов' -ForegroundColor White
+
+It 'все восемь шагов имеют заголовок «шаг N / 8»' {
+    $p = New-Sandbox 'init-steps'
+    $r = Bcf @('init', '--yes', '--project', $p)
+    for ($i = 1; $i -le 8; $i++) {
+        Assert-Match $r.Out "шаг $i / 8" "нет заголовка шага $i"
+    }
+}
+
+It 'шаг 1 показывает маскот и недавние проекты' {
+    $p = New-Sandbox 'init-step1'
+    $r = Bcf @('init', '--yes', '--project', $p)
+    Assert-Match $r.Out 'ГДЕ ПРОЕКТ'
+    Assert-Match $r.Out 'BRO CODING FACTORY'
+    # Маскот рисуется полублоками — без них шапка пустая.
+    Assert-Match $r.Out '[▀▄]' 'маскот не нарисован'
+    Assert-Match $r.Out 'состояние сохраняется в \.bcf/init\.json'
+}
+
+It 'вывод несёт ANSI-цвет, а не только текст' {
+    $p = New-Sandbox 'init-color'
+    $r = Bcf @('init', '--yes', '--project', $p)
+    Assert-Match $r.Out "`e\[" 'в выводе нет ни одной ANSI-последовательности'
+}
+
+# Регрессия к сути: цвет обязан гаснуть по общепринятому признаку, иначе вывод в файл
+# засоряется управляющими последовательностями, а их потом читают глазами.
+It 'BCF_NO_COLOR полностью выключает цвет' {
+    $p = New-Sandbox 'init-nocolor'
+    $old = $env:BCF_NO_COLOR
+    $env:BCF_NO_COLOR = '1'
+    try {
+        $r = Bcf @('init', '--yes', '--project', $p)
+        Assert-NoMatch $r.Out "`e\[" 'при BCF_NO_COLOR в выводе остались ANSI-коды'
+        Assert-Match $r.Out 'шаг 1 / 8' 'текст пропал вместе с цветом'
+    } finally { $env:BCF_NO_COLOR = $old }
+}
+
+It 'мастер сохраняет и убирает состояние .bcf/init.json' {
+    $p = New-Sandbox 'init-state'
+    $r = Bcf @('init', '--yes', '--project', $p)
+    Assert-True ($r.Code -in @(0, 1)) "неожиданный код $($r.Code)"
+    # После полного прохода состояние снимается: иначе следующий запуск сообщит о
+    # прерывании, которого не было.
+    Assert-True (-not (Test-Path (Join-Path $p '.bcf\init.json'))) 'состояние мастера не убрано после завершения'
+    Assert-True (Test-Path (Join-Path $p '.bcf\project.json')) 'карточка проекта не записана'
+}
+
+It 'init --dry проходит все экраны и ничего не пишет' {
+    $p = New-Sandbox 'init-dry'
+    $r = Bcf @('init', '--yes', '--dry', '--project', $p)
+    Assert-Match $r.Out 'шаг 8 / 8'
+    Assert-Match $r.Out 'ничего не записано'
+    Assert-True (-not (Test-Path (Join-Path $p 'config'))) 'сухой прогон записал config'
+    Assert-True (-not (Test-Path (Join-Path $p '.claude'))) 'сухой прогон записал .claude'
+}
+
 # --- detect --------------------------------------------------------------------------
 Write-Host ''
 Write-Host '  detect' -ForegroundColor White

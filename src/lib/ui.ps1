@@ -6,11 +6,57 @@
 # будет по-разному. Второе правило: опасное место называется ПОСЛЕДСТВИЕМ, а не
 # статусом — «затянет чужие правки в задачу», а не «дерево грязное».
 
-$script:BcfNoColor = [bool]$env:BCF_NO_COLOR
+# --- Цвет ------------------------------------------------------------------------------
+#
+# Цвет здесь несёт СМЫСЛ, а не украшает: зелёное — то, что проверено и работает; жёлтое —
+# оговорка; красное — то, из-за чего прогон встанет; серое — фон, который читать не надо.
+# Экран, где всё одного цвета, заставляет читать всё подряд, и человек перестаёт читать
+# вообще — а именно в этих строках лежат предупреждения, ради которых команда написана.
+#
+# Пишем ANSI, а не Write-Host -ForegroundColor. Разница не косметическая: атрибуты консоли
+# теряются при ЛЮБОМ перенаправлении — в файл, в пайп, в панель IDE, — и вывод, который в
+# окне выглядит осмысленным, в логе прогона оказывается серой простынёй. ANSI переживает
+# перенаправление, а выключается явно (NO_COLOR/BCF_NO_COLOR — общепринятый признак).
+
+$script:BcfNoColor = [bool]($env:BCF_NO_COLOR -or $env:NO_COLOR)
+
+# Палитра — стандартные 16 цветов терминала, а не RGB: так она подчиняется теме
+# пользователя. Тёмная тема, светлая, высококонтрастная — цвет остаётся читаемым.
+$script:BcfInk = @{
+    ''        = ''
+    'reset'   = "`e[0m"
+    'bold'    = "`e[1m"
+    'Red'     = "`e[91m"
+    'Green'   = "`e[92m"
+    'Yellow'  = "`e[93m"
+    'Blue'    = "`e[94m"
+    'Magenta' = "`e[95m"
+    'Cyan'    = "`e[96m"
+    'White'   = "`e[97m"
+    'Gray'    = "`e[37m"
+    'DarkGray'= "`e[90m"
+    'DarkCyan'= "`e[36m"
+    'DarkYellow' = "`e[33m"
+}
+
+function Test-BcfColor {
+    if ($script:BcfNoColor) { return $false }
+    return $true
+}
+
+# Раскрасить КУСОК строки. Нужно именно так: строка «TASK-02 готова crates/core/src.rs»
+# состоит из трёх разных по важности вещей, и красить её целиком одним цветом — значит
+# не сказать ничего. Текст передаётся уже дополненным до нужной ширины: ANSI-коды не
+# имеют ширины, и padding после раскраски съезжает.
+function Ink {
+    param([string]$Text, [string]$Color = '')
+    if (-not $Color -or -not (Test-BcfColor) -or -not $script:BcfInk.ContainsKey($Color)) { return $Text }
+    return $script:BcfInk[$Color] + $Text + $script:BcfInk['reset']
+}
 
 function Write-BcfLine {
     param([string]$Text = '', [string]$Color = '')
-    if ($Color -and -not $script:BcfNoColor) { Write-Host $Text -ForegroundColor $Color }
+    if ($Color -and (Test-BcfColor)) { Write-Host (Ink $Text $Color) }
     else { Write-Host $Text }
 }
 
@@ -24,10 +70,10 @@ function Write-BcfTitle {
 
 function Write-BcfRule { param([int]$Width = 78) Write-BcfLine ('  ' + ('─' * $Width)) 'DarkGray' }
 
-function Write-BcfOk    { param([string]$T) Write-BcfLine "  ✓ $T" 'Green' }
-function Write-BcfWarn  { param([string]$T) Write-BcfLine "  ⚠ $T" 'Yellow' }
-function Write-BcfFail  { param([string]$T) Write-BcfLine "  ✗ $T" 'Red' }
-function Write-BcfDim   { param([string]$T) Write-BcfLine "  · $T" 'DarkGray' }
+function Write-BcfOk    { param([string]$T) Write-Host ('  ' + (Ink '✓' 'Green')  + ' ' + (Ink $T 'Green')) }
+function Write-BcfWarn  { param([string]$T) Write-Host ('  ' + (Ink '⚠' 'Yellow') + ' ' + (Ink $T 'Yellow')) }
+function Write-BcfFail  { param([string]$T) Write-Host ('  ' + (Ink '✗' 'Red')    + ' ' + (Ink $T 'Red')) }
+function Write-BcfDim   { param([string]$T) Write-Host ('  ' + (Ink ('· ' + $T) 'DarkGray')) }
 function Write-BcfNote  { param([string]$T) Write-BcfLine "    $T" 'DarkGray' }
 
 # Источник вывода. Печатается рядом со значением, а не в легенде внизу: легенду не
@@ -42,13 +88,11 @@ function Get-BcfSourceTag {
 }
 
 function Write-BcfField {
-    param([string]$Name, [string]$Value, [string]$Source = '', [int]$NameWidth = 16)
-    $line = "  {0,-$NameWidth} {1}" -f $Name, $Value
+    param([string]$Name, [string]$Value, [string]$Source = '', [int]$NameWidth = 16, [string]$ValueColor = 'White')
+    $line = '  ' + (Ink ("{0,-$NameWidth}" -f $Name) 'DarkGray') + ' ' + (Ink $Value $ValueColor)
     if (-not $Source) { Write-Host $line; return }
     $tag = Get-BcfSourceTag $Source
-    Write-Host $line -NoNewline
-    if ($script:BcfNoColor) { Write-Host "   [$($tag.text)]" }
-    else { Write-Host "   $($tag.text)" -ForegroundColor $tag.color }
+    Write-Host ($line + '   ' + (Ink $tag.text $tag.color))
 }
 
 # Таблица без выравнивания по содержимому — колонки заданы заранее. Автоширина ломается
