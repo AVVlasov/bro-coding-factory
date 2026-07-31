@@ -1,0 +1,17 @@
+{
+  "iteration_id": "F03-2026-05-24-002",
+  "root_causes": [
+    {
+      "category_any": ["non_verifiable_dismiss", "arch_invariant_violation", "subagent_finding_ignored"]
+    }
+  ],
+  "ignored_subagent_findings": [
+    { "agent": "samanta-arch-consistency", "finding_id": "F03-arch-001" }
+  ],
+  "proposals": [
+    {
+      "kinds":   ["memory_anti_pattern"],
+      "targets": ["dismiss", "bypass", "architectural", "verbal", "temporary", "vague", "promise", "refactor", "deferred"]
+    }
+  ]
+}

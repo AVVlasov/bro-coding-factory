@@ -1,0 +1,12 @@
+[
+  {
+    "id": "ap-mock-as-real-001",
+    "agent_scope": "code",
+    "trigger_summary": "endpoint returning hardcoded data instead of querying source of truth",
+    "what_went_wrong": "GET /api/messages returned static fixture; passed tests because tests asserted the same fixture",
+    "correct_alternative": "skills/source-of-truth-endpoints",
+    "evidence": "iteration 2026-05-10-007",
+    "created": "2026-05-10",
+    "hits": 0
+  }
+]

@@ -1,0 +1,17 @@
+{
+  "iteration_id": "F02-2026-05-22-003",
+  "root_causes": [
+    { "category_any": ["repeated_anti_pattern"] },
+    { "category_any": ["test_mocked_subject_under_test"] }
+  ],
+  "ignored_subagent_findings": [
+    { "agent": "mock-as-real-detector", "finding_id": "auto" },
+    { "agent": "samanta-arch-consistency", "finding_id": "auto" }
+  ],
+  "proposals": [
+    {
+      "kinds":   ["memory_anti_pattern", "skill_new", "skill_update"],
+      "targets": ["hardcoded", "mock", "literal", "static", "source-of-truth", "repository", "store", "endpoint"]
+    }
+  ]
+}

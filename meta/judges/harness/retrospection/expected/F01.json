@@ -1,0 +1,19 @@
+{
+  "iteration_id": "F01-2026-05-20-001",
+  "root_causes": [
+    { "category_any": ["subagent_finding_ignored"], "severity": "high" }
+  ],
+  "ignored_subagent_findings": [
+    { "agent": "samanta-ux-vision", "finding_id": "F01-vision-001" }
+  ],
+  "proposals": [
+    {
+      "kinds":   ["memory_anti_pattern"],
+      "targets": ["must-address", "ignor", "accessibility", "address"]
+    },
+    {
+      "kinds":   ["skill_new", "skill_update"],
+      "targets": ["state", "contrast", "wcag", "accessibility"]
+    }
+  ]
+}
