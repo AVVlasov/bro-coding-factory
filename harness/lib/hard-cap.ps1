@@ -12,8 +12,9 @@
 # loop останавливается и зовёт оператора.
 
 # Repo root: env override, иначе два уровня вверх от этого lib-каталога
-# (REPO\loop\lib\hard-cap.ps1 → REPO).
-$script:RepoRoot = if ($env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
+# (REPO\harness\lib\hard-cap.ps1 → REPO).
+. (Join-Path $PSScriptRoot 'bcf-context.ps1')
+$script:RepoRoot = Get-BcfProjectRoot
 # bug_tracker.py: env override, иначе repo-relative default.
 $script:BugTracker = if ($env:BCF_BUG_TRACKER) { $env:BCF_BUG_TRACKER } else { Join-Path $script:RepoRoot 'memory/pgvector/bug_tracker.py' }
 

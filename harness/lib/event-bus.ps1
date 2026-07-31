@@ -1,7 +1,7 @@
 # event-bus.ps1 — append-only event log для Ralph harness (event-sourced state).
 #
-# Один файл: loop/events.jsonl. Append-only, NEVER редактируется.
-# Snapshot для быстрого доступа: loop/state/STATE.json (derived, можно пересчитать
+# Один файл: .bcf/events.jsonl. Append-only, NEVER редактируется.
+# Snapshot для быстрого доступа: .bcf/state/STATE.json (derived, можно пересчитать
 # `Compute-State` из events.jsonl).
 #
 # Контракт события (JSON, одна строка per event):
@@ -24,7 +24,7 @@
 #   . (Join-Path $PSScriptRoot 'lib\event-bus.ps1')
 #   Initialize-EventBus -RalphRoot (Split-Path $PSScriptRoot -Parent)/loop
 #   Append-Event -EventType iter-started -TaskId $task -Iteration $i -Phase loop
-#   Compute-State -StateDir "loop/state"
+#   Compute-State -StateDir ".bcf/state"
 
 $script:EventsFile = $null
 $script:StateDir   = $null

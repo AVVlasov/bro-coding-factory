@@ -1,8 +1,9 @@
 # bug-supervisor.ps1 — мостик supervisor-agent ↔ bug_tracker.py в loop-harness.
 # Используется loop.ps1 после verdict-recorded.
 
-# Repo root: env override, иначе два уровня вверх от lib-каталога (REPO\loop\lib → REPO).
-$script:RepoRoot    = if ($env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
+# Repo root: env override, иначе два уровня вверх от lib-каталога (REPO\harness\lib → REPO).
+. (Join-Path $PSScriptRoot 'bcf-context.ps1')
+$script:RepoRoot    = Get-BcfProjectRoot
 $script:BugTracker  = if ($env:BCF_BUG_TRACKER)     { $env:BCF_BUG_TRACKER }     else { Join-Path $script:RepoRoot 'memory/pgvector/bug_tracker.py' }
 $script:Invoker     = if ($env:BCF_INVOKE_SUPERVISOR) { $env:BCF_INVOKE_SUPERVISOR } else { Join-Path $script:RepoRoot 'agents/bin/invoke-supervisor.ps1' }
 $script:TestAuthor  = if ($env:BCF_INVOKE_TEST_AUTHOR) { $env:BCF_INVOKE_TEST_AUTHOR } else { Join-Path $script:RepoRoot 'agents/bin/invoke-test-author.ps1' }

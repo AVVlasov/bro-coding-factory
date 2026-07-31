@@ -1,7 +1,7 @@
 # harness-guard.ps1 — защита harness-скриптов от прямого вызова агентом.
 #
 # Контекст инцидента: кодовый агент в opencode-сессии самостоятельно запустил
-# `pwsh loop/lint-gate.ps1` (вероятно, чтобы посмотреть violations) → скрипт
+# `pwsh harness/lint-gate.ps1` (вероятно, чтобы посмотреть violations) → скрипт
 # исполнялся внутри LLM-сессии → итерация убита по таймауту. Запуск opencode-агента
 # идёт с --dangerously-skip-permissions, поэтому хуки pre-bash-guard не срабатывают —
 # нужен в-скриптовой guard.
@@ -92,18 +92,18 @@ function Assert-HarnessCaller {
 HARNESS-GUARD: вызов $ScriptName из агентской opencode-сессии запрещён.
 ==============================================================================
 
-Этот скрипт — часть harness. Его автоматически крутит loop/loop.ps1 между
-итерациями; результаты приходят к тебе через loop/STATE.md (BACKPRESSURE-блок).
+Этот скрипт — часть harness. Его автоматически крутит harness/loop.ps1 между
+итерациями; результаты приходят к тебе через .bcf/STATE.md (BACKPRESSURE-блок).
 
 Самостоятельный запуск из агентской сессии = ровно тот баг, который убивает
 итерацию — opencode run зависает по таймауту, потому что скрипт исполняется
 внутри LLM-сессии.
 
 Что делать вместо этого:
-  - смотреть последний backpressure: loop/STATE.md (раздел BACKPRESSURE);
-  - просить верификацию: создать файл loop/VERIFY-REQUEST (loop.ps1 сам
+  - смотреть последний backpressure: .bcf/STATE.md (раздел BACKPRESSURE);
+  - просить верификацию: создать файл .bcf/VERIFY-REQUEST (loop.ps1 сам
     вызовет verify.ps1 → judge);
-  - смотреть последние события: loop/events.jsonl (только Read, не запускать
+  - смотреть последние события: .bcf/events.jsonl (только Read, не запускать
     inspect.ps1).
 
 Process chain (первые 6 уровней):
@@ -120,7 +120,7 @@ $callerHint
             $busLib = Join-Path $PSScriptRoot 'event-bus.ps1'
             if (Test-Path $busLib) {
                 . $busLib
-                Initialize-EventBus -RalphRoot (Split-Path $PSScriptRoot -Parent)
+                Initialize-EventBus -RalphRoot (Get-BcfStateDir)
                 Append-Event -EventType 'agent-self-invoke' -Phase 'guard' `
                     -Payload @{
                         script = $ScriptName

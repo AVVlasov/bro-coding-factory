@@ -1,0 +1,420 @@
+# harness/run-all.ps1 — ОВЕРНАЙТ-оркестратор: прогоняет ВСЕ задачи подряд, автономно.
+#
+# Для каждой задачи в числовом порядке: если уже verdict: PASS — пропуск; иначе запускает
+# обычный однозадачный loop.ps1 <task> -AutoAdvance (синхронно, в этом же окне). После выхода
+# проверяет вердикт: PASS → следующая; не-PASS (затык/гейт/лимит) → ЗАПИСЫВАЕТ и идёт дальше
+# (ночью не блокируемся на одной задаче). Гейты зависимостей соблюдаются самим loop.ps1
+# (если предшественник не PASS — задача-наследник заблокируется и попадёт в «не сделано»).
+#
+# Подавляет per-task попапы Windows (в loop.ps1 через -AutoAdvance); в конце — ОДИН итоговый
+# REVIEW.md + одно окно + звук.
+#
+# Модель и task-id префикс берутся из config/harness.json (models.code, taskIdPrefix) —
+# не хардкодятся. loop.ps1 запускается через $PSScriptRoot.
+#
+# Запуск: pwsh harness/run-all.ps1   (обычно через harness/start.ps1 без аргумента → start.ps1)
+#   pwsh harness/run-all.ps1 -PerTaskMax 30
+# Досрочно остановить — создать файл .bcf/STOP (проверяется между задачами).
+
+param(
+  [int]$PerTaskMax = 40,                                  # потолок итераций НА ОДНУ задачу
+  [string]$Model = "",                                    # пусто → из config/harness.json (models.code)
+  [switch]$NoAutoRollback,
+  [int]$TaskConcurrency = 0,                              # 0 → из config; 1 = последовательно (старое поведение)
+  [switch]$DryPlan,                                       # только показать план параллелизма, ничего не запускать
+  [string]$ProjectRoot = ''                               # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+)
+
+$ErrorActionPreference = "Continue"
+. (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+$root     = Get-BcfProjectRoot -Explicit $ProjectRoot
+$stateDir = Get-BcfStateDir $root
+$loopPs1  = Join-Path $PSScriptRoot "loop.ps1"
+$logFile  = Join-Path $stateDir "loop.log"
+$stopFile = Join-Path $stateDir "STOP"
+$reviewFile = Join-Path $stateDir "REVIEW.md"
+Set-Location $root
+
+# --- Config (config/harness.json): code-agent model + task-id префикс ---
+$harnessCfg = $null
+$cfgFile = Join-Path $root 'config\harness.json'
+if (Test-Path $cfgFile) {
+  try { $harnessCfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json } catch { $harnessCfg = $null }
+}
+if (-not $Model -and $harnessCfg -and $harnessCfg.models -and $harnessCfg.models.code) {
+  $Model = [string]$harnessCfg.models.code
+}
+$taskIdPrefix = if ($harnessCfg -and $harnessCfg.taskIdPrefix) { [string]$harnessCfg.taskIdPrefix } else { 'TASK' }
+$modelLabel   = if ($Model) { $Model } else { '(backend default)' }
+
+try {
+  [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  $OutputEncoding           = [System.Text.Encoding]::UTF8
+  chcp 65001 | Out-Null
+} catch { }
+
+function Log($msg) {
+  $line = "[{0}] [run-all] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
+  Write-Host $line -ForegroundColor Cyan
+  Add-Content -Path $logFile -Value $line
+}
+
+function Verdict-Pass($t, $atRoot) {
+  # $atRoot — корень, где искать вердикт. У параллельной задачи это её worktree:
+  # loop.ps1 внутри worktree пишет вердикт туда, а не в основное дерево.
+  $base = if ($atRoot) { $atRoot } else { $root }
+  $vf = Join-Path $base "tasks\.verdicts\$t.md"
+  if (!(Test-Path $vf)) { return $false }
+  return [bool](Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
+}
+
+# Префикс-предшественники из «**Gate-вход:**» (как в loop.ps1: только <PREFIX>-\d+; иные
+# гейты вроде decision-record игнорируются — loop.ps1 на них тоже не блокирует).
+$predRegex = [regex]::Escape($taskIdPrefix) + '-\d+'
+function Get-GatePreds($t) {
+  $tf = Get-ChildItem (Join-Path $root "tasks") -Filter "$t-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $tf) { return @() }
+  $line = Select-String -Path $tf.FullName -Pattern '^\*\*Gate-вход' | Select-Object -First 1
+  if (-not $line) { return @() }
+  if ($line.Line -match 'Gate-вход[^:]*:\**\s*(.+)$') {
+    $val = $Matches[1]
+    if ($val -match '^\s*нет\b') { return @() }
+    return @([regex]::Matches($val, $predRegex) | ForEach-Object { $_.Value } | Select-Object -Unique | Where-Object { $_ -ne $t })
+  }
+  return @()
+}
+
+# --- Транзитивное сведе́ние каскад-гейта к КОРНЮ (задаче, которая реально требует человека).
+# Причина gate-block содержит «предшественник <PREFIX>-NN …». Идём по цепочке причин, пока не
+# упрёмся в задачу, чья причина НЕ начинается с «gate-block» — это и есть корневой блокер. ---
+function Resolve-Root([string]$task, [hashtable]$map) {
+  $seen = @{}; $cur = $task
+  while ($true) {
+    if ($seen.ContainsKey($cur)) { return $cur }   # защита от цикла
+    $seen[$cur] = $true
+    $r = $map[$cur]
+    if (-not $r -or ($r -notlike 'gate-block*')) { return $cur }
+    $mm = [regex]::Match($r, $predRegex)
+    if (-not $mm.Success) { return $cur }
+    $cur = $mm.Value
+  }
+}
+
+# --- ЕДИНЫЙ ЧЕСТНЫЙ ИТОГ.
+#
+# Зачем: раньше прогон всегда заканчивался попапом «готово» и exit 0 — даже когда закрыто
+# 13 задач из 19. И человек, и вызывающий агент принимали неполный прогон за успешный.
+# Теперь «готово» звучит ТОЛЬКО при полностью закрытой очереди, иначе INCOMPLETE + exit 1.
+#
+# Незакрытые категоризируются: «требуют человека» (сама задача застряла/упала) vs
+# «каскад-гейт» (заблокирована незакрытым предшественником) — чинить надо корни, а не список.
+#
+# Пишет REVIEW.md + run-all.status.json (+ harvest), возвращает объект статуса.
+# НЕ показывает попап и НЕ делает exit — это делает вызывающий код, чтобы функцию
+# можно было прогнать headless в тесте:
+#   $env:BCF_REPORT_LIB_ONLY=1 ; . harness/run-all.ps1 ; Emit-RunAllReport ... ---
+function Emit-RunAllReport {
+  # $StatusFile переопределяется ради сухих прогонов: у них «не закрыто» — артефакт
+  # режима, а не факт, и записывать его в боевой статус нельзя.
+  param([array]$Passed, [array]$Stuck, [int]$Total, [string]$Root, [string]$ReviewFile, [string]$Ts,
+        [string]$StatusFile = '')
+
+  $gateBlocked = @($Stuck | Where-Object { $_.Reason -like 'gate-block*' })
+  $needsHuman  = @($Stuck | Where-Object { $_.Reason -notlike 'gate-block*' })
+  $complete    = (@($Stuck).Count -eq 0)
+
+  $reasonOf = @{}
+  foreach ($s in $Stuck) { $reasonOf[$s.Task] = $s.Reason }
+  $blocksByRoot = @{}
+  foreach ($g in $gateBlocked) {
+    $rt = Resolve-Root $g.Task $reasonOf
+    if (-not $blocksByRoot.ContainsKey($rt)) { $blocksByRoot[$rt] = @() }
+    $blocksByRoot[$rt] += $g.Task
+  }
+
+  # run-all.status.json — машиночитаемый сигнал для вызывающего агента/автоматизации.
+  $statusObj = [ordered]@{
+    complete     = $complete
+    when         = $Ts
+    total        = $Total
+    passed       = @($Passed).Count
+    stuck        = @($Stuck).Count
+    # @($hash[отсутствующий ключ]) даёт массив ИЗ ОДНОГО null, и в статусе появлялось
+    # "blocks": [null] — то есть «блокирует 1» там, где не блокирует никого.
+    needs_human  = @($needsHuman  | ForEach-Object { [ordered]@{ task = $_.Task; reason = $_.Reason; blocks = @(@($blocksByRoot[$_.Task]) | Where-Object { $_ }) } })
+    gate_blocked = @($gateBlocked | ForEach-Object { [ordered]@{ task = $_.Task; reason = $_.Reason } })
+  }
+  $statusPath = if ($StatusFile) { $StatusFile } else { Join-Path $Root '.bcf\run-all.status.json' }
+  try { ($statusObj | ConvertTo-Json -Depth 6) | Set-Content -Path $statusPath -Encoding UTF8 } catch { }
+
+  # REVIEW.md.
+  $passLines = if (@($Passed).Count) { (@($Passed) | ForEach-Object { "- $_" }) -join "`n" } else { "- (нет)" }
+  $humanLines = if ($needsHuman.Count) {
+    ($needsHuman | ForEach-Object {
+      $b = @(@($blocksByRoot[$_.Task]) | Where-Object { $_ }); $suff = if ($b.Count) { " — блокирует $($b.Count): $($b -join ', ')" } else { "" }
+      "- **$($_.Task)** — $($_.Reason)$suff"
+    }) -join "`n"
+  } else { "- (нет)" }
+  $gateLines = if ($gateBlocked.Count) { ($gateBlocked | ForEach-Object { "- **$($_.Task)** — $($_.Reason)" }) -join "`n" } else { "- (нет)" }
+  $statusLine = if ($complete) {
+    "**Статус:** COMPLETE — все $Total задач закрыты (PASS)."
+  } else {
+    "**Статус:** INCOMPLETE — не закрыто $(@($Stuck).Count) из $Total (требуют человека: $($needsHuman.Count), каскад-гейт: $($gateBlocked.Count)). НЕ принимать за «готово»."
+  }
+  $rootHint = if ($needsHuman.Count) {
+    "## Корень: почини это первым`n" +
+    (($needsHuman | ForEach-Object {
+      $b = @(@($blocksByRoot[$_.Task]) | Where-Object { $_ })
+      "- **$($_.Task)** ($($_.Reason))$(if ($b.Count) { " -> разблокирует $($b.Count): $($b -join ', ')" })"
+    }) -join "`n") +
+    "`n`nПосле фикса перезапусти прогон — закрытые PASS пропустятся, каскад-гейт подтянется.`n`n"
+  } else { "" }
+
+  Set-Content -Path $ReviewFile -Encoding UTF8 -Value (
+    "# Ralph overnight run-all — итог`n`n" +
+    "**Когда:** $Ts`n$statusLine`n**Закрыто (PASS):** $(@($Passed).Count) / $Total`n`n" +
+    $rootHint +
+    "## PASS`n$passLines`n`n" +
+    "## Требуют вмешательства (сама задача застряла/упала)`n$humanLines`n`n" +
+    "## Заблокированы каскад-гейтом (закроются после фикса предшественника)`n$gateLines`n`n" +
+    "## Что дальше`n" +
+    "- Детали: .bcf/loop.log, tasks/.verdicts/<id>.md, pwsh harness/inspect.ps1 --task <NN> --last 20.`n" +
+    "- Машиночитаемый статус: .bcf/run-all.status.json (complete=$($complete.ToString().ToLower())).`n" +
+    "- Незакрытые: почини «требуют вмешательства», перезапусти точечно или прогон целиком.")
+
+  # Эволюционный harvest — топ-предложения ретроспектора (по частоте).
+  try {
+    # Клиент памяти — часть фабрики (одна установка pgvector на все проекты), поэтому
+    # путь считается от BCF_HOME, а не от корня проекта. Ошибка в этом месте молчалива:
+    # Test-Path не выполняется, блок пропускается, и раздел «Эволюция» в REVIEW.md
+    # оказывается пуст всегда — при полностью рабочем ретроспекторе.
+    $memClient = Join-Path (Get-BcfHomeRoot) 'memory\pgvector\memory_client.py'
+    if (Test-Path $memClient) {
+      $propJson = & python $memClient harvest-proposals --status new --limit 10 2>$null
+      $props = if ($propJson) { try { $propJson | ConvertFrom-Json } catch { @() } } else { @() }
+      $propLines = if (@($props).Count) {
+        (@($props) | ForEach-Object { "- $($_.count)x [$($_.kind)] $($_.target) — $($_.rationale)" }) -join "`n"
+      } else { "- (пока нет — ретроспектор накопит за прогоны)" }
+      Add-Content -Path $ReviewFile -Encoding UTF8 -Value "`n## Эволюция: топ-предложения ретроспектора (по частоте)`n$propLines`n`nТриаж: python memory/pgvector/memory_client.py harvest-proposals."
+    }
+  } catch { }
+
+  $rootList = if ($needsHuman.Count) {
+    ($needsHuman | ForEach-Object { $b = @(@($blocksByRoot[$_.Task]) | Where-Object { $_ }); "$($_.Task)$(if ($b.Count) { " (блокирует $($b.Count))" })" }) -join ', '
+  } elseif (-not $complete) { '(каскад-гейт; см. REVIEW.md)' } else { '' }
+
+  return [pscustomobject]@{
+    complete    = $complete
+    passed      = @($Passed).Count
+    total       = $Total
+    stuck       = @($Stuck).Count
+    needsHuman  = $needsHuman.Count
+    gateBlocked = $gateBlocked.Count
+    rootList    = $rootList
+  }
+}
+
+# Тест-режим: загрузить только определения функций (headless-проверка Emit-RunAllReport),
+# не запуская реальную оркестрацию очереди.
+if ($env:BCF_REPORT_LIB_ONLY) { return }
+
+# --- Очередь: top-level <PREFIX>-NN (без подзадач <PREFIX>-NN.M, без <PREFIX>-00 overview), по номеру ---
+$queue = Get-ChildItem (Join-Path $root "tasks") -Filter "$taskIdPrefix-*.md" -ErrorAction SilentlyContinue |
+  ForEach-Object {
+    if ($_.Name -match "^$([regex]::Escape($taskIdPrefix))-(\d+)-") { [pscustomobject]@{ Task = "$taskIdPrefix-$($Matches[1])"; Num = [int]$Matches[1]; File = $_.Name } }
+  } |
+  Where-Object { $_.Num -ne 0 } |
+  Sort-Object Num -Unique
+
+if (-not $queue -or $queue.Count -eq 0) { Log "Очередь пуста — нет задач $taskIdPrefix-NN в tasks/."; exit 1 }
+
+Log "=== ОВЕРНАЙТ run-all старт. Задач в очереди: $($queue.Count) (PerTaskMax=$PerTaskMax, model=$modelLabel). ==="
+Log "Очередь: $((($queue | ForEach-Object { $_.Task }) -join ', '))"
+
+# --- Параллельный режим (MX-04). При TaskConcurrency <= 1 работает старый
+# последовательный путь ниже — он проверен, его не трогаем. ---
+if ($TaskConcurrency -le 0) {
+  $TaskConcurrency = if ($harnessCfg -and $harnessCfg.limits.taskConcurrency) { [int]$harnessCfg.limits.taskConcurrency } else { 1 }
+}
+$maxAgents = if ($harnessCfg -and $harnessCfg.limits.agentConcurrency) { [int]$harnessCfg.limits.agentConcurrency } else { 6 }
+
+if ($TaskConcurrency -gt 1 -or $DryPlan) {
+  . (Join-Path $PSScriptRoot 'lib\claims.ps1')
+  . (Join-Path $PSScriptRoot 'lib\fleet.ps1')
+  . (Join-Path $PSScriptRoot 'lib\worktree.ps1')
+  . (Join-Path $PSScriptRoot 'lib\scheduler.ps1')
+
+  # Индекс связности пересобираем на входе: он и есть «память» о том, какие файлы
+  # ходят вместе, и без свежей истории допуск слепнет.
+  Update-CoChangeIndex -Root $root | Out-Null
+
+  $mergeChecks = @()
+  try {
+    $cf = Join-Path $root 'config\checks.json'
+    if (Test-Path $cf) {
+      $cj = Get-Content -Raw -LiteralPath $cf | ConvertFrom-Json
+      if ($cj._default) { $mergeChecks = @($cj._default | Where-Object { $_ -is [string] -and $_.Trim() }) }
+    }
+  } catch { }
+
+  Log "Параллельный режим: до $TaskConcurrency задач одновременно, потолок агентов $maxAgents$(if ($DryPlan) { ' (DRY-PLAN — ничего не запускается)' })."
+
+  $res = Invoke-ParallelQueue -Root $root -Tasks @($queue | ForEach-Object { $_.Task }) `
+    -IsPass { param($t, $wt) Verdict-Pass $t $wt } `
+    -GatePreds { param($t) Get-GatePreds $t } `
+    -LogFn { param($m) Log $m } `
+    -Concurrency $TaskConcurrency -MaxAgents $maxAgents -PerTaskMax $PerTaskMax `
+    -Model $Model -MergeChecks $mergeChecks -DryPlan:$DryPlan `
+    -GeneratedFiles @(if ($harnessCfg -and $harnessCfg.generatedFiles) { $harnessCfg.generatedFiles } else { @() })
+
+  foreach ($p in $res.Plan) {
+    Log ("план: {0,-10} {1}" -f $p.task, $(if ($p.admitted) { 'допущена' } else { "отклонена — $($p.reason)" }))
+  }
+
+  if ($DryPlan) {
+    Log "=== DRY-PLAN завершён: допущено $(@($res.Plan | Where-Object { $_.admitted }).Count), отклонено $(@($res.Plan | Where-Object { -not $_.admitted }).Count). ==="
+    exit 0
+  }
+
+  $rep = Emit-RunAllReport -Passed $res.Passed -Stuck $res.Stuck -Total $queue.Count -Root $root `
+    -ReviewFile $reviewFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  Log "=== run-all (параллельно) завершён: PASS $($rep.passed)/$($rep.total), не закрыто $($rep.stuck). ==="
+  if ($rep.complete) { exit 0 } else { exit 1 }
+}
+
+$passed = @(); $stuck = @()
+$stuckSet = [System.Collections.Generic.HashSet[string]]::new()
+$doneSet  = [System.Collections.Generic.HashSet[string]]::new()
+$tasks = @($queue | ForEach-Object { $_.Task })
+
+# Уже закрытые — сразу в passed.
+foreach ($t in $tasks) {
+  if (Verdict-Pass $t) { Log "$t — уже verdict: PASS, пропуск."; $passed += $t; [void]$doneSet.Add($t) }
+}
+
+# Зависимостно-аккуратный планировщик: МУЛЬТИПРОХОД. Запускаем задачу только когда все её
+# TASK-предшественники = PASS. Это чинит баг порядка: TASK-04/05 (Gate-вход=TASK-06, бо́льший
+# номер) ранее терялись при одном числовом проходе — теперь они запустятся в следующем проходе
+# после того как TASK-06 закрылся.
+$stopped = $false
+while (-not $stopped) {
+  if (Test-Path $stopFile) { Log "STOP-файл найден — оркестратор остановлен."; $stopped = $true; break }
+  $ranThisRound = $false
+  foreach ($task in $tasks) {
+    if ($doneSet.Contains($task)) { continue }
+    if (Test-Path $stopFile) { $stopped = $true; break }
+
+    $preds = Get-GatePreds $task
+    # Предшественник уже признан НЕ закрытым (stuck) → задача навсегда заблокирована.
+    $blockedBy = @($preds | Where-Object { $stuckSet.Contains($_) })
+    if ($blockedBy.Count -gt 0) {
+      $reason = "gate-block: предшественник $($blockedBy -join ', ') не закрыт"
+      Log "<<< $task → пропуск ($reason)."
+      $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
+      [void]$stuckSet.Add($task); [void]$doneSet.Add($task)
+      continue
+    }
+    # Предшественник ещё не PASS, но и не stuck (просто ещё не дошла очередь) → ждём след. прохода.
+    $pending = @($preds | Where-Object { -not (Verdict-Pass $_) })
+    if ($pending.Count -gt 0) { continue }
+
+    # Все предшественники PASS (или их нет) → запускаем.
+    Log ">>> Задача $task — запуск loop.ps1 -AutoAdvance (потолок $PerTaskMax итераций) ..."
+
+    # M-17: ИЗОЛЯЦИЯ ЗАДАЧ. Всё некоммиченное копится на ОДНОМ working-tree → правки
+    # незакрытой задачи протекают в следующую и контаминируют её гейты (напр. layout-contract
+    # флипал PASS/FAIL по чужому состоянию). Снимаем pre-task снимок; если задача
+    # НЕ закроется — откатим ТОЛЬКО её собственную дельту (tracked→snapshot + удалим добавленные ею
+    # untracked), сохранив работу прежних PASS-задач. Работа незакрытой — в refs/bcf/wip/$task.
+    $preTaskSnap = (& git stash create 2>$null | Out-String).Trim()
+    if (-not $preTaskSnap) { $preTaskSnap = (& git rev-parse HEAD 2>$null | Out-String).Trim() }
+    $preUntracked = @(& git ls-files --others --exclude-standard 2>$null | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+
+    $loopArgs = @('-NoProfile', '-File', $loopPs1, $task, '-MaxIterations', $PerTaskMax, '-AutoAdvance', '-Model', $Model)
+    if ($NoAutoRollback) { $loopArgs += '-NoAutoRollback' }
+    & pwsh @loopArgs
+    $ranThisRound = $true
+    [void]$doneSet.Add($task)
+
+    if (Verdict-Pass $task) {
+      Log "<<< $task → PASS."
+      $passed += $task
+    } else {
+      # Реальная причина остановки из STATE.md (gate-block здесь исключён — преды уже PASS).
+      $reason = 'не достиг PASS (лимит/затык)'
+      $sf = Join-Path $stateDir "STATE.md"
+      if (Test-Path $sf) {
+        $h = Select-String -Path $sf -Pattern '##\s*Итерация.*—\s*(.+)$' | Select-Object -Last 1
+        if ($h) { $reason = $h.Matches[0].Groups[1].Value.Trim() }
+      }
+      Log "<<< $task → НЕ закрыта ($reason)."
+      $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
+      [void]$stuckSet.Add($task)
+
+      # M-17: изоляция — откатываем собственную дельту незакрытой задачи (tracked → pre-task snapshot,
+      # удаляем добавленные ею untracked), чтобы её мусор не протёк в следующую задачу. Работа уже
+      # в refs/bcf/wip/$task (loop.ps1 Save-WipSnapshot) — восстановимо.
+      if ($preTaskSnap) {
+        # Изоляция — только по продуктовым путям. Полный откат `-- .` сносил и то,
+        # что снаружи правил человек/мета-слой параллельно с прогоном (инцидент
+        # 2026-07-26: удалён новый файл харнесса, откачены конфиги).
+        $isoPaths = if ($harnessCfg -and $harnessCfg.productPaths) { @($harnessCfg.productPaths) } else { @('.') }
+        & git checkout $preTaskSnap -- @isoPaths 2>&1 | Out-Null
+        & git reset -q 2>$null   # снять с индекса (checkout стейджит) — оставить как unstaged
+        $postUntracked = @(& git ls-files --others --exclude-standard 2>$null | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $addedByTask = @($postUntracked | Where-Object { $preUntracked -notcontains $_ })
+        # Удаляем только то, что лежит внутри продуктовых путей: новый файл обвязки,
+        # созданный снаружи, петля удалять не имеет права.
+        $addedByTask = @($addedByTask | Where-Object { $p = $_; @($isoPaths | Where-Object { $p -like "$_*" }).Count -gt 0 })
+        foreach ($f in $addedByTask) {
+          $full = Join-Path $root $f
+          if (Test-Path $full) { Remove-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue }
+        }
+        $snapShort = $preTaskSnap.Substring(0, [Math]::Min(8, $preTaskSnap.Length))
+        Log "изоляция: откатил дельту незакрытой $task к pre-task snapshot $snapShort (untracked удалено: $($addedByTask.Count)); её работа — refs/bcf/wip/$task."
+      }
+    }
+  }
+  if ($stopped) { break }
+  if (-not $ranThisRound) {
+    # Ничего не запустилось и ничего не помечено — остаток заблокирован незакрытыми предами
+    # (циклические/недостижимые гейты). Закрываем их как gate-block и выходим.
+    foreach ($task in $tasks) {
+      if ($doneSet.Contains($task)) { continue }
+      $preds = Get-GatePreds $task
+      $pend = @($preds | Where-Object { -not (Verdict-Pass $_) })
+      $stuck += [pscustomobject]@{ Task = $task; Reason = "gate-block: предшественник $($pend -join ', ') не закрыт (не запускался)" }
+      [void]$doneSet.Add($task)
+    }
+    break
+  }
+}
+
+# --- Итоговый отчёт (ОДИН на всю ночь).
+# «Готово» звучит ТОЛЬКО при полностью закрытой очереди; иначе INCOMPLETE + exit 1,
+# чтобы неполный прогон не был принят за успешный ни человеком, ни вызывающим агентом. ---
+$rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $queue.Count -Root $root `
+  -ReviewFile $reviewFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+if ($rep.complete) {
+  Log "=== run-all завершён: ВСЕ задачи закрыты (PASS $($rep.passed)/$($rep.total)). Итог — .bcf/REVIEW.md. ==="
+  try { [console]::beep(740, 180); Start-Sleep -Milliseconds 90; [console]::beep(988, 260) } catch { }   # восходящий = успех
+} else {
+  Log "=== run-all завершён НЕПОЛНО: PASS $($rep.passed)/$($rep.total); НЕ закрыто $($rep.stuck) (человек: $($rep.needsHuman), каскад-гейт: $($rep.gateBlocked)). Итог — .bcf/REVIEW.md. ==="
+  try { [console]::beep(660, 200); Start-Sleep -Milliseconds 110; [console]::beep(440, 450) } catch { }   # нисходящий = внимание
+}
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  if ($rep.complete) {
+    [System.Windows.Forms.MessageBox]::Show(
+      "Overnight run-all завершён.`nЗакрыто PASS: $($rep.passed) из $($rep.total) — ВСЁ закрыто.`n`nИтог — .bcf/REVIEW.md",
+      "Ralph run-all: готово", 'OK', 'Information') | Out-Null
+  } else {
+    [System.Windows.Forms.MessageBox]::Show(
+      "Очередь пройдена, но НЕ ВСЁ закрыто.`n`nЗакрыто PASS: $($rep.passed) из $($rep.total).`nНе закрыто: $($rep.stuck) (требуют тебя: $($rep.needsHuman), каскад-гейт: $($rep.gateBlocked)).`n`nПочини первым: $($rep.rootList)`nЗатем перезапусти прогон.`n`nИтог — .bcf/REVIEW.md",
+      "Ralph run-all: НЕЗАКРЫТО — нужно ревью", 'OK', 'Warning') | Out-Null
+  }
+} catch { }
+
+if ($rep.complete) { exit 0 } else { exit 1 }

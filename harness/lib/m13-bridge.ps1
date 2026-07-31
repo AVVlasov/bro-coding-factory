@@ -8,8 +8,9 @@
 #   Run-Retrospector      — после verdict: ретроспектор JSON → upsert в anti_patterns.
 #   Invoke-FindingGate    — между opencode-run и verify: блокирует non-verifiable dismiss.
 
-# Repo root: env override, иначе два уровня вверх от lib-каталога (REPO\loop\lib → REPO).
-$script:RepoRoot     = if ($env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
+# Repo root: env override, иначе два уровня вверх от lib-каталога (REPO\harness\lib → REPO).
+. (Join-Path $PSScriptRoot 'bcf-context.ps1')
+$script:RepoRoot     = Get-BcfProjectRoot
 
 $script:M13Disabled  = ($env:BCF_MEMORY_DISABLED -eq '1')
 $script:MemClient    = if ($env:BCF_MEMORY_CLIENT)   { $env:BCF_MEMORY_CLIENT }   else { Join-Path $script:RepoRoot 'memory/pgvector/memory_client.py' }
@@ -384,8 +385,8 @@ function Run-Retrospector {
 
     try { $parsed = $retroOut | ConvertFrom-Json } catch { return $null }
 
-    # Сохраняем JSON ретроспективы внутри harness-каталога (loop/retros).
-    $retroDir = if ($env:BCF_RETRO_DIR) { $env:BCF_RETRO_DIR } else { Join-Path $script:RepoRoot 'loop/retros' }
+    # Сохраняем JSON ретроспективы внутри harness-каталога (.bcf/retros).
+    $retroDir = if ($env:BCF_RETRO_DIR) { $env:BCF_RETRO_DIR } else { Join-Path $script:RepoRoot '.bcf/retros' }
     if (-not (Test-Path $retroDir)) { New-Item -ItemType Directory -Force -Path $retroDir | Out-Null }
     $retroFile = Join-Path $retroDir "$iterId-$(Get-Date -Format HHmmss).json"
     Set-Content -LiteralPath $retroFile -Value $retroOut -Encoding UTF8
@@ -426,7 +427,7 @@ function Invoke-FindingGate {
     Set-Content -LiteralPath (Join-Path $iterDir 'diff.patch') -Value ($diff -join "`n") -Encoding UTF8
 
     # findings — из предыдущего verdict-файла (must_address rem-* items).
-    $verifyDir = if ($env:BCF_VERIFY_DIR) { $env:BCF_VERIFY_DIR } else { Join-Path $repo 'loop/.verify' }
+    $verifyDir = if ($env:BCF_VERIFY_DIR) { $env:BCF_VERIFY_DIR } else { Join-Path $repo '.bcf/verify' }
     $prevVerdict = Join-Path $verifyDir "$TaskId-judge.out.txt"
     if (Test-Path $prevVerdict) {
         $jt = Get-Content -Raw -LiteralPath $prevVerdict

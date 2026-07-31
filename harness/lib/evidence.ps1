@@ -4,7 +4,7 @@
 # факты прямо из репозитория и работающих артефактов, минуя рассуждения
 # агента/тестеров.
 #
-# Используется из loop/verify.ps1 (Phase E) — добавляется в JSON-блок verdict-файла.
+# Используется из harness/verify.ps1 (Phase E) — добавляется в JSON-блок verdict-файла.
 
 function Collect-Evidence {
     param(
@@ -50,10 +50,10 @@ function Collect-Evidence {
         }
         # WIP-снапшоты прогресса (durable refs, см. loop.ps1 Save-WipSnapshot).
         # Петля не коммитит в основную историю (cumulative diff HEAD — source of
-        # truth), поэтому прогресс отражаем через refs/loop/wip-history.
-        $wipHist = @(git for-each-ref --format='%(refname:short)|%(objectname:short)|%(committerdate:iso)' refs/loop/wip-history 2>$null)
+        # truth), поэтому прогресс отражаем через refs/bcf/wip-history.
+        $wipHist = @(git for-each-ref --format='%(refname:short)|%(objectname:short)|%(committerdate:iso)' refs/bcf/wip-history 2>$null)
         if ($wipHist) {
-            $latest = git for-each-ref --sort=-committerdate --count=1 --format='%(objectname:short)|%(committerdate:iso)' refs/loop/wip-history 2>$null
+            $latest = git for-each-ref --sort=-committerdate --count=1 --format='%(objectname:short)|%(committerdate:iso)' refs/bcf/wip-history 2>$null
             $lp = ($latest -split '\|', 2)
             $ev.wip_snapshots = [ordered]@{
                 count       = @($wipHist).Count

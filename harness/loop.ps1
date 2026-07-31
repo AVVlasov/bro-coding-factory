@@ -1,26 +1,26 @@
-# loop/loop.ps1 — Ralph loop runner для the project (bounded-режим).
+# harness/loop.ps1 — Ralph loop runner для the project (bounded-режим).
 #
 # Каждая итерация: opencode выполняет ОДИН шаг задачи в свежем контексте → раннер гоняет
-# backpressure (tsc + done-gate) → пишет результат в loop/STATE.md (legacy compat) +
-# loop/events.jsonl (W3, append-only) → следующая итерация видит ошибки и исправляет.
+# backpressure (tsc + done-gate) → пишет результат в .bcf/STATE.md (legacy compat) +
+# .bcf/events.jsonl (W3, append-only) → следующая итерация видит ошибки и исправляет.
 # Останавливается на verdict-гейте для ревью оператора.
 #
 # Защиты от зависания:
 #   - таймаут на итерацию (-IterTimeoutSec): зависший opencode run убивается;
 #   - детектор «нет прогресса»: N итераций без изменений кода → стоп;
 #   - loop-detection: 3 итерации с одной ошибкой → стоп;
-#   - потолок -MaxIterations; файл loop/STOP; стоп на verdict: PASS.
+#   - потолок -MaxIterations; файл .bcf/STOP; стоп на verdict: PASS.
 #
 # W3 (2026-05-24): event-sourced harness.
-#   - loop/events.jsonl  — append-only журнал событий
-#   - loop/state/STATE.json — derived projection (пересчитывается inspect.ps1 --replay)
-#   - loop/STATE.md остался для legacy compat (агент его читает); удалим в W6 cleanup
+#   - .bcf/events.jsonl  — append-only журнал событий
+#   - .bcf/state/STATE.json — derived projection (пересчитывается inspect.ps1 --replay)
+#   - .bcf/STATE.md остался для legacy compat (агент его читает); удалим в W6 cleanup
 #
 # Запуск:
-#   pwsh loop/loop.ps1 TASK-01
-#   pwsh loop/loop.ps1 TASK-02 -Model "<model>" -IterTimeoutSec 1200
-#   pwsh loop/loop.ps1 TASK-03 -Force
-# Обычно — через тонкий лаунчер loop/start.ps1 <TASK-ID> (или эквивалентную команду вашего CLI).
+#   pwsh harness/loop.ps1 TASK-01
+#   pwsh harness/loop.ps1 TASK-02 -Model "<model>" -IterTimeoutSec 1200
+#   pwsh harness/loop.ps1 TASK-03 -Force
+# Обычно — через тонкий лаунчер harness/start.ps1 <TASK-ID> (или эквивалентную команду вашего CLI).
 
 param(
   [Parameter(Position = 0)] [string]$Task = "",
@@ -35,11 +35,13 @@ param(
   [int]$NetStallRetryMax = 8,       # макс. подряд retry одной итерации из-за обрывов сети (защита от флаппинга)
   [switch]$AutoAdvance,
   [switch]$NoAutoRollback,          # M-09 E: отключить авто-откат регрессий tsc (default on)
-  [switch]$Force
+  [switch]$Force,
+  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = "Continue"
-$root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+$root = Get-BcfProjectRoot -Explicit $ProjectRoot
 Set-Location $root
 
 # --- Harness config (config/harness.json) — единственный источник специфики проекта. ---
@@ -89,7 +91,7 @@ try {
 
 # W3: подключаем event-bus.
 . (Join-Path $PSScriptRoot 'lib\event-bus.ps1')
-Initialize-EventBus -RalphRoot $PSScriptRoot
+Initialize-EventBus -RalphRoot (Get-BcfStateDir $root)
 
 # Рендер JSON-событий бэкенд-агента → live в loop-окно (адаптер бэкенда, default opencode).
 . (Join-Path $PSScriptRoot 'lib\adapters\oc-render.ps1')
@@ -128,13 +130,14 @@ $script:itersWithoutPass = 0
 # копит >N файлов за >M итераций без PASS → фокус расплывается, ни один аспект не закрывается.
 # Форсим Phase-0 reset (single-aspect subtask) ОДИН раз, рано — не дожидаясь severity-hard-cap.
 $sprawlForced    = $false
-$SprawlFileLimit = 40   # >40 файлов в HEAD-диффе (без loop/)
+$SprawlFileLimit = 40   # >40 файлов в HEAD-диффе (без .bcf/)
 $SprawlIterLimit = 5    # и >5 итераций без PASS
 
-$promptFile = Join-Path $root "loop\PROMPT.md"
-$stateFile  = Join-Path $root "loop\STATE.md"
-$logFile    = Join-Path $root "loop\loop.log"
-$stopFile   = Join-Path $root "loop\STOP"
+$promptFile = Join-Path $root ".bcf\PROMPT.md"
+if (-not (Test-Path $promptFile)) { $promptFile = Join-Path $PSScriptRoot "PROMPT.md" }
+$stateFile  = Join-Path $root ".bcf\STATE.md"
+$logFile    = Join-Path $root ".bcf\loop.log"
+$stopFile   = Join-Path $root ".bcf\STOP"
 $focusFile  = Join-Path $root "tasks\CURRENT-FOCUS.md"
 
 function Log($msg) {
@@ -164,7 +167,7 @@ function Verdict-Pass($t) {
   return [bool](Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
 }
 
-# Отпечаток рабочего дерева БЕЗ loop/ (раннер сам пишет в loop/ — это не «прогресс»).
+# Отпечаток рабочего дерева БЕЗ .bcf/ (раннер сам пишет в .bcf/ — это не «прогресс»).
 function Get-TreeHash {
   $d  = (git diff HEAD -- ':!loop' 2>$null | Out-String)
   $d += (git status --porcelain -- ':!loop' 2>$null | Out-String)
@@ -174,12 +177,12 @@ function Get-TreeHash {
 }
 
 # M-16 (2026-05-31): СТАБИЛЬНАЯ сигнатура набора падающих тестов из вывода verify.
-# Берём id'шники упавших спеков (path.spec.ts:LINE:COL) из loop/.verify/<task>-*.out.txt —
+# Берём id'шники упавших спеков (path.spec.ts:LINE:COL) из .bcf/verify/<task>-*.out.txt —
 # они не зависят от тайминга/формулировок (в отличие от bp-строки, по которой loop-detection
 # слеп: причины «плавают», а набор тестов тот же). Пусто = не смогли извлечь / нет падений.
 function Get-FailingTestSignature {
   param([string]$Repo, [string]$Task)
-  $verifyDir = Join-Path $Repo 'loop\.verify'
+  $verifyDir = Join-Path $Repo '.bcf\verify'
   if (-not (Test-Path $verifyDir)) { return '' }
   $ids = New-Object System.Collections.Generic.HashSet[string]
   Get-ChildItem $verifyDir -Filter "$Task-*.out.txt" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -195,14 +198,14 @@ function Get-FailingTestSignature {
   return (($ids | Sort-Object) -join '|')
 }
 
-# M-15 (2026-06-05): ДЕТЕРМИНИРОВАННЫЙ дайджест провалов из loop/.verify/<task>-*.out.txt.
+# M-15 (2026-06-05): ДЕТЕРМИНИРОВАННЫЙ дайджест провалов из .bcf/verify/<task>-*.out.txt.
 # Зачем: раньше в backpressure уходил только вердикт LLM-судьи (который галлюцинирует ИЛИ не
 # может прочитать файл вывода — кейс TASK-16: судья выдал «найди файл» вместо «удали кнопку»).
 # Точный машинный вывод гейта (rendered vs expected, Expected/Received, unknown=[...]) —
 # авторитетнее судьи. Прокидываем его агенту напрямую, чтобы петля чинила ФАКТ, а не туман.
 function Get-DeterministicFailureDigest {
   param([string]$Repo, [string]$Task, [int]$MaxLines = 40, [int]$PerFile = 12)
-  $verifyDir = Join-Path $Repo 'loop\.verify'
+  $verifyDir = Join-Path $Repo '.bcf\verify'
   if (-not (Test-Path $verifyDir)) { return '' }
   # Сигнальные строки: заголовки упавших спеков, assert-диффы, контракт-диагностика навигации.
   $signal = '(^\s*(?:x|✘|\d+\))\s)|(\bError:)|(\bExpected:)|(\bReceived:)|(rendered nav)|(^\s*expected:)|(\bunknown\b)|(НЕИЗВЕСТНЫЕ)|(разошлась)|(\.spec\.ts:\d+:\d+)|(\bfailed\b)'
@@ -308,22 +311,22 @@ function Notify-Stop($kind, $title, $detail) {
   # AutoAdvance (overnight run-all): per-task попапы/REVIEW подавляем — оркестратор run-all.ps1
   # сводит ОДИН итоговый отчёт в конце. Иначе за ночь — шторм окон Windows.
   if ($AutoAdvance) { Log "[auto-advance] стоп текущей задачи ($title) — оркестратор перейдёт к следующей."; return }
-  $rf = Join-Path $root "loop\REVIEW.md"
+  $rf = Join-Path $root ".bcf\REVIEW.md"
   $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
   Set-Content -Path $rf -Encoding UTF8 -Value (
     "# Ralph loop остановлен — нужно твоё внимание`n`n" +
     "**Когда:** $ts`n**Причина:** $title`n`n$detail`n`n" +
     "## Что дальше`n" +
-    "- Открой loop/loop.log, loop/state/STATE.json и (legacy) loop/STATE.md.`n" +
-    "- inspect событий: pwsh loop/inspect.ps1 --task <TASK-NN> --last 20`n" +
-    "- Если verdict PASS — посмотри tasks/.verdicts/, сделай ревью, затем loop/start.ps1 для следующей задачи.`n" +
-    "- Если застряло — разберись с причиной, поправь, перезапусти loop/start.ps1.")
+    "- Открой .bcf/loop.log, .bcf/state/STATE.json и (legacy) .bcf/STATE.md.`n" +
+    "- inspect событий: pwsh harness/inspect.ps1 --task <TASK-NN> --last 20`n" +
+    "- Если verdict PASS — посмотри tasks/.verdicts/, сделай ревью, затем harness/start.ps1 для следующей задачи.`n" +
+    "- Если застряло — разберись с причиной, поправь, перезапусти harness/start.ps1.")
   try { [console]::beep(880, 250); Start-Sleep -Milliseconds 120; [console]::beep(660, 300) } catch { }
   try {
     Add-Type -AssemblyName System.Windows.Forms
     $icon = if ($kind -eq 'ok') { 'Information' } else { 'Warning' }
     [System.Windows.Forms.MessageBox]::Show(
-      "$detail`n`nПодробности — loop/REVIEW.md, loop/loop.log, loop/state/STATE.json",
+      "$detail`n`nПодробности — .bcf/REVIEW.md, .bcf/loop.log, .bcf/state/STATE.json",
       "Ralph loop: $title", 'OK', $icon) | Out-Null
   } catch { }
 }
@@ -432,15 +435,15 @@ try {
 # WIP-снапшот: durable, gc-safe снимок working-tree в конце итерации. НЕ двигает
 # HEAD и НЕ трогает `git diff HEAD` — cumulative task-diff (на нём висят evidence,
 # idempotency-fingerprint, triggers) остаётся прежним. Снимок пишется в ref
-# (refs/loop/wip/<task> + per-iter history), поэтому git gc его не соберёт, и
-# любую итерацию можно восстановить: `git checkout refs/loop/wip-history/<task>/iterN -- .`.
+# (refs/bcf/wip/<task> + per-iter history), поэтому git gc его не соберёт, и
+# любую итерацию можно восстановить: `git checkout refs/bcf/wip-history/<task>/iterN -- .`.
 # Решает проблему: прогресс жил только в uncommitted working-tree (хрупко, дни работы).
 function Save-WipSnapshot {
   param([string]$Repo, [string]$TaskId, [int]$Iteration)
   $snap = (& git -C $Repo stash create 2>$null | Out-String).Trim()
   if (-not $snap) { return $null }   # дерево чистое → снимать нечего
-  & git -C $Repo update-ref "refs/loop/wip/$TaskId" $snap 2>$null
-  & git -C $Repo update-ref "refs/loop/wip-history/$TaskId/iter$Iteration" $snap 2>$null
+  & git -C $Repo update-ref "refs/bcf/wip/$TaskId" $snap 2>$null
+  & git -C $Repo update-ref "refs/bcf/wip-history/$TaskId/iter$Iteration" $snap 2>$null
   return $snap
 }
 
@@ -476,7 +479,7 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
 
   if (Verdict-Pass $focus) {
     Log "[$focus] verdict: PASS. Bounded-режим: СТОП на ревью оператора."
-    Log "Проверь tasks/.verdicts/$focus.md, затем запусти loop/start.ps1 для следующей задачи."
+    Log "Проверь tasks/.verdicts/$focus.md, затем запусти harness/start.ps1 для следующей задачи."
     Append-Event -EventType 'task-closed' -TaskId $focus -Phase 'loop' -Iteration $i `
       -Payload @{ verdict = 'PASS'; pre_iter_check = $true }
     Notify-Stop 'ok' "$focus готова к ревью" "Задача $focus прошла судью (verdict: PASS). Цикл остановлен — нужно твоё ревью."
@@ -507,7 +510,7 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
     # даже если итерация длинная. Не пишем, если свалились в fallback HEAD.
     $headNow = (& git rev-parse HEAD 2>$null | Out-String).Trim()
     if ($preIterTreeRef -and $preIterTreeRef -ne $headNow) {
-      & git update-ref "refs/loop/pre-iter/$focus" $preIterTreeRef 2>$null
+      & git update-ref "refs/bcf/pre-iter/$focus" $preIterTreeRef 2>$null
     }
   }
 
@@ -610,8 +613,8 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
   $runCmd      = "& $resolvedAgentCmd `$p"
   $utf8Prefix  = "[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;`$OutputEncoding=[Text.Encoding]::UTF8;"
   $inner       = "$utf8Prefix `$p = Get-Content -Raw -LiteralPath '$promptFile'; $runCmd"
-  $ocOutFile   = Join-Path $root "loop\.iter-$i.out.jsonl"
-  $ocErrFile   = Join-Path $root "loop\.iter-$i.err.log"
+  $ocOutFile   = Join-Path $root ".bcf\iter-$i.out.jsonl"
+  $ocErrFile   = Join-Path $root ".bcf\iter-$i.err.log"
   Remove-Item $ocOutFile, $ocErrFile -ErrorAction SilentlyContinue
   # Префлайт связи: не запускаем opencode в мёртвую сеть — иначе SSE-стрим модели
   # сразу зависнет и сгорит в watchdog. Если интернета нет — ждём его здесь.
@@ -906,7 +909,7 @@ $culprit
   # не запускаем верификацию на заведомо плохом коде. Сначала агент чинит tsc/lint/done-gate,
   # потом — friction-trigger и verify. Раньше: human-callout прилетал на broken-syntax
   # коммит (TASK-03 iter=2), а judge крутился на dirty-bp коде (TASK-03 iter=1).
-  $verifyMarker = Join-Path $root "loop\VERIFY-REQUEST"
+  $verifyMarker = Join-Path $root ".bcf\VERIFY-REQUEST"
   if ($bp.Count -gt 0) {
     if (Test-Path $verifyMarker) {
       Remove-Item $verifyMarker -Force -ErrorAction SilentlyContinue
@@ -925,7 +928,7 @@ $culprit
     $trigOut = & pwsh @trigArgs 2>&1 | Out-String
     $trigExit = $LASTEXITCODE
     if ($trigExit -eq 2) {
-      Log "FRICTION-TRIGGER — Ralph пауза. См. loop/human-callout.md."
+      Log "FRICTION-TRIGGER — Ralph пауза. См. .bcf/human-callout.md."
       Set-Content $stateFile ("# Ralph STATE`n`n## Итерация $i — HUMAN CALLOUT`n`n" + $trigOut) -Encoding UTF8
       Notify-Stop 'warn' "$focus требует human-callout" "Изменения затронули критичные пути (migrations/auth/deps/configs). Ralph остановлен — нужно твоё ревью."
       break
@@ -934,7 +937,7 @@ $culprit
     }
   }
 
-  # 2.5. Фазы C-E — агент попросил верификацию (маркер loop/VERIFY-REQUEST).
+  # 2.5. Фазы C-E — агент попросил верификацию (маркер .bcf/VERIFY-REQUEST).
   if (Test-Path $verifyMarker) {
     # M-13/F (2026-05-27) idempotency-гейт: если diff vs HEAD не изменился с прошлой
     # !PASS-верификации — переиспользуем прошлый вердикт, не сжигаем 20 минут на
@@ -956,7 +959,7 @@ $culprit
       $pTxt = Get-Content -Raw -LiteralPath $vfPath
       $pV = ''
       if ($pTxt -match '(?m)^verdict:\s*(\S+)') { $pV = $Matches[1] }
-      $jOutP = Join-Path $root "loop\.verify\$focus-$($JudgeName).out.txt"
+      $jOutP = Join-Path $root ".bcf\verify\$focus-$($JudgeName).out.txt"
       if (Test-Path $jOutP) {
         $jtP = Get-Content -Raw -LiteralPath $jOutP
         $jmP = [regex]::Match($jtP, '(?s)\{(?:[^{}]|\{[^{}]*\})*"verdict"\s*:\s*"[^"]+"(?:[^{}]|\{[^{}]*\})*\}')
@@ -1128,7 +1131,7 @@ $culprit
       }
       # M-13/I (2026-05-27): fallback tester-scope-map (auto-detect из diff) — для задач без ## 3.1. Scope.
       elseif (-not $taskScope -and $prodChanges.Count -gt 0 -and ($markerText -notmatch '(?m)^\s*#\s*all-testers\b')) {
-        $tMapFile = Join-Path $root 'loop\tester-scope-map.json'
+        $tMapFile = Join-Path $root 'config\tester-scope-map.json'
         if (Test-Path $tMapFile) {
           try {
             $tMap = Get-Content -Raw -LiteralPath $tMapFile | ConvertFrom-Json
@@ -1185,7 +1188,7 @@ $culprit
       $prevTxt = Get-Content -Raw -LiteralPath $vfPath
       if ($prevTxt -match '(?m)^diff_fingerprint:\s*(\S+)') { $prevFp = $Matches[1] }
       # Авторитетный verdict — inner judge JSON.
-      $jOut = Join-Path $root "loop\.verify\$focus-$($JudgeName).out.txt"
+      $jOut = Join-Path $root ".bcf\verify\$focus-$($JudgeName).out.txt"
       if (Test-Path $jOut) {
         $jt = Get-Content -Raw -LiteralPath $jOut
         # Robust-экстракция (Extract-JudgeJson из m13-bridge.ps1) — старый
@@ -1206,7 +1209,7 @@ $culprit
       }
     }
     if (-not $skipVerify) {
-    Log "Маркер VERIFY-REQUEST — запуск Фаз C-E: loop/verify.ps1 $focus"
+    Log "Маркер VERIFY-REQUEST — запуск Фаз C-E: harness/verify.ps1 $focus"
     Append-Event -EventType 'verify-requested' -TaskId $focus -Phase 'C-E' -Iteration $i `
       -Payload @{ marker_content = ((Get-Content $verifyMarker -Raw) -join "`n") }
     $verifyPs1 = Join-Path $PSScriptRoot "verify.ps1"
@@ -1232,9 +1235,9 @@ $culprit
       $vv = 'UNKNOWN'
       $rem = ''
       $innerJson = $null
-      # Inner JSON судьи живёт в loop/.verify/<TASK>-$($JudgeName).out.txt — это
+      # Inner JSON судьи живёт в .bcf/verify/<TASK>-$($JudgeName).out.txt — это
       # авторитетный источник. Outer YAML wrapper в verdict.md часто рассинхронизирован.
-      $judgeOut = Join-Path $root "loop\.verify\$focus-$($JudgeName).out.txt"
+      $judgeOut = Join-Path $root ".bcf\verify\$focus-$($JudgeName).out.txt"
       $candidateText = if (Test-Path $judgeOut) { Get-Content -Raw -LiteralPath $judgeOut } else { $vtxt }
       # Берём САМЫЙ ШИРОКИЙ JSON-блок (greedy), который содержит "verdict" — это будет
       # внешний JSON-объект ответа судьи, а не вложенный assertion.
@@ -1264,7 +1267,7 @@ $culprit
         $src = if ($innerJson) { ' (inner judge JSON)' } else { ' (outer YAML fallback)' }
         $bp += "ВЕРДИКТ СУДЬИ: $vv$src (Фазы C-E, tasks/.verdicts/$focus.md).`n" +
                "Задача НЕ закрыта. Исправь код по списку ремедиации, затем снова создай`n" +
-               "файл loop/VERIFY-REQUEST для повторной верификации:`n$rem"
+               "файл .bcf/VERIFY-REQUEST для повторной верификации:`n$rem"
         # M-15: точный машинный вывод детерминированных гейтов — авторитетнее судьи.
         # Если судья промахнулся/не прочитал файл, агент всё равно увидит ФАКТ провала.
         $detDigest = Get-DeterministicFailureDigest -Repo $root -Task $focus
@@ -1300,7 +1303,7 @@ $culprit
       # Не зависит от вердикта — даже PASS-итерации полезно ретроспектировать
       # (что сработало). Failure режим: тихий no-op, не блокируем loop.
       try {
-        $judgeOutPath = Join-Path $root "loop\.verify\$focus-$($JudgeName).out.txt"
+        $judgeOutPath = Join-Path $root ".bcf\verify\$focus-$($JudgeName).out.txt"
         Run-Retrospector -TaskId $focus -Iteration $i `
           -IterOutJsonl $ocOutFile -VerdictFile $vf -JudgeOutFile $judgeOutPath | Out-Null
       } catch { Log "M-13 retrospector failed (non-fatal): $($_.Exception.Message)" }
@@ -1323,7 +1326,7 @@ $culprit
 
       # M-13/Phase1: supervisor — собирает findings → bug-ledger.
       try {
-        $judgeOutPath = Join-Path $root "loop\.verify\$focus-$($JudgeName).out.txt"
+        $judgeOutPath = Join-Path $root ".bcf\verify\$focus-$($JudgeName).out.txt"
         $curFp = (& git -C $root diff HEAD 2>$null | git -C $root hash-object --stdin 2>$null | Out-String).Trim()
         $diffFilesArr = @()
         if ($preIterTreeRef) {
@@ -1340,7 +1343,7 @@ $culprit
         }
       } catch { Log "bug-supervisor failed (non-fatal): $($_.Exception.Message)" }
     } else {
-      $bp += "verify.ps1 не создал tasks/.verdicts/$focus.md — верификация не дала вердикта. Проверь loop/loop.log."
+      $bp += "verify.ps1 не создал tasks/.verdicts/$focus.md — верификация не дала вердикта. Проверь .bcf/loop.log."
       Append-Event -EventType 'verify-no-verdict' -TaskId $focus -Phase 'C-E' -Iteration $i
     }
   }
@@ -1412,13 +1415,13 @@ $culprit
   # в зачёт no-progress и говорим прямо: «либо правь, либо проси verify, либо завершай».
   if ($curHash -eq $lastHash -and $bp.Count -eq 0 -and -not (Test-Path $verifyMarker)) {
     $bp += @"
-ПУСТАЯ ИТЕРАЦИЯ: ты не правил код И не создал loop/VERIFY-REQUEST.
+ПУСТАЯ ИТЕРАЦИЯ: ты не правил код И не создал .bcf/VERIFY-REQUEST.
 Раннер не знает что ты сделал. Возможные причины и действия:
-1. «Всё уже сделано» → создай loop/VERIFY-REQUEST для подтверждения PASS.
+1. «Всё уже сделано» → создай .bcf/VERIFY-REQUEST для подтверждения PASS.
 2. «Я только изучал» → следующая итерация должна делать meaningful edit
    (правь файлы из task DoD §3) или создавать subtask.
 3. «Я застрял на инфра-проблеме» (стейл-вердикт про <model>_API_KEY и т.п.) →
-   перепиши loop/VERIFY-REQUEST с пометкой `# stale-verdict-ignored` чтобы
+   перепиши .bcf/VERIFY-REQUEST с пометкой `# stale-verdict-ignored` чтобы
    harness выкинул старый verdict и прогнал свежий.
 Подряд 3 таких итерации → раннер остановит цикл (no-progress).
 "@
@@ -1430,7 +1433,7 @@ $culprit
       # M-15 (2026-05-30): в unattended (run-all) режиме НЕ бросаем задачу на no-progress —
       # человека рядом нет, а в бюджете ещё итерации (стопы рано: 6-13/40). Эскалируем ОДИН раз:
       # отдаём агенту КОНКРЕТИКУ (remediation последнего вердикта; open-bugs уже в STATE) и жёстко
-      # направляем на продуктовый код (loop/-правки не считаются прогрессом → агент крутил STATE.md).
+      # направляем на продуктовый код (.bcf/-правки не считаются прогрессом → агент крутил STATE.md).
       # Повторный no-progress после эскалации → честный стоп ниже. Потолок $MaxIterations + loop-detection
       # (3× одна ошибка) остаются — burst ограничен.
       $noProgressEscalated = $true
@@ -1448,17 +1451,17 @@ $culprit
 ## Итерация $i — ТЫ ЗАСТРЯЛ, НО ЗАДАЧА НЕ ЗАКРЫТА
 
 $NoProgressLimit итерации подряд БЕЗ изменений продуктового кода (src/, electron/, backend/).
-Правки в loop/ (STATE.md, human-callout.md и пр.) НЕ считаются прогрессом — раннер их игнорирует.
+Правки в .bcf/ (STATE.md, human-callout.md и пр.) НЕ считаются прогрессом — раннер их игнорирует.
 
 У тебя ещё $remaining итераций. НЕ останавливайся. Сделай СЛЕДУЮЩЕЕ:
 1. Возьми КОНКРЕТНУЮ упавшую проверку из remediation последнего вердикта (ниже) и почини её
    минимальным точечным изменением ПРОДУКТОВОГО файла из DoD §3.
 2. Если правка ломала tsc и откатывалась — НЕ повторяй её; воспроизведи минимально, потом фикс.
-3. Если уверен, что всё сделано — создай loop/VERIFY-REQUEST (а не правь STATE.md).
-4. ЗАПРЕЩЕНО: редактировать только loop/-файлы, «думать» без edit, повторять откатанную правку.
+3. Если уверен, что всё сделано — создай .bcf/VERIFY-REQUEST (а не правь STATE.md).
+4. ЗАПРЕЩЕНО: редактировать только .bcf/-файлы, «думать» без edit, повторять откатанную правку.
 
 ### Remediation последнего вердикта (чини ИМЕННО ЭТО):
-$(if ($remBlock) { $remBlock } else { '(вердикта ещё нет — сделай meaningful edit продуктового файла из DoD §3 и создай loop/VERIFY-REQUEST)' })
+$(if ($remBlock) { $remBlock } else { '(вердикта ещё нет — сделай meaningful edit продуктового файла из DoD §3 и создай .bcf/VERIFY-REQUEST)' })
 
 ### Открытые баги — блок <open-bugs> выше (priority 1 первым).
 "@
@@ -1497,7 +1500,7 @@ $(if ($remBlock) { $remBlock } else { '(вердикта ещё нет — сд�
   try {
     $wip = Save-WipSnapshot -Repo $root -TaskId $focus -Iteration $i
     if ($wip) {
-      Log "WIP-снапшот: refs/loop/wip/$focus → $($wip.Substring(0,8)) (gc-safe; откат: git checkout refs/loop/wip-history/$focus/iter$i -- .)"
+      Log "WIP-снапшот: refs/bcf/wip/$focus → $($wip.Substring(0,8)) (gc-safe; откат: git checkout refs/bcf/wip-history/$focus/iter$i -- .)"
       Append-Event -EventType 'wip-snapshot' -TaskId $focus -Phase 'loop' -Iteration $i -Payload @{ sha = $wip }
     }
   } catch { Log "WIP-снапшот не сохранён (non-fatal): $($_.Exception.Message)" }

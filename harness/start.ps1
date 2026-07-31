@@ -1,16 +1,18 @@
-# loop/start.ps1 — thin launcher: spawns loop.ps1 in the background for one task.
+# harness/start.ps1 — thin launcher: spawns loop.ps1 in the background for one task.
 # Usage:
-#   pwsh loop/start.ps1 <TASK>     # run a single task
-#   pwsh loop/start.ps1            # no arg → overnight run-all (all tasks in order)
+#   pwsh harness/start.ps1 <TASK>     # run a single task
+#   pwsh harness/start.ps1            # no arg → overnight run-all (all tasks in order)
 
 param(
   [Parameter(Position = 0)] [string]$Task = "",
   [string]$Model = "",                    # empty → resolved from config/harness.json (models.code)
-  [switch]$NoAutoRollback                  # disable auto-rollback of tsc regressions (default on)
+  [switch]$NoAutoRollback                  # disable auto-rollback of tsc regressions (default on),
+  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = "Stop"
-$root    = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+$root = Get-BcfProjectRoot -Explicit $ProjectRoot
 $loopPs1 = Join-Path $PSScriptRoot "loop.ps1"
 
 # Console in UTF-8 — otherwise the launch message renders as mojibake when the
@@ -44,7 +46,7 @@ $running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -and $_.CommandLine -match '(loop|run-all)\.ps1' -and $_.CommandLine -notmatch 'Win32_Process' })
 if ($running.Count -gt 0) {
   Write-Host "Loop already running (PID $($running.ProcessId -join ', '))."
-  Write-Host "Stop it (create the file loop/STOP) before starting a new run."
+  Write-Host "Stop it (create the file .bcf/STOP) before starting a new run."
   exit 1
 }
 
@@ -55,8 +57,8 @@ if ($runAll) {
   if ($NoAutoRollback) { $raArgs += '-NoAutoRollback' }
   Start-Process -FilePath 'pwsh' -ArgumentList $raArgs -WorkingDirectory $root -WindowStyle Minimized
   Write-Host "Overnight run-all started: will run every task in order (model $modelLabel)."
-  Write-Host "Progress — loop/loop.log. When the whole queue finishes — one window + loop/REVIEW.md (summary)."
-  Write-Host "Stop early — create the file loop/STOP."
+  Write-Host "Progress — .bcf/loop.log. When the whole queue finishes — one window + .bcf/REVIEW.md (summary)."
+  Write-Host "Stop early — create the file .bcf/STOP."
   exit 0
 }
 
@@ -75,4 +77,4 @@ Start-Process -FilePath 'pwsh' `
 
 $rollbackNote = if ($NoAutoRollback) { ', auto-rollback OFF' } else { '' }
 Write-Host "Loop started for $Task (model $modelLabel$rollbackNote)."
-Write-Host "Progress — loop/loop.log. On stop a window pops up + loop/REVIEW.md."
+Write-Host "Progress — .bcf/loop.log. On stop a window pops up + .bcf/REVIEW.md."

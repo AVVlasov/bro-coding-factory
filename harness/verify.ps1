@@ -1,5 +1,5 @@
-# loop/verify.ps1 — Фазы C–E для одной TASK-задачи. План верификации задаёт АГЕНТ
-# (в маркере loop/VERIFY-REQUEST), обвязка его исполняет.
+# harness/verify.ps1 — Фазы C–E для одной TASK-задачи. План верификации задаёт АГЕНТ
+# (в маркере .bcf/VERIFY-REQUEST), обвязка его исполняет.
 #
 # Каждый LLM-шаг — ОТДЕЛЬНЫЙ прогон со СВЕЖИМ контекстом; судья не видел ход реализации.
 #   - тестеры (Фаза C)        — <model> (выровнены с код-агентом, 2026-06-05);
@@ -13,7 +13,7 @@
 # Ключ и хост бэкенда — из окружения (.env: BCF_API_KEY / BCF_API_HOST); в коде их нет.
 # Результат — tasks/.verdicts/<TASK>.md.  exit 0 = verdict PASS, иначе exit 1.
 #
-# Маркер loop/VERIFY-REQUEST (пишет агент), формат:
+# Маркер .bcf/VERIFY-REQUEST (пишет агент), формат:
 #   task: TASK-NN
 #   testers: architecture api
 #   checks: npm run test:electron:smoke
@@ -21,9 +21,9 @@
 # Полей может не быть — тогда дефолты (architecture + api по слоям, без checks, visual:no).
 #
 # Запуск:
-#   pwsh loop/verify.ps1 TASK-01
-#   pwsh loop/verify.ps1 TASK-01 -DryRun                       # обвязка без вызовов LLM
-#   pwsh loop/verify.ps1 TASK-01 -JudgeModel claude-opus-4-7   # сильнее судья
+#   pwsh harness/verify.ps1 TASK-01
+#   pwsh harness/verify.ps1 TASK-01 -DryRun                       # обвязка без вызовов LLM
+#   pwsh harness/verify.ps1 TASK-01 -JudgeModel claude-opus-4-7   # сильнее судья
 
 param(
   [Parameter(Position = 0)] [string]$Task = "",
@@ -40,11 +40,13 @@ param(
   #      (incident 2026-05-26 11:45 — vision-suite сидел 19 мин после "Run → FAIL").
   # 600s (10 мин) — щедро для самого долгого fetch/thinking; короче — режет легитимно.
   [int]$SilentTimeoutSec = 600,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = "Continue"
-$root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+$root = Get-BcfProjectRoot -Explicit $ProjectRoot
 Set-Location $root
 
 # --- Harness config (config/harness.json + config/agents.json) — источник специфики. ---
@@ -79,7 +81,7 @@ try {
 
 # W3: подключаем event-bus.
 . (Join-Path $PSScriptRoot 'lib\event-bus.ps1')
-Initialize-EventBus -RalphRoot $PSScriptRoot
+Initialize-EventBus -RalphRoot (Get-BcfStateDir $root)
 
 # W2: подключаем evidence collector.
 . (Join-Path $PSScriptRoot 'lib\evidence.ps1')
@@ -99,9 +101,9 @@ Get-ChildItem env: | Where-Object { $_.Name -like 'OPENCODE_*' } | ForEach-Objec
 
 $agentsDir  = Join-Path $root "agents"
 $verdictDir = Join-Path $root "tasks\.verdicts"
-$workDir    = Join-Path $root "loop\.verify"
-$logFile    = Join-Path $root "loop\loop.log"
-$planFile   = Join-Path $root "loop\VERIFY-REQUEST"
+$workDir    = Join-Path $root ".bcf\verify"
+$logFile    = Join-Path $root ".bcf\loop.log"
+$planFile   = Join-Path $root ".bcf\VERIFY-REQUEST"
 
 function Log($m) {
   $line = "[{0}] [verify] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $m
@@ -339,7 +341,7 @@ if (-not $DryRun) {
   # W5: claude CLI больше не требуется — судья тоже через opencode.
 }
 
-# --- План верификации: задаёт АГЕНТ в маркере loop/VERIFY-REQUEST ---
+# --- План верификации: задаёт АГЕНТ в маркере .bcf/VERIFY-REQUEST ---
 $planTesters = @()
 $planChecks  = @()
 $planVisual  = $false
@@ -362,7 +364,7 @@ if (Test-Path $planFile) {
   $planVisionThemes = @($planVisionThemes | Select-Object -Unique)
 }
 else {
-  Log "ПРЕДУПРЕЖДЕНИЕ: маркер loop/VERIFY-REQUEST не найден — план по умолчанию."
+  Log "ПРЕДУПРЕЖДЕНИЕ: маркер .bcf/VERIFY-REQUEST не найден — план по умолчанию."
 }
 
 # M-09 (2026-05-25): агент может явно объявить «прошлый verdict с устаревшей
@@ -599,7 +601,7 @@ function Invoke-Shell($command, $label) {
 }
 
 # M-15 (2026-06-05): компактный хвост РЕАЛЬНОГО провала детерминированного гейта для ИНЛАЙНА
-# в промпт судьи. Раньше судья получал лишь ссылку «Вывод — loop/.verify/...» и пытался
+# в промпт судьи. Раньше судья получал лишь ссылку «Вывод — .bcf/verify/...» и пытался
 # прочитать файл сам → glob/cwd промахивался → «file not found» → галлюцинация BLOCKED
 # (кейс TASK-16: судья не увидел rendered-nav diff и выдал «найди файл» вместо «удали кнопку»).
 # Сигнальные строки: упавшие спеки, Expected/Received, rendered nav, unknown=[...].
@@ -696,13 +698,14 @@ $diffFull
   }
 }
 
-# --- ОБЯЗАТЕЛЬНЫЕ checks из loop/required-checks.json (авторитет вердикта, ВНЕ агента) ---
+# --- ОБЯЗАТЕЛЬНЫЕ checks из config/checks.json (авторитет вердикта, ВНЕ агента) ---
 # Дыра: checks в VERIFY-REQUEST пишет сам агент → может сузить проверку до tsc и получить
-# тривиальный PASS (инцидент TASK-06: vitest на гонку chatSend НЕ попал в план). Фикс
-# (решение 2026-05-30): обязательные проверки задаём МЫ в required-checks.json и
-# объединяем с планом — агент не может их убрать.
+# тривиальный PASS (инцидент: тест на гонку в отправке сообщения НЕ попал в план). Фикс
+# (решение 2026-05-30): обязательные проверки задаём МЫ в config/checks.json проекта и
+# объединяем с планом — агент не может их убрать. Файл лежит в проекте, а не в движке:
+# «что доказывает закрытую задачу» — свойство продукта, а не харнесса.
 try {
-  $rcFile = Join-Path $PSScriptRoot 'required-checks.json'
+  $rcFile = Join-Path $root 'config\checks.json'
   if (Test-Path $rcFile) {
     $rc = Get-Content -Raw -LiteralPath $rcFile | ConvertFrom-Json
     $required = @()
@@ -711,9 +714,9 @@ try {
     foreach ($rcmd in $required) {
       if ($rcmd -and ($planChecks -notcontains $rcmd)) { $planChecks += $rcmd }
     }
-    if ($required.Count) { Log "Required-checks ($Task): + $($required.Count) обязательных проверок из required-checks.json (агент не может убрать)." }
+    if ($required.Count) { Log "Required-checks ($Task): + $($required.Count) обязательных проверок из config/checks.json (агент не может убрать)." }
   }
-} catch { Log "ПРЕДУПРЕЖДЕНИЕ: required-checks.json не разобран ($($_.Exception.Message))." }
+} catch { Log "ПРЕДУПРЕЖДЕНИЕ: config/checks.json не разобран ($($_.Exception.Message))." }
 
 # --- Детерминированные checks (план агента ∪ обязательные) ---
 $checkReports = [ordered]@{}
@@ -839,7 +842,7 @@ if ($planVisual -or $hasLayoutSpec) {
       $verdictWord = if ($visualFailed) { 'FAIL' } else { 'PASS' }
       $parts = @($pageReport, $layoutReport) | Where-Object { $_ }
       if ($missingHardFail) { $parts += "[HARD-FAIL] in-scope экран(ы) без контракт-спека: $($missingContracts -join ', ')" }
-      $visualReport = "Контракт-gate Фаза D (DOM/токены/layout your design reference) → $verdictWord. " + ($parts -join '; ') + ".`n(ФАКТ провала инлайнится выше — НЕ нужно читать файлы; полный вывод при желании: loop/.verify/$Task-vision-contract*.out.txt.)"
+      $visualReport = "Контракт-gate Фаза D (DOM/токены/layout your design reference) → $verdictWord. " + ($parts -join '; ') + ".`n(ФАКТ провала инлайнится выше — НЕ нужно читать файлы; полный вывод при желании: .bcf/verify/$Task-vision-contract*.out.txt.)"
       Log "Фаза D завершена → $verdictWord (page=$pageFailed, layout=$layoutFailed, shellInScope=$shellInScope, missing=$missingHardFail)"
     }
   }
@@ -882,7 +885,7 @@ else {
 # Тестеры outputят килобайты рассуждений; судье нужен только финальный вердикт-блок.
 # Стратегия: если есть явный маркер "### Verdict" / "## Tester verdict" — режем от него
 # до конца. Иначе — последние 80 строк (там обычно verdict-таблица).
-# Полный отчёт остаётся в loop/.verify/$Task-$tester.out.txt — судья читает Read'ом
+# Полный отчёт остаётся в .bcf/verify/$Task-$tester.out.txt — судья читает Read'ом
 # при сомнении.
 function Compress-TesterReport($text) {
   if ([string]::IsNullOrWhiteSpace($text)) { return $text }
@@ -892,14 +895,14 @@ function Compress-TesterReport($text) {
   }
   $lines = $text -split "`n"
   if ($lines.Count -le 80) { return $text }
-  return "...[начало отчёта обрезано — последние 80 строк; полный текст в loop/.verify/]`n" +
+  return "...[начало отчёта обрезано — последние 80 строк; полный текст в .bcf/verify/]`n" +
          (($lines | Select-Object -Last 80) -join "`n")
 }
 
 $reportsBlock = ""
 foreach ($k in $reports.Keys) {
   $compact = Compress-TesterReport $reports[$k]
-  $reportsBlock += "`n===== ОТЧЁТ ТЕСТЕРА: $k (см. loop/.verify/$Task-$k.out.txt — полный) =====`n" + $compact + "`n"
+  $reportsBlock += "`n===== ОТЧЁТ ТЕСТЕРА: $k (см. .bcf/verify/$Task-$k.out.txt — полный) =====`n" + $compact + "`n"
 }
 if (-not $reportsBlock) { $reportsBlock = "(тестеры не запускались)" }
 
@@ -922,7 +925,7 @@ cross-check-правила, антипаттерны) — в $JudgeAgentFile. Е
 в правиле — открой Read'ом этот файл.
 
 Вынеси вердикт по задаче $Task. Реализацию ты не видел — суди по DoD из task-файла, diff,
-отчётам тестеров (компактные хвосты — полные в loop/.verify/), checks и визуальной Фазы D.
+отчётам тестеров (компактные хвосты — полные в .bcf/verify/), checks и визуальной Фазы D.
 При сомнении в строке диффа / содержимом файла — ЧИТАЙ файл инструментом Read; не
 достраивай по памяти. Файл tasks/.verdicts/$Task.md пишет обвязка ПОСЛЕ тебя — его
 отсутствие сейчас не дефект.
@@ -1052,7 +1055,7 @@ if ($lintFailed) {
   else { $remediation = $lintRem + "`n" + $remediation }
 }
 if ($visualFailed) {
-  $visRem = "- VISUAL-CONTRACT-FAIL: контракт дизайна your design reference нарушен (детерминированные DOM/токен/layout-ассерты) — открой loop/.verify/$Task-vision-contract.out.txt, чини конкретные упавшие проверки ДО следующего VERIFY-REQUEST"
+  $visRem = "- VISUAL-CONTRACT-FAIL: контракт дизайна your design reference нарушен (детерминированные DOM/токен/layout-ассерты) — открой .bcf/verify/$Task-vision-contract.out.txt, чини конкретные упавшие проверки ДО следующего VERIFY-REQUEST"
   if ([string]::IsNullOrWhiteSpace($remediation)) { $remediation = $visRem }
   else { $remediation = $visRem + "`n" + $remediation }
 }
@@ -1063,7 +1066,7 @@ else {
   $remediationBlock = (($remediation -split "`r?`n") | ForEach-Object { '  ' + $_ }) -join "`n"
 }
 
-$testerLines = ($reports.Keys | ForEach-Object { "  ${_}: loop/.verify/$Task-$_.out.txt" }) -join "`n"
+$testerLines = ($reports.Keys | ForEach-Object { "  ${_}: .bcf/verify/$Task-$_.out.txt" }) -join "`n"
 if ([string]::IsNullOrWhiteSpace($testerLines)) { $testerLines = "  (тестеры не запускались)" }
 
 # W2: собираем machine-aggregated evidence (Tejas IBM — judge должен видеть tool-trace, не output).
@@ -1075,7 +1078,7 @@ $verdictBody = @"
 verdict: $verdict
 date: $today
 diff_fingerprint: $fp
-verified_by: loop/verify.ps1 — Фазы C-E (всё через opencode; кодинг/тестеры/судья — $Model, vision — $VisionModel, судья — $JudgeModel)
+verified_by: harness/verify.ps1 — Фазы C-E (всё через opencode; кодинг/тестеры/судья — $Model, vision — $VisionModel, судья — $JudgeModel)
 plan:
   testers: $($testers -join ', ')
   checks: $checksLine
@@ -1085,7 +1088,7 @@ $testerLines
 notes: |
   Вердикт ДЕТЕРМИНИРОВАННЫЙ: $verdict — функция гейтов (checks/lint/contract-gate).
   LLM-судья judge ($Model) — СОВЕЩАТЕЛЬНЫЙ (мнение: $judgeVerdict), на вердикт не влияет
-  (недетерминирован/галлюцинирует). Полный вывод судьи: loop/.verify/$Task-judge.out.txt
+  (недетерминирован/галлюцинирует). Полный вывод судьи: .bcf/verify/$Task-judge.out.txt
 remediation: |
 $remediationBlock
 

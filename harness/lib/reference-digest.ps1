@@ -3,7 +3,8 @@
 # и переиспользуется. Перегенерация — если эталон newer.
 
 # Repo root + digester invoker: env override, иначе repo-relative default.
-$script:RepoRoot = if ($env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
+. (Join-Path $PSScriptRoot 'bcf-context.ps1')
+$script:RepoRoot = Get-BcfProjectRoot
 $script:Digester = if ($env:BCF_INVOKE_REFERENCE_DIGESTER) { $env:BCF_INVOKE_REFERENCE_DIGESTER } else { Join-Path $script:RepoRoot 'agents/bin/invoke-reference-digester.ps1' }
 
 function Get-OrCreate-ReferenceDigest {

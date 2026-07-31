@@ -14,8 +14,8 @@
 #   2  — внутренняя ошибка (lint не запускается; не блокировать цикл)
 #
 # Использование (standalone, из корня репо):
-#   pwsh loop/lint-gate.ps1
-#   pwsh loop/lint-gate.ps1 -JsonOutput   # для парсинга
+#   pwsh harness/lint-gate.ps1
+#   pwsh harness/lint-gate.ps1 -JsonOutput   # для парсинга
 
 param(
     # Дефолт — текущая директория. Раннер (loop.ps1) всегда передаёт явно;
@@ -40,11 +40,11 @@ Assert-HarnessCaller -ScriptName 'lint-gate.ps1'
 $ProductPaths = @('src')
 $HooksCfg = $null
 try {
-    $hf = Join-Path $PSScriptRoot '..\config\harness.json'
+    $hf = Join-Path $Repo 'config\harness.json'
     if (Test-Path $hf) { $hc = Get-Content -Raw $hf | ConvertFrom-Json; if ($hc.productPaths) { $ProductPaths = @($hc.productPaths) } }
 } catch { }
 try {
-    $hcf = Join-Path $PSScriptRoot '..\hooks\hooks-config.json'
+    $hcf = Join-Path $Repo '.claude\hooks\hooks-config.json'
     if (Test-Path $hcf) { $HooksCfg = Get-Content -Raw $hcf | ConvertFrom-Json }
 } catch { }
 

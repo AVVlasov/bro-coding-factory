@@ -7,7 +7,8 @@
 #                     соответствующий bug через bug_tracker.py open.
 
 # Repo root + bug_tracker.py: env override, иначе repo-relative default.
-$script:RepoRoot   = if ($env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT } else { Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
+. (Join-Path $PSScriptRoot 'bcf-context.ps1')
+$script:RepoRoot   = Get-BcfProjectRoot
 $script:BugTracker = if ($env:BCF_BUG_TRACKER) { $env:BCF_BUG_TRACKER } else { Join-Path $script:RepoRoot 'memory/pgvector/bug_tracker.py' }
 
 function _Resolve-VisionDir {

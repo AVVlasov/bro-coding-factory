@@ -1,12 +1,12 @@
 # inspect.ps1 — CLI инспектор Ralph event-log'а.
 #
 # Использование:
-#   pwsh loop/inspect.ps1 --last 20
-#   pwsh loop/inspect.ps1 --task <TASK>
-#   pwsh loop/inspect.ps1 --task <TASK> --phase A
-#   pwsh loop/inspect.ps1 --replay                 # пересчитать STATE.json из events.jsonl
-#   pwsh loop/inspect.ps1 --stats                  # сводка по задачам
-#   pwsh loop/inspect.ps1 --export-csv events.csv  # экспорт в CSV
+#   pwsh harness/inspect.ps1 --last 20
+#   pwsh harness/inspect.ps1 --task <TASK>
+#   pwsh harness/inspect.ps1 --task <TASK> --phase A
+#   pwsh harness/inspect.ps1 --replay                 # пересчитать STATE.json из events.jsonl
+#   pwsh harness/inspect.ps1 --stats                  # сводка по задачам
+#   pwsh harness/inspect.ps1 --export-csv events.csv  # экспорт в CSV
 
 param(
     [int]    $Last       = 0,
@@ -16,11 +16,13 @@ param(
     [switch] $Replay,
     [switch] $Stats,
     [string] $ExportCsv  = '',
-    [string] $SinceTs    = ''
+    [string] $SinceTs    = '',
+  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+$root = Get-BcfProjectRoot -Explicit $ProjectRoot
 
 try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -32,11 +34,11 @@ try {
 # M-09 D: блокируем запуск из агентской сессии.
 . (Join-Path $PSScriptRoot 'lib\harness-guard.ps1')
 Assert-HarnessCaller -ScriptName 'inspect.ps1'
-Initialize-EventBus -RalphRoot $PSScriptRoot
+Initialize-EventBus -RalphRoot (Get-BcfStateDir $root)
 
 if ($Replay) {
     $state = Compute-State
-    Write-Host "[ok] STATE.json пересчитан из $($state.total_events) событий → loop/state/STATE.json"
+    Write-Host "[ok] STATE.json пересчитан из $($state.total_events) событий → .bcf/state/STATE.json"
     return
 }
 

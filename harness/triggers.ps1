@@ -15,7 +15,7 @@
 # Поведение:
 #   - запускается из loop.ps1 в backpressure section ПЕРЕД VERIFY-REQUEST;
 #   - проверяет git diff HEAD на матч с триггерами;
-#   - если совпадение — пишет loop/human-callout.md + emit event + exit 2.
+#   - если совпадение — пишет .bcf/human-callout.md + emit event + exit 2.
 #
 # Exit codes:
 #   0 — нет триггеров (loop продолжается)
@@ -23,8 +23,8 @@
 #   1 — внутренняя ошибка
 #
 # Использование (standalone):
-#   pwsh loop/triggers.ps1 -Repo <repo> -TaskId <TASK> -Iteration 5
-#   pwsh loop/triggers.ps1 -Repo <repo> -JsonOutput
+#   pwsh harness/triggers.ps1 -Repo <repo> -TaskId <TASK> -Iteration 5
+#   pwsh harness/triggers.ps1 -Repo <repo> -JsonOutput
 
 param(
     [Parameter(Mandatory)] [string] $Repo,
@@ -161,7 +161,7 @@ if ($hits.Count -gt 0) {
     # Уникализируем по file+pattern
     $hits = $hits | Group-Object { "$($_.file):$($_.pattern)" } | ForEach-Object { $_.Group[0] }
 
-    # 1) human-callout.md (живёт в каталоге харнеса loop/)
+    # 1) human-callout.md (живёт в каталоге харнеса .bcf/)
     $calloutFile = Join-Path $PSScriptRoot 'human-callout.md'
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $body = @()
@@ -185,8 +185,8 @@ if ($hits.Count -gt 0) {
     $body += ""
     $body += "1. Открой ``git diff HEAD -- <files>`` — проверь, что изменения умышленные."
     $body += "2. Если нужно: исправь / откати / закоммить вручную."
-    $body += "3. Удали ``loop/human-callout.md`` ИЛИ создай ``loop/STOP`` для полной остановки."
-    $body += "4. Запусти ``loop/start.ps1 <TASK>`` для продолжения."
+    $body += "3. Удали ``.bcf/human-callout.md`` ИЛИ создай ``.bcf/STOP`` для полной остановки."
+    $body += "4. Запусти ``harness/start.ps1 <TASK>`` для продолжения."
     Set-Content -LiteralPath $calloutFile -Value ($body -join "`n") -Encoding UTF8
 
     # 2) emit event (если разрешено)
@@ -194,12 +194,12 @@ if ($hits.Count -gt 0) {
         $eventBus = Join-Path $PSScriptRoot 'lib\event-bus.ps1'
         if (Test-Path $eventBus) {
             . $eventBus
-            Initialize-EventBus -RalphRoot $PSScriptRoot
+            Initialize-EventBus -RalphRoot (Get-BcfStateDir $root)
             Append-Event -EventType 'human-callout' -TaskId $TaskId -Phase 'loop' -Iteration $Iteration `
                 -Payload @{
                     trigger_count = $hits.Count
                     triggers      = @($hits | ForEach-Object { "$($_.severity):$($_.pattern):$($_.file)" })
-                    callout_file  = 'loop/human-callout.md'
+                    callout_file  = '.bcf/human-callout.md'
                 }
         }
     }
@@ -210,7 +210,7 @@ if ($hits.Count -gt 0) {
             passed        = $false
             hit_count     = $hits.Count
             hits          = $hits
-            callout_file  = 'loop/human-callout.md'
+            callout_file  = '.bcf/human-callout.md'
         }
         Write-Output ($result | ConvertTo-Json -Depth 6)
     } else {
@@ -219,7 +219,7 @@ if ($hits.Count -gt 0) {
             Write-Output "  [$($h.severity)] $($h.file) ← $($h.reason)"
         }
         Write-Output ""
-        Write-Output "Подробности: loop/human-callout.md"
+        Write-Output "Подробности: .bcf/human-callout.md"
     }
     exit 2
 } else {
