@@ -10,20 +10,41 @@ function Get-BcfGraphRoot {
     return (Join-Path $Project '.bcf\graph')
 }
 
+# Каталоги, где могут лежать журналы прогонов.
+#
+# Второй адрес — НАСЛЕДИЕ, и он здесь не из вежливости. Проекты, которые водили харнесс
+# до перехода на .bcf/, держат историю в loop/.graph/. Читать только новый адрес значит
+# на таком проекте сказать «прогонов ещё не было» при полусотне сохранённых журналов —
+# то есть соврать про историю ровно тем способом, против которого весь этот CLI и сделан.
+# Писать в наследие мы не будем никогда; читать — обязаны, пока история не перенесена.
+function Get-BcfGraphRoots {
+    param([Parameter(Mandatory)][string]$Project)
+    $out = @()
+    $cur = Join-Path $Project '.bcf\graph'
+    if (Test-Path $cur) { $out += [pscustomobject]@{ Path = $cur; Legacy = $false } }
+    $legacy = Join-Path $Project 'loop\.graph'
+    if (Test-Path $legacy) { $out += [pscustomobject]@{ Path = $legacy; Legacy = $true } }
+    return $out
+}
+
 function Get-BcfRuns {
     param([Parameter(Mandatory)][string]$Project, [int]$Limit = 0)
 
-    $root = Get-BcfGraphRoot -Project $Project
-    if (-not (Test-Path $root)) { return @() }
-
-    $runs = @()
-    foreach ($d in (Get-ChildItem $root -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
-        $j = Join-Path $d.FullName 'journal.jsonl'
-        if (-not (Test-Path $j)) { continue }
-        $runs += (Read-BcfRun -JournalPath $j -RunId $d.Name)
-        if ($Limit -and $runs.Count -ge $Limit) { break }
+    $all = @()
+    foreach ($src in (Get-BcfGraphRoots -Project $Project)) {
+        foreach ($d in (Get-ChildItem $src.Path -Directory -ErrorAction SilentlyContinue)) {
+            $j = Join-Path $d.FullName 'journal.jsonl'
+            if (-not (Test-Path $j)) { continue }
+            $run = Read-BcfRun -JournalPath $j -RunId $d.Name
+            $run | Add-Member -NotePropertyName 'Legacy' -NotePropertyValue $src.Legacy -Force
+            $all += $run
+        }
     }
-    return $runs
+    # Сортируем по времени, а не по имени каталога: у двух источников имена независимы,
+    # и склеенный по алфавиту список перемешал бы хронологию.
+    $sorted = @($all | Sort-Object Started -Descending)
+    if ($Limit -and $sorted.Count -gt $Limit) { return @($sorted | Select-Object -First $Limit) }
+    return $sorted
 }
 
 function Read-BcfRun {
@@ -123,6 +144,21 @@ function Read-BcfRun {
     }
 }
 
+# Путь для показа человеку: относительный, со слэшами вперёд.
+#
+# Нужен потому, что подсказка «журнал лежит там-то» обязана указывать на файл, который
+# ДЕЙСТВИТЕЛЬНО там лежит. У проекта со старым каталогом состояния печатать заведомо
+# новый путь — значит отправить человека искать несуществующий файл.
+function Get-BcfRelPath {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Project)
+    $p = $Path
+    if ($p.StartsWith($Project, [StringComparison]::OrdinalIgnoreCase)) {
+        $p = $p.Substring($Project.Length)
+    }
+    $p = $p -replace '\\', '/'
+    return $p.TrimStart('/')
+}
+
 function Get-BcfLastRun {
     param([Parameter(Mandatory)][string]$Project)
     $runs = Get-BcfRuns -Project $Project -Limit 1
@@ -133,9 +169,14 @@ function Get-BcfLastRun {
 function Resolve-BcfRun {
     param([Parameter(Mandatory)][string]$Project, [string]$RunId = '')
     if (-not $RunId -or $RunId -eq 'last') { return (Get-BcfLastRun -Project $Project) }
-    $j = Join-Path (Get-BcfGraphRoot -Project $Project) "$RunId\journal.jsonl"
-    if (-not (Test-Path $j)) { return $null }
-    return (Read-BcfRun -JournalPath $j -RunId $RunId)
+    foreach ($src in (Get-BcfGraphRoots -Project $Project)) {
+        $j = Join-Path $src.Path "$RunId\journal.jsonl"
+        if (-not (Test-Path $j)) { continue }
+        $run = Read-BcfRun -JournalPath $j -RunId $RunId
+        $run | Add-Member -NotePropertyName 'Legacy' -NotePropertyValue $src.Legacy -Force
+        return $run
+    }
+    return $null
 }
 
 # Сводка по ролям. Именно роль, а не узел, — единица, в которой имеет смысл считать

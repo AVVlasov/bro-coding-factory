@@ -17,7 +17,9 @@ if ($asJson) {
     exit 0
 }
 
-Write-BcfTitle 'ПРОГОНЫ ГРАФА' "$(Split-Path $project -Leaf) · .bcf/graph/"
+$srcs = Get-BcfGraphRoots -Project $project
+$where = if ($srcs.Count) { ($srcs | ForEach-Object { if ($_.Legacy) { 'loop/.graph/ (старый каталог)' } else { '.bcf/graph/' } }) -join ' + ' } else { '.bcf/graph/' }
+Write-BcfTitle 'ПРОГОНЫ ГРАФА' "$(Split-Path $project -Leaf) · $where"
 
 if (-not $runs.Count) {
     Write-BcfDim 'прогонов ещё не было'
@@ -42,6 +44,7 @@ foreach ($r in $runs) {
              }
              elseif ($r.Failed) { "провалов узлов $($r.Failed)" }
              else { 'ок' }
+    if ($r.Legacy) { $state += ' · старый кат.' }
     Add-BcfRow $rows @($r.RunId, $r.Name, "$($r.NodeCount)", ('{0:hh\:mm\:ss}' -f $r.Duration), "$([int]$r.Tokens)", $state)
     $colors += $(if ($r.DryPlan) { 'DarkGray' }
                  elseif (-not $r.Complete) { 'DarkYellow' }
@@ -50,8 +53,17 @@ foreach ($r in $runs) {
 Write-BcfTable -Headers @('runId', 'граф', 'узлов', 'время', 'токенов', 'состояние') `
                -Widths @(24, 10, 7, 10, 10, 16) -Rows $rows -RowColors $colors
 
-$broken = @($runs | Where-Object { -not $_.Complete })
+$legacy = @($runs | Where-Object { $_.Legacy })
 Write-Host ''
+if ($legacy.Count) {
+    # Молчать об этом нельзя: человек увидит свою историю и решит, что всё на месте, —
+    # а новые прогоны пойдут в другой каталог, и через месяц список разъедется надвое.
+    Write-BcfWarn "$($legacy.Count) прогонов лежат в старом каталоге loop/.graph/ — читаются, но новые туда не пишутся"
+    Write-BcfNote 'перенести историю: bcf migrate   (переносит состояние из loop/ в .bcf/, git-историю не трогает)'
+    Write-Host ''
+}
+
+$broken = @($runs | Where-Object { -not $_.Complete })
 if ($broken.Count) {
     Write-BcfNote "оборванных: $($broken.Count). Доиграть: bcf run queue --resume $($broken[0].RunId)"
     Write-BcfNote 'узлы, успевшие завершиться, возьмутся из журнала и не будут пересчитаны.'

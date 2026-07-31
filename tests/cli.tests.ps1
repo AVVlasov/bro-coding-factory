@@ -278,6 +278,47 @@ It 'cost не печатает ноль там, где тарифа нет' {
     Assert-Match $r.Out '—'  'неизвестная цена показывается прочерком, а не нулём'
 }
 
+# Регрессия: проект, водивший харнесс до перехода на .bcf/, держит историю в loop/.graph/.
+# Читать только новый адрес значит сказать «прогонов ещё не было» при полусотне журналов —
+# то есть соврать про историю ровно тем способом, против которого весь этот CLI и сделан.
+It 'история из старого каталога loop/ видна и помечена' {
+    $p = New-Sandbox 'legacy-history'
+    Bcf @('install', '--project', $p) | Out-Null
+    $runId = 'g_20250101-000000_old001'
+    $dir = Join-Path $p "loop\.graph\$runId"
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    @(
+        '{"event":"run-start","runId":"' + $runId + '","name":"queue","ts":"2025-01-01T00:00:00.0000000+00:00"}'
+        '{"event":"node-start","key":"n1","label":"работа-СТАРАЯ","phase":"Работа","role":"worker","model":"m","ts":"2025-01-01T00:00:01.0000000+00:00"}'
+        '{"event":"node-finish","key":"n1","label":"работа-СТАРАЯ","phase":"Работа","ok":true,"tokens":777,"ts":"2025-01-01T00:00:05.0000000+00:00"}'
+        '{"event":"run-finish","runId":"' + $runId + '","tokens":777,"ts":"2025-01-01T00:00:06.0000000+00:00"}'
+    ) | Set-Content -LiteralPath (Join-Path $dir 'journal.jsonl') -Encoding UTF8
+
+    $r = Bcf @('runs', '--project', $p)
+    Assert-NoMatch $r.Out 'прогонов ещё не было' 'история есть, а CLI говорит, что её нет'
+    Assert-Match $r.Out $runId
+    Assert-Match $r.Out 'старом каталоге' 'молчать о разделённой истории нельзя: новые прогоны пойдут в другое место'
+
+    # Подсказка обязана указывать на файл, который ДЕЙСТВИТЕЛЬНО там лежит.
+    $b = Bcf @('board', $runId, '--project', $p)
+    Assert-Match $b.Out 'loop/\.graph' 'подсказка ведёт в новый каталог, где файла нет'
+    Assert-Match $b.Out '777'
+}
+
+It 'migrate --dry показывает план и ничего не переносит' {
+    $p = New-Sandbox 'legacy-migrate'
+    Bcf @('install', '--project', $p) | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'loop\.graph\g_x') | Out-Null
+    Set-Content -LiteralPath (Join-Path $p 'loop\.graph\g_x\journal.jsonl') -Value '{"event":"run-start","name":"queue"}' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $p 'loop\loop.log') -Value 'x' -Encoding UTF8
+
+    $r = Bcf @('migrate', '--dry', '--project', $p)
+    Assert-Match $r.Out 'loop/\.graph'
+    Assert-Match $r.Out 'ничего не записано'
+    Assert-True (Test-Path (Join-Path $p 'loop\.graph\g_x\journal.jsonl')) 'сухой прогон перенёс файлы'
+    Assert-True (-not (Test-Path (Join-Path $p '.bcf\graph'))) 'сухой прогон создал целевой каталог'
+}
+
 # --- meta ----------------------------------------------------------------------------
 Write-Host ''
 Write-Host '  meta' -ForegroundColor White

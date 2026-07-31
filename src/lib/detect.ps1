@@ -85,7 +85,11 @@ function Get-BcfEcosystems {
     if (-not ($found | Where-Object { $_.key -eq 'node' })) {
         foreach ($sub in @('app', 'web', 'frontend', 'client', 'ui')) {
             if (Test-Path (Join-Path $Root "$sub\package.json")) {
-                $n = ($script:BcfEcosystems | Where-Object { $_.key -eq 'node' })[0].Clone()
+                # @() обязательна. Where-Object на одном совпадении отдаёт САМ объект, и
+                # [0] на хеш-таблице — это не «первый элемент», а поиск по ключу 0: он
+                # даёт $null, и .Clone() падает. Ломалось только на монорепах, то есть
+                # ровно там, где эта ветка и нужна.
+                $n = @($script:BcfEcosystems | Where-Object { $_.key -eq 'node' })[0].Clone()
                 $n.manifest = "$sub/package.json"
                 $n.product = @("$sub/src")
                 $n.generated = @("$sub/package-lock.json")

@@ -13,9 +13,19 @@
 $project = $script:BcfProject
 $runId = @($script:BcfArgs | Where-Object { $_ -notlike '-*' }) | Select-Object -First 1
 
-$stateDir = Join-Path $project '.bcf'
-$statusFile = Join-Path $stateDir 'run-all.status.json'
-$reviewFile = Join-Path $stateDir 'REVIEW.md'
+# Итог ночного прогона ищем и в новом каталоге, и в старом: проект, водивший харнесс
+# до перехода на .bcf/, держит его в loop/. Показать «прогонов не было» при лежащем
+# рядом отчёте — это не «не нашли», это неправда.
+$statusFile = ''
+$reviewFile = ''
+foreach ($d in @((Join-Path $project '.bcf'), (Join-Path $project 'loop'))) {
+    $s = Join-Path $d 'run-all.status.json'
+    if (-not $statusFile -and (Test-Path $s)) { $statusFile = $s }
+    $rv = Join-Path $d 'REVIEW.md'
+    if (-not $reviewFile -and (Test-Path $rv)) { $reviewFile = $rv }
+}
+if (-not $statusFile) { $statusFile = Join-Path $project '.bcf\run-all.status.json' }
+if (-not $reviewFile) { $reviewFile = Join-Path $project '.bcf\REVIEW.md' }
 $graphRun = Resolve-BcfRun -Project $project -RunId $runId
 
 # Что показывать, решает время: у ночного цикла и у графа разные артефакты, и брать
@@ -82,12 +92,16 @@ if ($runId -or $graphAt -gt $loopAt) {
     }
     if (-not $complete) {
         Write-Host ''
-        Write-BcfNote 'что именно не закрылось и почему — bcf tasks, подробности — .bcf/REVIEW.md'
+        $rvHint = if ($reviewFile -and (Test-Path $reviewFile)) { Get-BcfRelPath -Path $reviewFile -Project $project } else { '.bcf/REVIEW.md' }
+        Write-BcfNote "что именно не закрылось и почему — bcf tasks, подробности — $rvHint"
     }
 
     Write-Host ''
     Write-BcfNote "доска: bcf board $($graphRun.RunId)   ·   расход: bcf cost $($graphRun.RunId)"
-    Write-BcfNote "журнал: .bcf/graph/$($graphRun.RunId)/journal.jsonl"
+    # Настоящий путь журнала, а не тот, где он лежал бы у свежего проекта: по неверной
+    # подсказке человек пойдёт искать файл и не найдёт.
+    Write-BcfNote "журнал: $(Get-BcfRelPath -Path $graphRun.Journal -Project $project)"
+    if ($graphRun.Legacy) { Write-BcfNote 'прогон из старого каталога loop/ — перенести историю: bcf migrate' }
     Write-Host ''
     exit $(if ($complete) { 0 } else { 1 })
 }
@@ -129,7 +143,8 @@ if ($st.complete) {
 }
 
 Write-Host ''
-if (Test-Path $reviewFile) { Write-BcfNote 'подробности: .bcf/REVIEW.md' }
-Write-BcfNote 'машиночитаемо: .bcf/run-all.status.json   ·   состояние очереди: bcf tasks'
+if (Test-Path $reviewFile) { Write-BcfNote "подробности: $(Get-BcfRelPath -Path $reviewFile -Project $project)" }
+Write-BcfNote "машиночитаемо: $(Get-BcfRelPath -Path $statusFile -Project $project)   ·   состояние очереди: bcf tasks"
+if ($statusFile -match '[\\/]loop[\\/]') { Write-BcfNote 'итог из старого каталога loop/ — перенести: bcf migrate' }
 Write-Host ''
 exit $(if ($st.complete) { 0 } else { 1 })

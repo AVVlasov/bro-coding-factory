@@ -52,7 +52,10 @@ foreach ($ph in $phases) {
 }
 
 Write-Host ''
-Write-BcfNote "журнал: .bcf/graph/$($run.RunId)/journal.jsonl"
+# Печатаем НАСТОЯЩИЙ путь журнала, а не тот, где он лежал бы у свежего проекта:
+# у проекта со старым каталогом человек пойдёт по подсказке и файла там не найдёт.
+Write-BcfNote "журнал: $(Get-BcfRelPath -Path $run.Journal -Project $project)"
+if ($run.Legacy) { Write-BcfNote 'прогон из старого каталога loop/ — перенести историю: bcf migrate' }
 if (-not $run.Complete) {
     Write-BcfNote "доиграть: bcf run $($run.Name) --resume $($run.RunId)"
 }

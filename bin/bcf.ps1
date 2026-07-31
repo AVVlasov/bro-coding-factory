@@ -20,6 +20,7 @@ $BcfRoot = Split-Path $PSScriptRoot -Parent
 $COMMANDS = [ordered]@{
     'init'     = @{ file = 'init.ps1';     help = 'настроить фабрику под проект — восемь шагов, всё в текстовые файлы' }
     'install'  = @{ file = 'install.ps1';  help = 'записать/обновить обвязку в проекте: .claude, config, agents, tasks' }
+    'migrate'  = @{ file = 'migrate.ps1';  help = 'перенести состояние прогонов из старого каталога loop/ в .bcf/' }
     'doctor'   = @{ file = 'doctor.ps1';   help = 'живая проба окружения: бэкенды, авторизации, память, проверки' }
     'detect'   = @{ file = 'detect.ps1';   help = 'разбор проекта: языки, сборка, тесты, git — ничего не пишет' }
     'tasks'    = @{ file = 'tasks.ps1';    help = 'бэклог: что готово к работе, что ждёт, что закрыто' }
