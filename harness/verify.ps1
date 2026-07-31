@@ -101,7 +101,7 @@ Get-ChildItem env: | Where-Object { $_.Name -like 'OPENCODE_*' } | ForEach-Objec
 
 # Роли живут в .claude/agents: там их читает и Claude Code как субагентов, и обвязка
 # при верификации. Вторая копия в agents/ означала бы, что однажды поправят не ту.
-$agentsDir  = Join-Path $root ".claudegents"
+$agentsDir  = Join-Path $root (Join-Path ".claude" "agents")
 $verdictDir = Join-Path $root "tasks\.verdicts"
 $workDir    = Join-Path $root ".bcf\verify"
 $logFile    = Join-Path $root ".bcf\loop.log"
@@ -640,10 +640,29 @@ if (-not $iterChangedFiles -or $iterChangedFiles.Count -eq 0) {
 }
 $impactMode = ($planRegression -ne 'release')
 
+# Тестеры, которых не нашлось. Держим отдельно: пропущенная роль — это НЕ выполненная
+# Фаза C, и вердикт обязан это учитывать, иначе PASS выдаётся за проверку, которой не было.
+$missingTesters = @()
+
 foreach ($t in $testers) {
-  $agentFile = Join-Path $agentsDir "$t.md"
+  # Путь берём из config/agents.json (testers[].file), а собираем сами только если там
+  # его нет. Схема объявляет это поле, и игнорировать его — значит требовать, чтобы
+  # роли лежали ровно там, где угадывает код: переименовал файл в конфиге, а тестер
+  # молча пропал.
+  $agentFile = ''
+  if ($AgentsCfg -and $AgentsCfg.testers) {
+    $entry = @($AgentsCfg.testers | Where-Object { $_.name -eq $t -and $_.file }) | Select-Object -First 1
+    if ($entry) { $agentFile = Join-Path $root ([string]$entry.file -replace '/', [IO.Path]::DirectorySeparatorChar) }
+  }
+  if (-not $agentFile) { $agentFile = Join-Path $agentsDir "$t.md" }
+
   if (-not (Test-Path $agentFile)) {
-    Log "ПРЕДУПРЕЖДЕНИЕ: $agentFile не найден — тестер $t пропущен."
+    # ЭТО НЕ ПРЕДУПРЕЖДЕНИЕ. Пропущенный тестер означает, что Фаза C не выполнялась, а
+    # вердикт при этом считается по оставшимся зелёным гейтам — то есть PASS выдаётся
+    # за проверку, которой не было. Отсутствие файла роли — дефект конфигурации, и он
+    # обязан красить вердикт, а не теряться строкой в логе.
+    Log "ОШИБКА: файл роли не найден: $agentFile — тестер '$t' исполнить нечем."
+    $missingTesters += $t
     continue
   }
   $agentSpec = Get-Content -Raw -LiteralPath $agentFile
@@ -1023,6 +1042,7 @@ Log "Судья (совещательно, НЕ авторитет): $judgeVerdi
 # вердикт НЕ влияют (решение 2026-05-30: обвязка автономна, флаки-LLM не решает).
 $gateFailures = @()
 if ($checksFailed) { $gateFailures += 'checks' }
+if ($missingTesters.Count) { $gateFailures += 'testers-missing:' + ($missingTesters -join '|') }
 if ($lintFailed)   { $gateFailures += 'lint:' + (($lintViolations | ForEach-Object { $_.rule }) -join '|') }
 if ($visualFailed) { $gateFailures += 'visual-contract' }
 if ($gateFailures.Count -eq 0) {

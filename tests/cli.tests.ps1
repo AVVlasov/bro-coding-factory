@@ -68,6 +68,31 @@ Write-Host ''
 Write-Host "  ДЫМОВЫЕ ТЕСТЫ CLI   песочница: $sandboxRoot" -ForegroundColor Cyan
 Write-Host ''
 
+# --- Целостность исходников ------------------------------------------------------------
+Write-Host '  целостность' -ForegroundColor White
+
+# Регрессия и защита от целого класса дефектов. В verify.ps1 в путь к каталогу ролей попал
+# байт BEL (0x07) — след неудачного экранирования "\a" при пакетной правке. Путь стал
+# несуществующим, ВСЕ тестеры Фазы C молча пропускались строкой «предупреждение», а
+# вердикт считался по оставшимся зелёным гейтам: PASS выдавался за проверку, которой не
+# было. Глазами такой байт не виден, парсер на него не ругается — ловить можно только так.
+It 'в скриптах нет управляющих байтов' {
+    $bad = @()
+    foreach ($f in (Get-ChildItem -Path (Join-Path $root 'harness'), (Join-Path $root 'src'), (Join-Path $root 'bin') -Recurse -Filter '*.ps1')) {
+        $text = Get-Content -Raw -LiteralPath $f.FullName
+        for ($i = 0; $i -lt $text.Length; $i++) {
+            $c = [int]$text[$i]
+            # разрешены только табуляция, перевод строки и возврат каретки
+            if ($c -lt 32 -and $c -ne 9 -and $c -ne 10 -and $c -ne 13) {
+                $line = ($text.Substring(0, $i) -split "`n").Count
+                $bad += "$($f.Name):$line  байт 0x{0:X2}" -f $c
+                break
+            }
+        }
+    }
+    Assert-True ($bad.Count -eq 0) ("управляющие байты: " + ($bad -join '; '))
+}
+
 # --- Диспетчер -----------------------------------------------------------------------
 Write-Host '  диспетчер' -ForegroundColor White
 
