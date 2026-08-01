@@ -159,7 +159,11 @@ function Build-Board {
         if ($known) { $money = '  ' + (Format-BcfMoney $c $pricing.Currency) }
     }
 
-    $L.Add(@{ t = '  ' + (Ink $barTxt 'Cyan') + (Ink ("  {0,3}%  {1}/{2} узлов{3}" -f $pct, $doneN, $total, $money) 'White'); c = '' })
+    # Полоса считает УЗЛЫ и подписана этим словом, но зелёная стопроцентная полоса под
+    # заголовком «НЕПОЛНО» всё равно читается как успех — глазом ловится цвет, а не
+    # подпись. У прогона, не закрывшего очередь, полоса жёлтая.
+    $barColor = if ($live) { 'Cyan' } elseif ($Run.DryPlan) { 'DarkGray' } elseif ($doneOk) { 'Green' } else { 'Yellow' }
+    $L.Add(@{ t = '  ' + (Ink $barTxt $barColor) + (Ink ("  {0,3}%  {1}/{2} узлов{3}" -f $pct, $doneN, $total, $money) 'White'); c = '' })
     return $L.ToArray()
 }
 
