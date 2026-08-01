@@ -1115,6 +1115,40 @@ It 'доска живого прогона собирается и не врёт
     Assert-NoMatch $txt '₽' 'доска показала деньги без тарифов'
 }
 
+# Запасная модель роли. Смысл фичи — в том, КОГДА она включается: на отказ провайдера
+# (429, зависший поток, отвалившаяся авторизация, пустой ответ), а не на отказ задачи.
+# Включать её на «схема не сошлась» значит списать бюджет дважды за тот же провал.
+It 'запасная модель включается на отказ провайдера, а не задачи' {
+    . (Join-Path $root 'harness\lib\bcf-context.ps1')
+    . (Join-Path $root 'harness\lib\graph-runtime.ps1')
+
+    foreach ($r in @('бэкенд отказал: rate limit 429', 'стрим молчит 300с — зависший поток модели',
+                     'агент не вернул текста', 'бэкенд отказал: 401 unauthorized')) {
+        Assert-True (Test-BcfFallbackWorthy $r) "провайдерский отказ не распознан: $r"
+    }
+    foreach ($r in @('схема: ответ не содержит разбираемого JSON', 'проверки на слитом дереве красные', '')) {
+        Assert-True (-not (Test-BcfFallbackWorthy $r)) "на отказе задачи запасная включилась бы: $r"
+    }
+}
+
+# Конфиг допускает обе формы записи: строку (та же CLI, другая модель) и объект.
+It 'запасная читается и строкой, и объектом' {
+    . (Join-Path $root 'harness\lib\bcf-context.ps1')
+    . (Join-Path $root 'harness\lib\graph-runtime.ps1')
+
+    $cfg = @'
+{ "graph": { "backends": { "claude": { "command": "c {model}" }, "codex": { "command": "x {model}" } },
+             "roles": { "a": { "backend": "claude", "model": "opus", "fallback": "sonnet" },
+                        "b": { "backend": "claude", "model": "opus", "fallback": { "backend": "codex", "model": "gpt" } },
+                        "c": { "backend": "claude", "model": "opus" } } } }
+'@ | ConvertFrom-Json
+    $roles = _GraphRoles $cfg
+    Assert-True ($roles['a'].Fallback.Backend -eq 'claude') 'строка не унаследовала бэкенд роли'
+    Assert-True ($roles['a'].Fallback.Model -eq 'sonnet')   'строка не прочиталась как модель'
+    Assert-True ($roles['b'].Fallback.Backend -eq 'codex')  'объект не прочитался'
+    Assert-True ($null -eq $roles['c'].Fallback)            'у роли без fallback появилась запасная'
+}
+
 It 'update --check не трогает рабочее дерево' {
     $before = (& git -C (Get-Location) status --porcelain | Out-String)
     $r = Bcf @('update', '--check')

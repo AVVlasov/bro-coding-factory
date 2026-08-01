@@ -75,7 +75,15 @@ foreach ($k in $roles.Keys) {
     $cur = $cfg.graph.roles.PSObject.Properties[$k]
     if ($cur -and $cur.Value.backend -and -not $reconfigure) { $kept += "graph.roles.$k"; continue }
     $entry = [ordered]@{ backend = $roles[$k].backend; model = $roles[$k].model }
-    if ($roles[$k].fallback) { $entry.fallback = $roles[$k].fallback }
+    # Пишем ОБЪЕКТОМ: движок читает fallback.backend/fallback.model. Строка тоже
+    # понимается (человек пишет её руками), но своё мы пишем в полной форме — чтобы в
+    # конфиге было видно, на какую CLI уходит запасная.
+    if ($roles[$k].fallback) {
+        $fbv = $roles[$k].fallback
+        $entry.fallback = if ($fbv -is [string]) {
+            [pscustomobject]@{ backend = $roles[$k].backend; model = $fbv }
+        } else { [pscustomobject]$fbv }
+    }
     $cfg.graph.roles | Add-Member -NotePropertyName $k -NotePropertyValue ([pscustomobject]$entry) -Force
 }
 

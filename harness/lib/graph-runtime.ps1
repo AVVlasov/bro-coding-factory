@@ -190,7 +190,22 @@ function _GraphRoles($cfg) {
         foreach ($prop in $r.PSObject.Properties) {
             if ($prop.Name -like '$*') { continue }
             $v = $prop.Value
-            $out[$prop.Name] = @{ Backend = [string]$v.backend; Model = [string]$v.model }
+            # Запасная модель роли. Необязательна; когда её нет — поведение прежнее.
+            # Две формы, обе валидны: "fallback": "sonnet" (та же CLI, другая модель) и
+            # "fallback": { "backend": "codex", "model": "gpt-5.6" }. Строку человек пишет
+            # руками чаще, и отвергать её значит требовать формальности вместо работы.
+            $fb = $null
+            $fp = $v.PSObject.Properties['fallback']
+            if ($fp -and $fp.Value) {
+                $fv = $fp.Value
+                if ($fv -is [string]) {
+                    if ($fv.Trim()) { $fb = @{ Backend = [string]$v.backend; Model = $fv.Trim() } }
+                } elseif ([string]$fv.backend -or [string]$fv.model) {
+                    $fb = @{ Backend = [string]$fv.backend; Model = [string]$fv.model }
+                    if (-not $fb.Backend) { $fb.Backend = [string]$v.backend }   # та же CLI, другая модель
+                }
+            }
+            $out[$prop.Name] = @{ Backend = [string]$v.backend; Model = [string]$v.model; Fallback = $fb }
         }
     }
     return $out
@@ -205,12 +220,26 @@ function Resolve-GraphRole {
     $spec = $ctx.Roles[$Role]
     if ($spec -and $spec.Backend -and $ctx.Backends.ContainsKey($spec.Backend)) {
         $b = $ctx.Backends[$spec.Backend]
+        # Запасная резолвится СРАЗУ и здесь же: искать её в момент отказа значит делать это
+        # на горячем пути, где уже нет ни времени, ни внятной диагностики.
+        $fb = $null
+        if ($spec.Fallback -and $ctx.Backends.ContainsKey($spec.Fallback.Backend)) {
+            $fbB = $ctx.Backends[$spec.Fallback.Backend]
+            $fb = @{
+                Backend = $spec.Fallback.Backend
+                Command = $fbB.Command
+                Format  = $fbB.Format
+                Env     = @($fbB.Env)
+                Model   = $spec.Fallback.Model
+            }
+        }
         return @{
-            Backend = $spec.Backend
-            Command = $b.Command
-            Format  = $b.Format
-            Env     = @($b.Env)
-            Model   = if ($ModelOverride) { $ModelOverride } else { $spec.Model }
+            Backend  = $spec.Backend
+            Command  = $b.Command
+            Format   = $b.Format
+            Env      = @($b.Env)
+            Model    = if ($ModelOverride) { $ModelOverride } else { $spec.Model }
+            Fallback = $fb
         }
     }
     if ($spec -and $spec.Backend) {
@@ -1004,6 +1033,28 @@ function _GraphRunAgent {
 # Invoke-Node — узел графа
 # ---------------------------------------------------------------------------
 
+# Стоит ли пробовать ЗАПАСНУЮ модель после этого отказа.
+#
+# Не всякий провал лечится сменой модели, и переключаться на всё подряд нельзя: если узел
+# падает на схеме ответа, вторая модель упадёт на ней же, а бюджет будет потрачен дважды.
+# Запасная нужна там, где отказал ПРОВАЙДЕР, а не задача:
+#
+#   · 429 / исчерпан лимит плана — модель физически недоступна ближайшее время;
+#   · поток завис и был снят по тишине — у этого провайдера сейчас плохо со стримом;
+#   · авторизация отвалилась на ходу — CLI больше не может ходить в эту модель;
+#   · пустой ответ при нулевом коде — молча умерший агент.
+#
+# Цена отказа от запасной измерима: узел падает, волна встаёт и ждёт рук, а на слиянии
+# worktree остаётся заклеймлённым и следующие задачи не берут те же файлы.
+function Test-BcfFallbackWorthy {
+    param([string]$Reason)
+    if (-not $Reason) { return $false }
+    return [bool]($Reason -match '(?i)429|rate.?limit|лимит|quota|усталь|overload|' +
+                                 'стрим молчит|зависш|timeout|таймаут|' +
+                                 'auth|авториз|unauthor|forbidden|403|401|' +
+                                 'не вернул текста|бэкенд отказал')
+}
+
 function Invoke-Node {
     param(
         [Parameter(Mandatory, Position = 0)][string]$Prompt,
@@ -1131,15 +1182,30 @@ function Invoke-Node {
     $attempt = 0
     $promptNow = $full
     $lastReason = ''
+    $useFb = $false          # текущая попытка идёт на запасной модели
+    $fbUsed = $false         # запасная уже включалась в этом узле
     while ($attempt -le $MaxRetries) {
         $attempt++
-        $res = _GraphRunAgent -Prompt $promptNow -Model $Model -Label "$label-a$attempt" `
+        $cur = if ($useFb -and $rt.Fallback) { $rt.Fallback } else { $rt }
+        $curModel = if ($useFb -and $rt.Fallback) { $rt.Fallback.Model } else { $Model }
+        $res = _GraphRunAgent -Prompt $promptNow -Model $curModel -Label "$label-a$attempt" `
                               -WorkDir $work -TimeoutSec $timeout -SilentSec ([int]$ctx.SilentSec) `
-                              -CommandTpl $rt.Command -Format $rt.Format -RequiredEnv $rt.Env -FileBase "$safeBase-a$attempt"
+                              -CommandTpl $cur.Command -Format $cur.Format -RequiredEnv $cur.Env -FileBase "$safeBase-a$attempt"
 
         if (-not $res.Ok) {
             $lastReason = $res.Reason
             Write-GraphLog "! $label — попытка $attempt не удалась: $($res.Reason)"
+
+            # ЗАПАСНАЯ — на отказ провайдера, а не на отказ задачи. И ровно один раз:
+            # бесконечное перебирание моделей превращает потолок повторов в фикцию.
+            if (-not $fbUsed -and $rt.Fallback -and (Test-BcfFallbackWorthy $res.Reason)) {
+                $useFb = $true
+                $fbUsed = $true
+                _GraphJournal @{ event = 'node-fallback'; key = $key; label = $label; phase = $phase
+                                 from = "$($rt.Backend)/$Model"; to = "$($rt.Fallback.Backend)/$($rt.Fallback.Model)"
+                                 reason = $res.Reason }
+                Write-GraphLog "  ↻ $label — перехожу на запасную: $($rt.Fallback.Backend) / $($rt.Fallback.Model)"
+            }
             continue
         }
 
