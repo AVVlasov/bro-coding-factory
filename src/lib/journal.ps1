@@ -36,6 +36,8 @@ function Get-BcfRuns {
             $j = Join-Path $d.FullName 'journal.jsonl'
             if (-not (Test-Path $j)) { continue }
             $run = Read-BcfRun -JournalPath $j -RunId $d.Name
+            # Пробы `bcf doctor` — не прогоны и в историю не идут.
+            if ($run.Doctor) { continue }
             $run | Add-Member -NotePropertyName 'Legacy' -NotePropertyValue $src.Legacy -Force
             $all += $run
         }
@@ -50,7 +52,7 @@ function Get-BcfRuns {
 function Read-BcfRun {
     param([Parameter(Mandatory)][string]$JournalPath, [string]$RunId = '')
 
-    $name = ''; $started = $null; $finished = $null
+    $name = ''; $started = $null; $finished = $null; $isDoctor = $false
     $nodes = @{}
     $order = @()
     $done = $false
@@ -66,6 +68,12 @@ function Read-BcfRun {
             'run-start' {
                 $name = [string]$r.name
                 $dryPlan = [bool]$r.dryPlan
+                # Живая проба бэкендов (`bcf doctor`) заводит каталог прогона и пишет
+                # run-start, но НИКОГДА не пишет run-finish — она и не прогон. В истории
+                # оставался вечный «оборванный» прогон, и он становился последним для всех
+                # экранов: человек проверял окружение, а карточка потом сообщала ему про
+                # оборванный прогон, которого не было.
+                $isDoctor = ([bool]$r.doctor) -or ($name -eq 'doctor')
                 if ($r.ts) { $started = [datetime]$r.ts }
             }
             'phase' { $curPhase = [string]$r.phase }
@@ -135,6 +143,7 @@ function Read-BcfRun {
         Duration = ($finished - $started)
         Complete = $done
         DryPlan  = $dryPlan
+        Doctor   = $isDoctor
         Result   = $result
         Nodes    = $list
         NodeCount = $list.Count
@@ -146,6 +155,53 @@ function Read-BcfRun {
         # верный способ разъехаться с тем, куда рантайм на самом деле пишет.
         Dir      = (Split-Path $JournalPath -Parent)
     }
+}
+
+# Пульс работающих агентов: .bcf/fleet/*.worker.json.
+#
+# ЖУРНАЛА ДЛЯ ОПРЕДЕЛЕНИЯ «ЖИВ» НЕ ХВАТАЕТ. Между node-start и node-finish рантайм в
+# журнал не пишет ничего, а потолок на узел по умолчанию 1800 секунд: любой агентский
+# узел, думающий дольше полутора минут, делал журнал «протухшим», и живая доска объявляла
+# идущий прогон ОБОРВАННЫМ — жёлтым заголовком, замершим таймером и значком предупреждения
+# вместо спиннера. То есть доска, сделанная чтобы смотреть за долгой работой, ломалась
+# ровно на долгой работе.
+#
+# Реестр воркеров обновляется на каждом такте опроса и содержит и время, и подробность
+# («120с, тишина 12с») — это и есть настоящий признак жизни.
+function Get-BcfFleetPulse {
+    param([Parameter(Mandatory)][string]$Project)
+    $dir = Join-Path $Project '.bcf\fleet'
+    if (-not (Test-Path $dir)) { return $null }
+    $best = $null
+    foreach ($f in (Get-ChildItem $dir -Filter '*.worker.json' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $rec = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json
+            $hb = if ($rec.heartbeat) { [datetime]$rec.heartbeat } else { $f.LastWriteTime }
+        } catch { $hb = $f.LastWriteTime; $rec = $null }
+        if (-not $best -or $hb -gt $best.At) {
+            $best = [pscustomobject]@{
+                At = $hb
+                Detail = $(if ($rec -and $rec.detail) { [string]$rec.detail } else { '' })
+                Task = $(if ($rec -and $rec.task) { [string]$rec.task } else { '' })
+                Count = 0
+            }
+        }
+    }
+    if ($best) {
+        $best.Count = @(Get-ChildItem $dir -Filter '*.worker.json' -File -ErrorAction SilentlyContinue).Count
+    }
+    return $best
+}
+
+# Идёт ли прогон прямо сейчас. Свежесть считаем по САМОМУ НОВОМУ из двух источников:
+# записи в журнал и пульса воркеров.
+function Test-BcfRunLive {
+    param([Parameter(Mandatory)]$Run, [Parameter(Mandatory)][string]$Project, [int]$WithinSec = 90)
+    if (-not $Run -or $Run.Complete) { return $false }
+    $last = $Run.Finished
+    $pulse = Get-BcfFleetPulse -Project $Project
+    if ($pulse -and $pulse.At -gt $last) { $last = $pulse.At }
+    return (((Get-Date) - $last).TotalSeconds -lt $WithinSec)
 }
 
 # Закрылся ли прогон на самом деле.

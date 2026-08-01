@@ -936,6 +936,87 @@ It 'доска, карточка и отчёт говорят о прогоне 
     Assert-Match $card.Out 'НЕПОЛНО' 'карточка выдаёт незакрытую очередь за успех'
 }
 
+# Регрессия: [int]$Span.TotalDays ОКРУГЛЯЕТ, а не отбрасывает — «1д 21:36» печаталось как
+# «2д 21:36», противореча часам рядом. И знак терялся целиком: «-00:05:30» выходило «05:30».
+It 'длительность не завышает дни и не теряет знак' {
+    . (Join-Path $root 'src\lib\ui.ps1')
+    Assert-True ((Format-BcfDuration ([timespan]'1.21:36:00')) -eq '1д 21:36') "получил: $(Format-BcfDuration ([timespan]'1.21:36:00'))"
+    Assert-True ((Format-BcfDuration ([timespan]'6.13:00:00')) -eq '6д 13:00') "получил: $(Format-BcfDuration ([timespan]'6.13:00:00'))"
+    Assert-True ((Format-BcfDuration ([timespan]'-00:05:30')).StartsWith('-')) 'отрицательный интервал напечатан как положительный'
+    Assert-True ((Format-BcfDuration ([timespan]'-3.04:00:00')) -eq '-3д 04:00') "получил: $(Format-BcfDuration ([timespan]'-3.04:00:00'))"
+}
+
+# Регрессия: индекс за границей массива в PowerShell не ошибка — он даёт $null, и явно
+# указанный --project молча превращался в своё отсутствие. `bcf install --project` (значение
+# потерялось при копировании) записывал обвязку в текущий каталог и рапортовал об успехе.
+It 'флаг --project без значения отказывает, а не берёт текущий каталог' {
+    $r = Bcf @('install', '--project')
+    Assert-True ($r.Code -eq 2) "ожидал код 2, получил $($r.Code)"
+    Assert-Match $r.Out 'нет значения'
+}
+
+# Регрессия: разборщики деклараций смотрели строго в <root>/tasks, игнорируя paths.tasks.
+# На проекте с другим каталогом обе функции возвращали пусто — то есть «предшественников
+# нет» при незакрытом гейте. Задача уходила в волну, которой не должна была достаться.
+It 'декларации задачи читаются из каталога, заданного в конфиге' {
+    $p = New-Sandbox 'paths-tasks'
+    Bcf @('install', '--project', $p) | Out-Null
+    $cfgPath = Join-Path $p 'config\harness.json'
+    $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
+    if (-not $cfg.paths) { $cfg | Add-Member -NotePropertyName 'paths' -NotePropertyValue ([pscustomobject]@{}) -Force }
+    $cfg.paths | Add-Member -NotePropertyName 'tasks' -NotePropertyValue 'backlog' -Force
+    ($cfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'backlog') | Out-Null
+
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'backlog\TASK-01-a.md') -Value @"
+# TASK-01 — a
+
+## Файлы
+- ``src/a.rs``
+
+**Gate-вход:** нет
+"@
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'backlog\TASK-02-b.md') -Value @"
+# TASK-02 — b
+
+## Файлы
+- ``src/b.rs``
+
+**Gate-вход:** TASK-01
+"@
+    $r = Bcf @('task', 'why', 'TASK-02', '--project', $p)
+    Assert-Match $r.Out 'TASK-01' 'предшественник не найден: разборщик смотрит не в тот каталог'
+    Assert-NoMatch $r.Out 'предшественников нет' 'незакрытый гейт объявлен отсутствующим'
+    Assert-Match $r.Out 'src/b\.rs' 'объявленные файлы не найдены: разборщик смотрит не в тот каталог'
+}
+
+# Регрессия: `bcf doctor` заводит каталог прогона и пишет run-start, но никогда не пишет
+# run-finish — она и не прогон. В истории оставался вечный «оборванный» прогон, и он
+# становился последним для ВСЕХ экранов.
+It 'проба doctor не попадает в историю прогонов' {
+    $p = New-Sandbox 'doctor-ghost'
+    Bcf @('install', '--project', $p) | Out-Null
+    $g = Join-Path $p '.bcf\graph\g_20260101-000000_probe'
+    New-Item -ItemType Directory -Force -Path $g | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'journal.jsonl') -Value @(
+        '{"ts":"2026-01-01T00:00:00Z","event":"run-start","name":"doctor","doctor":true,"nodes":0}'
+    )
+    $r = Bcf @('runs', '--project', $p)
+    Assert-NoMatch $r.Out 'g_20260101-000000_probe' 'проба doctor показана как прогон'
+    $card = Bcf @('--project', $p)
+    Assert-NoMatch $card.Out 'ОБОРВАН' 'карточка объявила оборванным прогон, которого не было'
+}
+
+# Регрессия: аргумент с пробелами уезжал в docker несколькими — тот падал на разборе за
+# доли секунды, и снаружи это неотличимо от «демон не ответил».
+It 'docker зовётся с корректно закавыченными аргументами' {
+    . (Join-Path $root 'harness\lib\docker.ps1')
+    if (-not (Test-BcfDockerDaemon)) { return }   # без демона проверять нечего
+    $r = Invoke-BcfDocker -DockerArgs @('ps', '--format', '{{.Names}} {{.Status}}') -TimeoutSec 15
+    Assert-True $r.Ok "docker отказал: $(($r.Err).Trim())"
+    Assert-True ($null -ne $r.Err) 'Invoke-BcfDocker не возвращает stderr — причину отказа печатать нечем'
+}
+
 It 'update --check не трогает рабочее дерево' {
     $before = (& git -C (Get-Location) status --porcelain | Out-String)
     $r = Bcf @('update', '--check')

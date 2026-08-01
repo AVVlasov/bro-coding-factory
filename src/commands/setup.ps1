@@ -53,7 +53,11 @@ if ($IsWindows -eq $false) {
     Write-Host ''
     Write-BcfLine "    export PATH=`"$binDir`":`$PATH" 'Cyan'
     Write-Host ''
-    Write-BcfNote 'и сделай обёртку исполняемой: chmod +x ' + (Join-Path $binDir 'bcf')
+    # Скобки обязательны: без них PowerShell разбирает строку как ВЫЗОВ с аргументами —
+    # '+' и путь уезжают в $args, печатается только первый кусок, и человек получает
+    # «chmod +x » без имени файла. Ошибки при этом нет, exit 0: обрывок выглядит
+    # полноценной инструкцией.
+    Write-BcfNote ('и сделай обёртку исполняемой: chmod +x ' + (Join-Path $binDir 'bcf'))
     Write-Host ''
     exit 0
 }
@@ -122,8 +126,22 @@ if ($env:PATH -notlike "*$binDir*") { $env:PATH = "$env:PATH;$binDir" }
 Write-Host ''
 Write-BcfLine '  ПРОВЕРКА' 'White'
 $now = Test-OnPath
-if ($now) { Write-BcfOk "bcf → $now" }
-else {
+if ($now) {
+    # СВЕРЯЕМ ИСТОЧНИК. Зелёная галочка по любому найденному `bcf` — ложь об установке:
+    # каталог дописывается в КОНЕЦ PATH, поэтому уже стоявшая на машине чужая фабрика
+    # продолжает выигрывать разрешение имени, и экран заканчивается строкой
+    # «✓ bcf → C:\tools\bcf.cmd» — отметкой об успехе на команду, ведущую не сюда.
+    if ($now -like (Join-Path $binDir '*')) {
+        Write-BcfOk "bcf → $now"
+    } else {
+        Write-BcfFail "команда bcf ведёт НЕ СЮДА: $now"
+        Write-BcfNote "эта фабрика: $binDir"
+        Write-BcfNote 'каталог добавлен в конец PATH, поэтому имя по-прежнему разрешается в чужую установку.'
+        Write-BcfNote 'две фабрики на одном PATH — источник расхождений, видимых только по итогу прогона.'
+        Write-BcfNote 'реши, какая главная: убери лишнюю (bcf setup --remove в ней) либо'
+        Write-BcfNote "подними этот каталог выше в переменной PATH пользователя."
+    }
+} else {
     Write-BcfWarn 'в ЭТОМ окне команда ещё не видна'
     Write-BcfNote 'Windows не обновляет переменные в уже запущенных процессах — открой новое окно.'
 }

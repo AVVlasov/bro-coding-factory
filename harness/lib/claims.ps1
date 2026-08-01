@@ -57,6 +57,31 @@ function _Write-Json($path, $obj) {
     ($obj | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $path -Encoding UTF8
 }
 
+# Каталог задач берётся ИЗ КОНФИГА, а не из захардкоженного 'tasks'.
+#
+# paths.tasks — штатная настройка (её читают и bcf tasks, и bcf task, и карточка), но
+# разборщики деклараций смотрели строго в <root>/tasks. На проекте с другим каталогом
+# файл задачи просто не находился, и обе функции возвращали ПУСТО — то есть «файлов не
+# объявлено» и «предшественников нет». Второе опаснее: задача с незакрытым гейтом
+# объявлялась готовой и уходила в волну, а планировщик графа считал владение файлами по
+# пустым декларациям, то есть не считал вовсе.
+$script:TaskDirCache = @{}
+function Get-BcfTasksDir {
+    param([Parameter(Mandatory)][string]$Root)
+    if ($script:TaskDirCache.ContainsKey($Root)) { return $script:TaskDirCache[$Root] }
+    $rel = 'tasks'
+    try {
+        $cfgFile = Join-Path $Root 'config\harness.json'
+        if (Test-Path $cfgFile) {
+            $cfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+            if ($cfg.paths -and $cfg.paths.tasks) { $rel = [string]$cfg.paths.tasks }
+        }
+    } catch { }
+    $dir = Join-Path $Root ($rel -replace '/', '\')
+    $script:TaskDirCache[$Root] = $dir
+    return $dir
+}
+
 # --- Объявленные файлы задачи: секция «## Файлы» task-файла ---
 function Get-TaskDeclaredFiles {
     param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
@@ -65,7 +90,7 @@ function Get-TaskDeclaredFiles {
     # массив на выходе функции). Вызывающие обёрнуты в @(), поэтому у них он снова
     # становится пустым массивом; терпимость к $null нужна только тем, кто передаёт
     # результат дальше параметром — см. Get-CoupledFiles.
-    $tasksDir = Join-Path $Root 'tasks'
+    $tasksDir = Get-BcfTasksDir -Root $Root
     $tf = Get-ChildItem $tasksDir -Filter "$TaskId-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $tf) { return @() }
     $body = Get-Content -Raw -LiteralPath $tf.FullName
@@ -105,7 +130,7 @@ function Get-TaskPredecessors {
         [string]$Prefix = 'TASK'
     )
 
-    $tasksDir = Join-Path $Root 'tasks'
+    $tasksDir = Get-BcfTasksDir -Root $Root
     $tf = Get-ChildItem $tasksDir -Filter "$TaskId-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $tf) { return @() }
     $body = Get-Content -Raw -LiteralPath $tf.FullName -ErrorAction SilentlyContinue

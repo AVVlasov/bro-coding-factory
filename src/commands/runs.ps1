@@ -36,11 +36,13 @@ foreach ($r in $runs) {
     #   ОБОРВАН  — можно доиграть, работа отработавших узлов не потеряна;
     #   неполно  — граф доиграл, но очередь закрылась не вся (его собственный вердикт);
     #   ок       — закрылось всё.
-    $res = $r.Result
+    # Правило «закрылся ли прогон» — общее на все экраны (Get-BcfRunComplete), а не своё
+    # в каждой команде: разные копии одного правила и разъезжаются по-разному.
     $state = if ($r.DryPlan) { 'сухой план' }
              elseif (-not $r.Complete) { 'ОБОРВАН' }
-             elseif ($null -ne $res -and $res.PSObject.Properties['complete'] -and -not $res.complete) {
-                 "неполно: $($res.passed)/$($res.total)"
+             elseif (-not (Get-BcfRunComplete -Run $r)) {
+                 $t = Get-BcfRunTally -Run $r
+                 if ($t) { "неполно: $t" } else { 'неполно' }
              }
              elseif ($r.Failed) { "провалов узлов $($r.Failed)" }
              else { 'ок' }

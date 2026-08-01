@@ -146,9 +146,15 @@ if (-not $noProbe -and $roleOf.Count) {
     Write-BcfNote 'по одному короткому запросу на роль — единственное место, где doctor тратит токены'
     Write-Host ''
 
+    # Вывод дочернего процесса идёт СРАЗУ, а не после его конца.
+    #
+    # `… | Out-String` буферизует всё до завершения, а завершается это не быстро: проба
+    # каждой роли — живой запуск бэкенда с потолком в 180 секунд на каждый, плюс подъём
+    # памяти. На четырёх ролях экран молчал минутами и выглядел зависшим ровно в той
+    # команде, которую запускают, чтобы понять, всё ли живо.
     $graphPs1 = Join-Path (Get-BcfHarness) 'graph.ps1'
-    $out = & pwsh -NoProfile -File $graphPs1 -Doctor -ProjectRoot $project 2>&1 | Out-String
-    foreach ($line in ($out -split "`r?`n")) {
+    & pwsh -NoProfile -File $graphPs1 -Doctor -ProjectRoot $project 2>&1 | ForEach-Object {
+        $line = [string]$_
         if ($line.Trim()) { Write-Host $line }
     }
     if ($LASTEXITCODE -ne 0) { $bad++ }

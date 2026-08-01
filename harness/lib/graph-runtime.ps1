@@ -54,7 +54,12 @@ function Initialize-GraphRun {
         [int]$MaxConcurrency = 0,
         [int]$MaxNodes = 1000,
         [double]$TokenBudget = 0,
-        [switch]$DryPlan
+        [switch]$DryPlan,
+        # ТОЛЬКО ЧТЕНИЕ: собрать контекст для показа чужого прогона, ничего в него не
+        # записав. Без этого просмотр доски дописывал в журнал ПОКАЗЫВАЕМОГО прогона
+        # второй run-start: время старта уезжало на «сейчас», длительность становилась
+        # отрицательной, и запись портилась просто оттого, что на неё посмотрели.
+        [switch]$ReadOnly
     )
 
     $cfg = $null
@@ -129,8 +134,10 @@ function Initialize-GraphRun {
         MutexName      = "Global\bcf-graph-$RunId"
     }
 
-    _GraphJournal @{ event = 'run-start'; runId = $RunId; name = $Meta.name; resumeFrom = $ResumeFromRunId
-                     concurrency = $MaxConcurrency; budget = $TokenBudget; dryPlan = [bool]$DryPlan }
+    if (-not $ReadOnly) {
+        _GraphJournal @{ event = 'run-start'; runId = $RunId; name = $Meta.name; doctor = [bool]$Meta.doctor; resumeFrom = $ResumeFromRunId
+                         concurrency = $MaxConcurrency; budget = $TokenBudget; dryPlan = [bool]$DryPlan }
+    }
     return $script:GraphCtx
 }
 

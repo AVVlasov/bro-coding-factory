@@ -25,6 +25,47 @@ function Test-BcfDockerDaemon {
         return ($LASTEXITCODE -eq 0)
     }
 
+    # Куда ПОЙДЁТ следующая команда docker — решает не список каналов, а активный
+    # контекст. Каналы неактивных движков публикуются тоже (проверено: при активном
+    # desktop-linux рядом живут dockerDesktopEngine и dockerDesktopWindowsEngine), поэтому
+    # «какой-то канал есть» не значит «тот самый демон отвечает». Спрашиваем адрес.
+    $endpoint = $env:DOCKER_HOST
+    if (-not $endpoint) {
+        try {
+            $cfg = Join-Path $env:USERPROFILE '.docker\config.json'
+            $ctxName = ''
+            if (Test-Path $cfg) {
+                $j = Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Json
+                if ($j.currentContext) { $ctxName = [string]$j.currentContext }
+            }
+            if ($ctxName -and $ctxName -ne 'default') {
+                # Метаданные контекста лежат в каталоге, имя которого — sha256 от имени.
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                $hash = ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($ctxName)) |
+                         ForEach-Object { $_.ToString('x2') }) -join ''
+                $meta = Join-Path $env:USERPROFILE ".docker\contexts\meta\$hash\meta.json"
+                if (Test-Path $meta) {
+                    $m = Get-Content -Raw -LiteralPath $meta | ConvertFrom-Json
+                    if ($m.Endpoints -and $m.Endpoints.docker -and $m.Endpoints.docker.Host) {
+                        $endpoint = [string]$m.Endpoints.docker.Host
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    if ($endpoint -and $endpoint -notlike 'npipe:*') {
+        # Удалённый демон (tcp/ssh) каналом не проверить. Спрашиваем сам docker, но
+        # ОБЯЗАТЕЛЬНО с потолком времени: автозапуск Desktop здесь не грозит, а вот
+        # висящее сетевое подключение — вполне.
+        $r = Invoke-BcfDocker -DockerArgs @('version', '--format', '{{.Server.Version}}') -TimeoutSec 8
+        return [bool]$r.Ok
+    }
+
+    # npipe:////./pipe/dockerDesktopLinuxEngine -> dockerDesktopLinuxEngine
+    $wanted = ''
+    if ($endpoint -like 'npipe:*') { $wanted = ($endpoint -replace '.*[\\/]', '') }
+
     try {
         $pipes = [System.IO.Directory]::GetFiles('\\.\pipe\')
     } catch {
@@ -33,7 +74,9 @@ function Test-BcfDockerDaemon {
     }
     foreach ($p in $pipes) {
         $n = [IO.Path]::GetFileName($p)
-        if ($n -eq 'dockerDesktopLinuxEngine' -or $n -eq 'dockerDesktopEngine' -or $n -eq 'docker_engine') {
+        if ($wanted) {
+            if ($n -eq $wanted) { return $true }
+        } elseif ($n -eq 'dockerDesktopLinuxEngine' -or $n -eq 'dockerDesktopEngine' -or $n -eq 'docker_engine') {
             return $true
         }
     }
@@ -43,24 +86,88 @@ function Test-BcfDockerDaemon {
 # Вызов docker с жёстким потолком времени. Нужен там, где демон уже отвечает: даже живой
 # docker inspect может залипнуть на переключении контекста, а прогон, молчащий минутами,
 # неотличим от сломанного.
+# Аргументы с пробелами ОБЯЗАНЫ быть в кавычках: Start-Process отдаёт их через командную
+# строку Windows и сам не экранирует. Без этого `--format '{{.Names}} {{.State}}'` уезжает
+# двумя аргументами, docker падает на разборе за доли секунды и отвечает «accepts no
+# arguments» — снаружи неотличимо от «демон не ответил». Тот же дефект уже ловили в
+# клиенте памяти (см. _GMemPython в graph-memory.ps1), и он повторяется всюду, где
+# Start-Process зовут с готовым списком.
+function _BcfQuoteArgs {
+    param([string[]]$A)
+    return @($A | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    })
+}
+
 function Invoke-BcfDocker {
     param([Parameter(Mandatory)][string[]]$DockerArgs, [int]$TimeoutSec = 15)
 
     $out = [IO.Path]::GetTempFileName()
     $err = [IO.Path]::GetTempFileName()
     try {
-        $p = Start-Process -FilePath 'docker' -ArgumentList $DockerArgs -NoNewWindow -PassThru `
+        $p = Start-Process -FilePath 'docker' -ArgumentList (_BcfQuoteArgs $DockerArgs) -NoNewWindow -PassThru `
                            -RedirectStandardOutput $out -RedirectStandardError $err
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             try { $p.Kill($true) } catch { }
-            return @{ Ok = $false; Out = ''; TimedOut = $true }
+            return @{ Ok = $false; Out = ''; Err = "не ответил за ${TimeoutSec}с"; TimedOut = $true }
         }
         $text = ''
         if (Test-Path $out) { $text = (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue) }
-        return @{ Ok = ($p.ExitCode -eq 0); Out = [string]$text; TimedOut = $false }
+        # stderr ВОЗВРАЩАЕМ, а не выбрасываем. Пока он молча удалялся в finally, вызывающий
+        # не мог напечатать настоящую причину отказа и подставлял свою — «не поднялся за
+        # 45с» вместо «нет доступа к реестру» или «порт занят».
+        $e = ''
+        if (Test-Path $err) { $e = (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue) }
+        # Приводим ЯВНО. Get-Content -Raw на пустом файле не возвращает пустую строку — он
+        # не возвращает ничего, и поле уезжает в $null. Вызывающий делает .Trim() на
+        # причине отказа и падает ровно там, где пытался её напечатать.
+        if ($null -eq $text) { $text = '' }
+        if ($null -eq $e) { $e = '' }
+        return @{ Ok = ($p.ExitCode -eq 0); Out = "$text"; Err = "$e"; TimedOut = $false }
     } catch {
-        return @{ Ok = $false; Out = ''; TimedOut = $false }
+        return @{ Ok = $false; Out = ''; Err = $_.Exception.Message; TimedOut = $false }
     } finally {
         Remove-Item $out, $err -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Долгая операция docker, ход которой ВИДНО. Для compose up и pull: они идут минутами, и
+# потолок времени тут не решение — решение показывать, что происходит. Прогон, молчащий
+# пять минут, неотличим от зависшего, и именно так его и воспринимают.
+function Invoke-BcfDockerStreamed {
+    param([Parameter(Mandatory)][string[]]$DockerArgs, [int]$TimeoutSec = 900, [string]$Prefix = '[docker]')
+
+    $log = [IO.Path]::GetTempFileName()
+    $elog = "$log.err"
+    try {
+        $p = Start-Process -FilePath 'docker' -ArgumentList (_BcfQuoteArgs $DockerArgs) -NoNewWindow -PassThru `
+                           -RedirectStandardOutput $log -RedirectStandardError $elog
+        $shown = 0
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        while (-not $p.HasExited) {
+            Start-Sleep -Milliseconds 700
+            try {
+                $lines = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)
+                for ($i = $shown; $i -lt $lines.Count; $i++) { Write-Host "  $Prefix $($lines[$i])" -ForegroundColor DarkGray }
+                $shown = $lines.Count
+            } catch { }
+            if ((Get-Date) -gt $deadline) {
+                try { $p.Kill($true) } catch { }
+                return @{ Ok = $false; Err = "не завершилось за ${TimeoutSec}с"; TimedOut = $true }
+            }
+        }
+        $p.WaitForExit()
+        $e = ''
+        if (Test-Path $elog) { $e = (Get-Content -LiteralPath $elog -Raw -ErrorAction SilentlyContinue) }
+        # У compose ход работы идёт в stderr — это не ошибка, а прогресс. Печатаем его,
+        # чтобы человек видел загрузку образа, а не пустой экран.
+        foreach ($l in (($e -split "`r?`n") | Where-Object { $_.Trim() })) {
+            Write-Host "  $Prefix $l" -ForegroundColor DarkGray
+        }
+        return @{ Ok = ($p.ExitCode -eq 0); Err = [string]$e; TimedOut = $false }
+    } catch {
+        return @{ Ok = $false; Err = $_.Exception.Message; TimedOut = $false }
+    } finally {
+        Remove-Item $log, $elog -Force -ErrorAction SilentlyContinue
     }
 }

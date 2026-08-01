@@ -405,7 +405,11 @@ if ($Task) {
 if (!(Get-Command $AgentBin -ErrorAction SilentlyContinue)) {
   Log "ОШИБКА: агент '$AgentBin' (из config/harness.json agent.command) не найден в PATH."; exit 1
 }
-$hasBash = [bool](Get-Command bash -ErrorAction SilentlyContinue)
+# Не `Get-Command bash`: под Windows это чаще всего лаунчер WSL, который на
+# неинициализированном дистрибутиве уходит в интерактивную настройку и блокируется
+# на stdin — цикл встаёт между итерациями навсегда. См. Get-BcfBash.
+$bcfBash = Get-BcfBash
+$hasBash = [bool]$bcfBash
 if (-not $hasBash) { Log "ПРЕДУПРЕЖДЕНИЕ: 'bash' не найден — done-gate.sh пропускается." }
 
 # opencode desktop пробрасывает в дочерние процессы ссылку на свою сессию через OPENCODE_*
@@ -879,7 +883,7 @@ $culprit
   }
   $lastTscExit = $tscExit
   if ($hasBash) {
-    $dgOut = & bash ".claude/hooks/done-gate.sh" 2>&1
+    $dgOut = & $bcfBash ".claude/hooks/done-gate.sh" 2>&1
     if ($LASTEXITCODE -ne 0) {
       $bp += "done-gate.sh BLOCK (exit $LASTEXITCODE):`n" + (($dgOut | Select-Object -Last 10) -join "`n")
       Append-Event -EventType 'done-gate-blocked' -TaskId $focus -Phase 'B' -Iteration $i `

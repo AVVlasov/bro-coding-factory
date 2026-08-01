@@ -52,13 +52,24 @@ function Build-Board {
 
     $L = New-Object 'System.Collections.Generic.List[object]'
     if (-not $Run) {
-        $L.Add(@{ t = '  прогонов ещё не было'; c = 'DarkGray' })
-        $L.Add(@{ t = '  запустить: bcf run queue'; c = 'DarkGray' })
+        # Опечатка в id и пустая история — РАЗНЫЕ вещи. Пока их путали, `bcf watch
+        # <опечатка>` уверял человека с полусотней журналов, что прогонов ещё не было,
+        # предлагал запустить первый и выходил с нулём.
+        if ($runId) {
+            $L.Add(@{ t = "  прогон $runId не найден"; c = 'Yellow' })
+            $L.Add(@{ t = '  список: bcf runs'; c = 'DarkGray' })
+        } else {
+            $L.Add(@{ t = '  прогонов ещё не было'; c = 'DarkGray' })
+            $L.Add(@{ t = '  запустить: bcf run queue'; c = 'DarkGray' })
+        }
         return $L.ToArray()
     }
 
     $age = (Get-Date) - $Run.Finished
-    $live = (-not $Run.Complete) -and ($age.TotalSeconds -lt $LIVE_SEC)
+    # Живость — по пульсу воркеров И журналу. Один журнал недостаточен: между node-start
+    # и node-finish в него не пишется ничего, а узел думает до получаса.
+    $pulse = Get-BcfFleetPulse -Project $project
+    $live = Test-BcfRunLive -Run $Run -Project $project -WithinSec $LIVE_SEC
     $elapsed = if ($live) { (Get-Date) - $Run.Started } else { $Run.Duration }
 
     # «Завершён» ≠ «сделал дело». Узлы могут отработать все до одного, а очередь остаться
@@ -114,6 +125,11 @@ function Build-Board {
             $i++
         }
         if ($running.Count -gt 8) { $L.Add(@{ t = "     ещё $($running.Count - 8) узлов"; c = 'DarkGray' }) }
+        # Подробность из реестра воркеров: сколько узел уже идёт и сколько молчит его
+        # поток. Именно это отвечает на вопрос «оно думает или повисло».
+        if ($live -and $pulse -and $pulse.Detail) {
+            $L.Add(@{ t = "     пульс: $($pulse.Detail)"; c = 'DarkGray' })
+        }
         $L.Add('')
     }
 

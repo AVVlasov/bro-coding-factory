@@ -85,9 +85,21 @@ function Format-BcfDuration {
     param($Span)
     if ($null -eq $Span) { return '  --  ' }
     if ($Span -isnot [timespan]) { $Span = [timespan]$Span }
-    if ($Span.TotalDays -ge 1) { return ('{0}д {1:00}:{2:00}' -f [int]$Span.TotalDays, $Span.Hours, $Span.Minutes) }
-    if ($Span.TotalHours -ge 1) { return ('{0:hh\:mm\:ss}' -f $Span) }
-    return ('{0:mm\:ss}' -f $Span)
+
+    # Знак несём сами: пользовательские форматы TimeSpan в .NET его НЕ печатают, и
+    # отрицательный интервал выходил положительным — «-00:05:30» превращалось в «05:30».
+    # Отрицательная длительность означает, что времена разъехались (например, Started
+    # уехал вперёд Finished), и молчать об этом нельзя: беззнаковый вывод выглядит
+    # нормальным числом, по которому делают выводы.
+    $sign = if ($Span.Ticks -lt 0) { '-' } else { '' }
+    $a = if ($Span.Ticks -lt 0) { $Span.Negate() } else { $Span }
+
+    # Дни ОТБРАСЫВАЕМ, а не округляем: [int] в PowerShell округляет к ближайшему, и любой
+    # интервал с остатком ≥ 12 часов получал лишний день — «1д 21:36» печаталось как
+    # «2д 21:36», прямо противореча часам рядом.
+    if ($a.TotalDays -ge 1) { return ('{0}{1}д {2:00}:{3:00}' -f $sign, [int][math]::Floor($a.TotalDays), $a.Hours, $a.Minutes) }
+    if ($a.TotalHours -ge 1) { return ($sign + ('{0:hh\:mm\:ss}' -f $a)) }
+    return ($sign + ('{0:mm\:ss}' -f $a))
 }
 
 function Fit-BcfWidth {

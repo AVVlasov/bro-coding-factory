@@ -151,7 +151,7 @@ function Write-BcfBanner {
         $age = (Get-Date) - $r.Finished
         # «Идёт» определяем по свежести журнала, а не по файлу-маркеру: маркер переживает
         # падение процесса и потом сутками уверяет, что прогон работает.
-        if (-not $r.Complete -and $age.TotalSeconds -lt 90) {
+        if (Test-BcfRunLive -Run $r -Project $Status.Project) {
             Write-BcfLine ("  {0,-10} идёт: {1} · узлов {2} · {3} (bcf watch · bcf stop)" -f `
                            'прогон', $r.Name, $r.NodeCount, (Format-BcfDuration ((Get-Date) - $r.Started))) 'Cyan'
         } elseif (-not $r.Complete) {

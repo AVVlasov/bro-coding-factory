@@ -145,12 +145,23 @@ if ($node) {
     Write-BcfLine "  $base" 'White'
 }
 
-function _Show { param([string]$Path, [string]$Head, [int]$Tail = 0)
+function _Show { param([string]$Path, [string]$Head, [int]$Limit = 0)
     if (-not (Test-BcfHasContent $Path)) { return $false }
     Write-Host ''
     Write-BcfLine "  $Head" 'White'
-    $lines = if ($Tail) { Get-Content -LiteralPath $Path -Tail $Tail -Encoding UTF8 } else { Get-Content -LiteralPath $Path -Encoding UTF8 }
-    foreach ($l in $lines) { Write-Host "  $l" }
+    $all = @(Get-Content -LiteralPath $Path -Encoding UTF8)
+    if (-not $Limit -or $all.Count -le $Limit) {
+        foreach ($l in $all) { Write-Host "  $l" }
+        return $true
+    }
+    # Урезаем с СЕРЕДИНЫ, а не с начала. Причина отказа почти всегда в первых строках
+    # («model not found», отказ авторизации), а хвост — трасса. Показывать один хвост
+    # значит спрятать причину; и молчать о том, что часть выброшена, тоже нельзя.
+    $head = [math]::Max(10, [int]($Limit / 3))
+    $tail = $Limit - $head
+    foreach ($l in ($all | Select-Object -First $head)) { Write-Host "  $l" }
+    Write-BcfDim ("… пропущено строк: {0} (целиком — {1})" -f ($all.Count - $Limit), (Split-Path $Path -Leaf))
+    foreach ($l in ($all | Select-Object -Last $tail)) { Write-Host "  $l" }
     return $true
 }
 
@@ -173,7 +184,11 @@ if (Test-Path $outTxt) {
     if (-not (_Show $outTxt 'ВЫВОД КОМАНДЫ' 200)) { Write-BcfDim '  вывод пуст' }
 } elseif (Test-Path $outJsonl) {
     if ($raw) {
-        _Show $outJsonl 'ПОТОК БЭКЕНДА (как есть)' 200 | Out-Null
+        # БЕЗ Tail. Флаг обещает «файл как есть», и урезанный хвост под этим обещанием —
+        # худший из вариантов: причина падения обычно в ПЕРВЫХ строках (model not found,
+        # отказ авторизации), а следом идут сотни строк трассы. Показав хвост, команда
+        # уводит от причины и делает это молча.
+        _Show $outJsonl 'ПОТОК БЭКЕНДА (как есть)' | Out-Null
     } else {
         # Достаём текст из потока событий. У каждой CLI своя схема, поэтому берём все
         # известные формы, а не одну: задача — показать ответ, а не разобрать протокол.

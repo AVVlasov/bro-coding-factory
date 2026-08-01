@@ -130,7 +130,10 @@ if ($Board) {
     foreach ($l in (Get-Content -LiteralPath $jf -Encoding UTF8)) {
         if ($l -match '"event":"run-start"') { try { $o = $l | ConvertFrom-Json; if ($o.name) { $nm = $o.name }; if ($o.ts) { $started = [datetime]$o.ts } } catch { } ; break }
     }
-    Initialize-GraphRun -Root $root -Meta @{ name = $nm; description = '' } -RunId $runId -MaxConcurrency 1 | Out-Null
+    # ТОЛЬКО ЧТЕНИЕ. Показ доски — команда для просмотра, и писать в журнал она не
+    # должна: второй run-start сдвигал время старта показываемого прогона на «сейчас»,
+    # после чего его длительность становилась отрицательной во всех отчётах.
+    Initialize-GraphRun -Root $root -Meta @{ name = $nm; description = '' } -RunId $runId -MaxConcurrency 1 -ReadOnly | Out-Null
     $script:GraphCtx.Journal = $jf
     $script:GraphCtx.StartedAt = $started
 
@@ -155,7 +158,12 @@ if ($Doctor) {
     . (Join-Path $PSScriptRoot 'lib\graph-runtime.ps1')
     . (Join-Path $PSScriptRoot 'lib\graph-memory.ps1')
 
-    $ctx = Initialize-GraphRun -Root $root -Meta @{ name = 'doctor'; description = 'проверка бэкендов' } -MaxConcurrency 1
+    # ПОМЕЧАЕМ прогон как пробу. Initialize-GraphRun безусловно заводит каталог и пишет
+    # run-start, а ветка -Doctor выходит, не вызывая Complete-GraphRun: в истории
+    # оставался вечный «оборванный» прогон, который становился ПОСЛЕДНИМ для всех
+    # экранов. Человек запускал проверку окружения и получал карточку с жёлтым
+    # «ОБОРВАН — работа задач осталась в ветках» про прогон, которого не было.
+    $ctx = Initialize-GraphRun -Root $root -Meta @{ name = 'doctor'; description = 'проверка бэкендов'; doctor = $true } -MaxConcurrency 1
     Write-Host "`nБэкенды графа:`n" -ForegroundColor Cyan
 
     $probeDir = Join-Path $ctx.Dir 'probe'

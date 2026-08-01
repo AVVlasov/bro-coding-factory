@@ -76,7 +76,14 @@ function Ensure-LmStudioEmbedding {
     try { Invoke-RestMethod -Uri $modelsUrl -TimeoutSec 4 | Out-Null; $serverUp = $true } catch { $serverUp = $false }
     if (-not $serverUp) {
         Write-Host "[memory] LM Studio сервер недоступен ($modelsUrl) — lms server start..." -ForegroundColor Yellow
-        & lms server start 2>&1 | Out-Null
+        # Запускаем ФОНОМ: синхронный вызов здесь тоже ничем не ограничен, а ждать мы и
+        # так умеем — поллингом endpoint ниже, у которого потолок настоящий.
+        try {
+            Start-Process -FilePath 'lms' -ArgumentList @('server', 'start') -NoNewWindow -PassThru | Out-Null
+        } catch {
+            Write-Host "[memory] ⚠ не удалось запустить lms: $($_.Exception.Message)" -ForegroundColor Red
+            return $false
+        }
         $deadline = (Get-Date).AddSeconds(15)
         do {
             Start-Sleep -Seconds 2
@@ -90,36 +97,74 @@ function Ensure-LmStudioEmbedding {
 
     # 3. Модель не загружена → грузим РОВНО ОДИН раз (guard из шага 1 гарантирует
     #    отсутствие дубля). --yes подавляет интерактивный prompt выбора конфига.
-    Write-Host "[memory] эмбеддинг-модель '$model' не загружена — lms load..." -ForegroundColor Yellow
-    & lms load $model --yes 2>&1 | Out-Null
+    # ЗАГРУЗКА ИДЁТ ФОНОМ, А ЖДЁМ МЫ ПО ЧАСАМ.
+    #
+    # `& lms load … | Out-Null` — синхронный вызов: он тянет несколько гигабайт в VRAM и
+    # возвращается только по окончании. Дедлайн заводился СТРОКОЙ НИЖЕ, то есть не
+    # ограничивал ничего, а сообщение «не удалось загрузить за ${TimeoutSec}s» называло
+    # время, которое ничего не измеряло. Плюс весь прогресс `lms` уничтожался Out-Null, и
+    # прогон стоял молча минуты. Теперь процесс запускается отдельно, а ожидание —
+    # честное, с потолком и с отметками, что загрузка идёт.
+    Write-Host "[memory] эмбеддинг-модель '$model' не загружена — lms load (это минуты: модель едет с диска в память)..." -ForegroundColor Yellow
+    $loadLog = [IO.Path]::GetTempFileName()
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath 'lms' -ArgumentList @('load', $model, '--yes') -NoNewWindow -PassThru `
+                              -RedirectStandardOutput $loadLog -RedirectStandardError "$loadLog.err"
+    } catch {
+        Write-Host "[memory] ⚠ не удалось запустить lms: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $psOut = ''
+    $tick = 0
     do {
         Start-Sleep -Seconds 2
+        $tick += 2
         $psOut = (& lms ps 2>$null | Out-String)
-    } while (($psOut -notmatch [regex]::Escape($model)) -and (Get-Date) -lt $deadline)
+        if ($psOut -match [regex]::Escape($model)) { break }
+        # Каждые полминуты говорим, что живы: молчащая на минуты команда читается как
+        # зависшая, и её убивают ровно перед тем, как она бы закончила.
+        if ($tick % 30 -eq 0) { Write-Host "[memory]   всё ещё гружу '$model' ($tick с из $TimeoutSec)…" -ForegroundColor DarkGray }
+    } while ((Get-Date) -lt $deadline)
 
     if ($psOut -match [regex]::Escape($model)) {
         Write-Host "[memory] ✅ эмбеддинг-модель '$model' загружена." -ForegroundColor Green
         return $true
     }
+
+    # Не уложились — снимаем зависшую загрузку и печатаем НАСТОЯЩУЮ причину, а не только
+    # время: stderr до сих пор молча выбрасывался.
+    if ($proc -and -not $proc.HasExited) { try { $proc.Kill($true) } catch { } }
+    $why = ''
+    try { if (Test-Path "$loadLog.err") { $why = (Get-Content -Raw -LiteralPath "$loadLog.err" -EA SilentlyContinue) } } catch { }
+    Remove-Item $loadLog, "$loadLog.err" -Force -ErrorAction SilentlyContinue
     Write-Host "[memory] ⚠ не удалось загрузить '$model' за ${TimeoutSec}s — recall/upsert будут падать. Загрузи вручную: lms load $model" -ForegroundColor Red
+    if ($why.Trim()) { Write-Host "[memory]    lms сказал: $(($why -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join ' ')" -ForegroundColor DarkGray }
     return $false
 }
 
 . (Join-Path $PSScriptRoot 'docker.ps1')
 
 function Get-M13Health {
-    # 'healthy'|'starting'|'unhealthy'|'stopped'|'absent'|'no-daemon'|'no-docker'.
+    # 'healthy'|'starting'|'unhealthy'|'stopped'|'absent'|'no-response'|'no-daemon'|'no-docker'.
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return 'no-docker' }
     # НЕ `docker version`: на Windows он не падает, а ЗАПУСКАЕТ Docker Desktop и ждёт его
     # — прогон вис минутами, ничего не печатая. Канал демона существует ровно тогда,
     # когда демон слушает, и проверка по нему ничего не запускает. См. lib/docker.ps1.
     if (-not (Test-BcfDockerDaemon)) { return 'no-daemon' }
     $r = Invoke-BcfDocker -DockerArgs @('inspect', '-f', '{{.State.Status}}', $script:MemContainer) -TimeoutSec 15
+    # ТАЙМАУТ — НЕ «КОНТЕЙНЕРА НЕТ». Пока их склеивали, подвисший или ещё
+    # инициализирующийся демон давал 'absent', и восстановление уходило поднимать
+    # контейнер, которого никто не проверял: потолок времени превращался во вход в
+    # новое зависание. Утверждать про контейнер что-либо, не получив ответа, нельзя.
+    if ($r.TimedOut) { return 'no-response' }
     $state = ([string]$r.Out).Trim()
     if (-not $r.Ok -or -not $state) { return 'absent' }
     if ($state -ne 'running') { return 'stopped' }
     $r2 = Invoke-BcfDocker -DockerArgs @('inspect', '-f', '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}', $script:MemContainer) -TimeoutSec 15
+    if ($r2.TimedOut) { return 'no-response' }
     $h = ([string]$r2.Out).Trim()
     if (-not $h -or $h -eq 'none') { return 'healthy' }   # без healthcheck — running считаем healthy
     return $h                                              # healthy | starting | unhealthy
@@ -185,14 +230,41 @@ function Ensure-M13Memory {
         Write-Host "[memory] ✅ демон Docker готов." -ForegroundColor Green
     }
 
+    # Демон не ответил — восстанавливать вслепую нельзя: мы не знаем, есть контейнер или
+    # нет, а `docker compose up -d` в этом состоянии уходит в тот же колодец.
+    if ($health -eq 'no-response') {
+        Write-Host "[memory] ⚠ docker не ответил за 15с (демон подвис или ещё инициализируется) — векторная память недоступна, цикл обучения ВЫКЛЮЧЕН." -ForegroundColor Red
+        Write-Host "[memory]    проверь вручную: docker ps --filter name=$($script:MemContainer)" -ForegroundColor DarkGray
+        return $false
+    }
+
     if ($health -ne 'healthy') {
         if ($health -eq 'stopped') {
             Write-Host "[memory] контейнер '$($script:MemContainer)' остановлен — docker start..." -ForegroundColor Yellow
-            & docker start $script:MemContainer 2>&1 | Out-Null
+            # С ПОТОЛКОМ и с причиной. Сырой `& docker start … | Out-Null` не ограничен по
+            # времени и уничтожает stderr: при отказе человек получал подменённый диагноз
+            # «pgvector не поднялся за 45s», не имеющий отношения к настоящей ошибке.
+            $st = Invoke-BcfDocker -DockerArgs @('start', $script:MemContainer) -TimeoutSec 60
+            if (-not $st.Ok) {
+                Write-Host "[memory] ⚠ docker start не отработал: $(($st.Err).Trim())" -ForegroundColor Red
+                return $false
+            }
         } elseif ($health -eq 'absent') {
             if (Test-Path $script:MemCompose) {
+                # Образ ещё не скачан? Тогда это не «секунды», а минуты загрузки ~450 МБ.
+                # Молчать об этом нельзя: прогон, замерший на пять минут без единой
+                # строки, читается как зависший — и его убивают.
+                $img = Invoke-BcfDocker -DockerArgs @('image', 'inspect', 'pgvector/pgvector:pg16') -TimeoutSec 15
+                if (-not $img.Ok) {
+                    Write-Host "[memory] образа pgvector/pgvector:pg16 нет локально — идёт загрузка (~450 МБ, это минуты)." -ForegroundColor Yellow
+                }
                 Write-Host "[memory] контейнер отсутствует — docker compose up -d ($script:MemCompose)..." -ForegroundColor Yellow
-                & docker compose -f $script:MemCompose up -d 2>&1 | Out-Null
+                $up = Invoke-BcfDockerStreamed -DockerArgs @('compose', '-f', $script:MemCompose, 'up', '-d') -TimeoutSec 900 -Prefix '[memory]'
+                if (-not $up.Ok) {
+                    Write-Host "[memory] ⚠ docker compose up не отработал: $(($up.Err).Trim())" -ForegroundColor Red
+                    Write-Host "[memory]    повтори вручную: docker compose -f `"$script:MemCompose`" up -d" -ForegroundColor DarkGray
+                    return $false
+                }
             } else {
                 Write-Host "[memory] ⚠ контейнер отсутствует и compose-файл не найден ($script:MemCompose) — память недоступна." -ForegroundColor Red
                 return $false

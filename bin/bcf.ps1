@@ -78,7 +78,25 @@ $projectArg = ''
 for ($i = 0; $i -lt $argv.Count; $i++) {
     $a = [string]$argv[$i]
     switch -Regex ($a) {
-        '^(--project|-p)$' { $i++; $projectArg = [string]$argv[$i]; continue }
+        # Значение ОБЯЗАТЕЛЬНО. Индекс за границей массива в PowerShell не ошибка — он
+        # возвращает $null, [string]$null даёт пустую строку, и явно указанный --project
+        # молча превращался в своё отсутствие: проект брался из текущего каталога.
+        # `bcf install --project` (значение потерялось при копировании строки) записывал
+        # обвязку в тот каталог, где человек стоял, и рапортовал об успехе.
+        '^(--project|-p)$' {
+            $i++
+            $v = if ($i -lt $argv.Count) { [string]$argv[$i] } else { '' }
+            if (-not $v -or $v.StartsWith('-')) {
+                Write-Host ''
+                Write-Host "  У флага $a нет значения." -ForegroundColor Red
+                Write-Host '  Без пути команда взяла бы ТЕКУЩИЙ каталог — и записала бы обвязку в него.' -ForegroundColor DarkGray
+                Write-Host '  Укажи путь: bcf <команда> --project D:\путь\к\проекту' -ForegroundColor DarkGray
+                Write-Host ''
+                exit 2
+            }
+            $projectArg = $v
+            continue
+        }
         '^--project=(.+)$' { $projectArg = $Matches[1]; continue }
         '^(--yes|-y)$'     { Set-BcfAssumeYes $true; continue }
         '^--no-color$'     { $env:BCF_NO_COLOR = '1'; $script:BcfNoColor = $true; continue }

@@ -277,7 +277,28 @@ switch ($sub) {
 }
 
 'down' {
+    # Проба демона ОБЯЗАТЕЛЬНА, как и в init. Без неё `bcf memory down` при закрытом
+    # Docker Desktop сам его ЗАПУСКАЕТ и ждёт минуты — то есть команда «останови»
+    # поднимает приложение, которое её об этом не просили.
+    . (Join-Path (Get-BcfHarness) 'lib\docker.ps1')
+    if (-not (Test-BcfDockerDaemon)) {
+        Write-BcfDim 'демон Docker не отвечает — останавливать нечего'
+        Write-BcfNote 'Docker Desktop не запущен, значит и контейнер не работает; данные в memory/pgvector/data на месте.'
+        Write-BcfNote 'сам Docker Desktop не поднимаем: старт занимает минуты, и команда выглядела бы зависшей.'
+        Write-Host ''
+        exit 0
+    }
+    if (-not (Test-Path $compose)) { Write-BcfFail "compose-файл не найден: $compose"; exit 2 }
+
     & docker compose -f $compose down 2>&1 | ForEach-Object { Write-BcfNote $_ }
+    # Код возврата проверяем ДО слова «остановлен»: раньше строка успеха печаталась
+    # безусловно, и отказ compose (чужой контекст, занятый ресурс) выглядел как успех.
+    if ($LASTEXITCODE -ne 0) {
+        Write-BcfFail 'docker compose down не отработал — контейнер, вероятно, ещё работает'
+        Write-BcfNote "проверь: docker ps --filter name=bcf-agent-memory"
+        Write-Host ''
+        exit 1
+    }
     Write-BcfOk 'контейнер остановлен, данные остались в memory/pgvector/data'
     exit 0
 }

@@ -48,3 +48,33 @@ function Get-BcfHomeRoot {
     if ($env:BCF_HOME) { return $env:BCF_HOME.TrimEnd('\', '/') }
     return (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent)
 }
+
+# Какой bash звать под Windows.
+#
+# `bash` из PATH — НЕ тот, о котором думает автор хука. Первым там обычно стоит
+# C:\Windows\System32\bash.exe — это лаунчер WSL, а не POSIX-оболочка для репозитория.
+# Если дистрибутив ещё не инициализирован, первый запуск уходит в интерактивную настройку
+# («Enter new UNIX username:») и блокируется на stdin — цикл встаёт МЕЖДУ итерациями
+# навсегда, не напечатав ни строки. Если дистрибутива нет вовсе, он возвращает ненулевой
+# код, и хук выглядит провалившимся, хотя не запускался.
+#
+# Порядок: BCF_BASH (явная воля владельца) → Git Bash → любой bash из PATH, кроме WSL.
+function Get-BcfBash {
+    if ($env:BCF_BASH -and (Test-Path $env:BCF_BASH)) { return $env:BCF_BASH }
+
+    foreach ($c in @(
+        (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe')
+    )) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+
+    foreach ($cmd in @(Get-Command bash -All -ErrorAction SilentlyContinue)) {
+        $src = [string]$cmd.Source
+        if (-not $src) { continue }
+        if ($src -match '(?i)\\Windows\\(System32|SysWOW64)\\bash\.exe$') { continue }   # это WSL
+        return $src
+    }
+    return ''
+}

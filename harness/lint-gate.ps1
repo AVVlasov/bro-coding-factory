@@ -174,7 +174,8 @@ if (Test-Path $structSpec) {
 # ----------------------------------------------------------------------------
 $detectorPath = if ($env:BCF_NONTARGET_DETECTOR) { $env:BCF_NONTARGET_DETECTOR } else { Join-Path $Repo 'hooks\non-target-script-detector.sh' }
 # bash: env BCF_BASH, иначе ищем в PATH (Get-Command). Опционально — детектор может отсутствовать.
-$gitBash = if ($env:BCF_BASH) { $env:BCF_BASH } else { (Get-Command bash -ErrorAction SilentlyContinue).Source }
+. (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+$gitBash = Get-BcfBash
 if ((Test-Path $detectorPath) -and $gitBash -and (Test-Path $gitBash)) {
     $targets = @()
     foreach ($d in $ProductPaths) {

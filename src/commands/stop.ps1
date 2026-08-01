@@ -41,13 +41,39 @@ if ($clear) {
 # Что вообще сейчас происходит. Команда, которая молча создаёт файл, не отвечает на
 # главный вопрос: было ли что останавливать.
 $run = Get-BcfLastRun -Project $project
-$live = $run -and (-not $run.Complete) -and (((Get-Date) - $run.Finished).TotalSeconds -lt 90)
+# Живость — по пульсу воркеров тоже: между node-start и node-finish журнал молчит,
+# и по нему одному идущий прогон выглядит оборванным уже через полторы минуты.
+$live = $run -and (Test-BcfRunLive -Run $run -Project $project)
+
+# СЕБЯ И СВОИХ РОДИТЕЛЕЙ В СПИСОК НЕ БЕРЁМ.
+#
+# Отбор идёт по «путь проекта встречается в командной строке», а у самой команды
+# `bcf stop --now --project D:\proj` он там, разумеется, есть — как и у оболочки, из
+# которой её запустили. Цикл снятия доходил до собственного PID и убивал сам себя:
+# часть агентов оставалась жить, итоговая строка не печаталась вовсе, и снаружи это
+# выглядело как «аварийный тормоз сработал».
+$selfChain = @{}
+try {
+    $pid_ = $PID
+    for ($d = 0; $d -lt 8 -and $pid_; $d++) {
+        $selfChain[$pid_] = $true
+        $pp = Get-CimInstance Win32_Process -Filter "ProcessId=$pid_" -ErrorAction SilentlyContinue
+        if (-not $pp) { break }
+        $pid_ = [int]$pp.ParentProcessId
+    }
+} catch { $selfChain[$PID] = $true }
+
+# Смотрелки — не агенты. `bcf watch` в соседнем окне подходит под тот же отбор, но
+# снимать читателя журнала бессмысленно и обидно.
+$viewers = 'bcf\.ps1["'']?\s+(watch|board|report|runs|log|tasks|cost|stop)\b'
 
 $procs = @()
 try {
     $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($project) -and
-                              $_.Name -match 'pwsh|powershell|node|python|claude|opencode|codex|cursor-agent' })
+                              $_.Name -match 'pwsh|powershell|node|python|claude|opencode|codex|cursor-agent' -and
+                              -not $selfChain.ContainsKey([int]$_.ProcessId) -and
+                              $_.CommandLine -notmatch $viewers })
 } catch { }
 
 if ($live) {
@@ -106,12 +132,37 @@ if (-not (Get-BcfAssumeYes)) {
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 Set-Content -LiteralPath $stopFile -Value (Get-Date -Format 'o') -Encoding UTF8
 
+# Отказ снятия НЕ глотаем. Пустой catch превращал «восемь агентов отказались умирать» в
+# зелёное «снято процессов: 0»: человек уходил уверенный, что тормоз сработал, а прогон
+# продолжал писать в дерево. Аварийная команда обязана говорить, что не сработала.
 $killed = 0
+$stubborn = @()
 foreach ($p in $procs) {
-    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $killed++ } catch { }
+    try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $killed++ }
+    catch { $stubborn += [pscustomobject]@{ Pid = $p.ProcessId; Name = $p.Name; Why = $_.Exception.Message } }
 }
+
 Write-Host ''
-Write-BcfOk "снято процессов: $killed"
+if ($killed) { Write-BcfOk "снято процессов: $killed" }
+
+if ($stubborn.Count) {
+    Write-BcfFail "НЕ снято: $($stubborn.Count) — эти процессы продолжают работать"
+    foreach ($s in ($stubborn | Select-Object -First 8)) {
+        Write-BcfNote ("pid {0,-7} {1,-12} {2}" -f $s.Pid, $s.Name, (($s.Why -split "`r?`n")[0]))
+    }
+    Write-BcfNote 'чаще всего это права: процесс запущен из другой сессии или с повышением.'
+    Write-BcfNote 'сними их вручную (Диспетчер задач) или повтори из той же сессии, где они стартовали.'
+    Write-BcfNote 'запрос на остановку .bcf/STOP уже записан — следующую задачу оркестратор не возьмёт.'
+    Write-Host ''
+    exit 1
+}
+
+if (-not $killed) {
+    Write-BcfDim 'снимать оказалось нечего — процессы завершились сами, пока команда спрашивала'
+    Write-Host ''
+    exit 0
+}
+
 Write-BcfNote 'заявки на файлы: bcf tasks покажет коллизии; снять руками — .bcf/fleet/claims.json'
 Write-BcfNote 'вернуть возможность запуска: bcf stop --clear'
 Write-Host ''
