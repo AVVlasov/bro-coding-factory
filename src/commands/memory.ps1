@@ -4,7 +4,7 @@
 #   bcf memory init        поднять pgvector, применить схему, включить в конфиге проекта
 #   bcf memory ask <текст> что память помнит по этому поводу
 #   bcf memory stats       то же, что status, но JSON
-#   bcf memory down        остановить контейнер (данные остаются)
+#   bcf memory down        убрать контейнер; данные остаются на диске, init поднимет заново
 #
 # ПОЧЕМУ ЭТО ВАЖНЕЕ, ЧЕМ ВЫГЛЯДИТ. Без памяти каждый прогон начинается с нуля: один и тот
 # же провал повторяется столько раз, сколько раз запущен цикл. С памятью — провал узла,
@@ -91,6 +91,41 @@ switch ($sub) {
         Write-Host ''
         exit 1
     }
+    # ЭМБЕДДИНГИ ПРОВЕРЯЕМ ТОЖЕ. База и сервер эмбеддингов отказывают НЕЗАВИСИМО, а
+    # выглядит это одинаково: «память недоступна» на прогоне при полностью живом
+    # контейнере. Пока проба стояла только в `memory init`, статус показывал зелёную базу
+    # и правильные числа — то есть отвечал «всё хорошо» на вопрос «почему не работает».
+    $cfgFile = Join-Path (Get-BcfMemoryDir) 'memory.config.json'
+    $endpoint = 'http://localhost:1234/v1/embeddings'
+    $model = ''
+    $mc = $null
+    if (Test-Path $cfgFile) {
+        try {
+            $mc = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+            if ($mc.embedding_endpoint) { $endpoint = [string]$mc.embedding_endpoint }
+            if ($mc.embedding_model) { $model = [string]$mc.embedding_model }
+        } catch { }
+    }
+    try {
+        $body = @{ model = $model; input = 'probe' } | ConvertTo-Json
+        $resp = Invoke-RestMethod -Uri $endpoint -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15
+        $dim = @($resp.data[0].embedding).Count
+        if ($dim -gt 0) {
+            Write-BcfOk "эмбеддинги отвечают: $model, размерность $dim"
+            if ($mc -and $mc.embedding_dim -and [int]$mc.embedding_dim -ne $dim) {
+                Write-BcfFail "размерность НЕ совпадает со схемой ($($mc.embedding_dim)) — записи отвергаются базой"
+                Write-BcfNote "поправь embedding_dim в $cfgFile или загрузи модель нужной размерности."
+            }
+        } else {
+            Write-BcfFail 'сервер эмбеддингов ответил пустым вектором — отзыв работать не будет'
+        }
+    } catch {
+        Write-BcfFail "сервер эмбеддингов не отвечает: $endpoint"
+        Write-BcfNote 'база жива, но отзыв считает эмбеддинг запроса — без сервера recall не работает,'
+        Write-BcfNote 'и на прогоне это выглядит как «память недоступна» при исправном контейнере.'
+        Write-BcfNote "подними любой OpenAI-совместимый /v1/embeddings и загрузи модель $model."
+    }
+
     $ap = [int]$st.anti_patterns
     $week = $st.anti_patterns_last_7d
     if ($ap -le 1) {

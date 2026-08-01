@@ -144,6 +144,33 @@ It 'проба демона docker отвечает мгновенно и нич
     Assert-True (-not $call.Success) 'в проверке здоровья снова вызывается docker version — на Windows он поднимает Docker Desktop и ждёт'
 }
 
+# Инструкция, обещающая несуществующую команду, — тот же дефект, что и врущий вывод:
+# человек делает по ней и получает «Неизвестная команда». Docs дрейфуют молча, поэтому
+# сверяем их с диспетчером механически.
+It 'команды из документации существуют' {
+    $known = @()
+    $disp = Get-Content -Raw -LiteralPath (Join-Path $root 'bin\bcf.ps1')
+    foreach ($m in [regex]::Matches($disp, "(?m)^\s+'([a-z-]+)'\s*=\s*@\{\s*file")) { $known += $m.Groups[1].Value }
+    Assert-True ($known.Count -gt 10) "в диспетчере нашлось всего $($known.Count) команд — сломался разбор"
+
+    # Подкоманды и флаги разбираются своими командами, диспетчер о них не знает.
+    $subs = @('new','why','show','loop','night','queue','review','init','status','ask','down',
+              'stats','list','register','audit','wiki','log')
+
+    $bad = @()
+    foreach ($doc in @('README.md', 'docs\WORKFLOW.md', 'docs\CLI.md', 'docs\SETUP.md')) {
+        $path = Join-Path $root $doc
+        if (-not (Test-Path $path)) { continue }
+        $text = Get-Content -Raw -LiteralPath $path
+        foreach ($m in [regex]::Matches($text, 'bcf ([a-z][a-z-]+)')) {
+            $c = $m.Groups[1].Value
+            if ($c -in $known -or $c -in $subs) { continue }
+            $bad += "$doc → bcf $c"
+        }
+    }
+    Assert-True (-not $bad.Count) ("документация обещает несуществующее: " + (($bad | Select-Object -Unique) -join '; '))
+}
+
 # --- Диспетчер -----------------------------------------------------------------------
 Write-Host '  диспетчер' -ForegroundColor White
 
