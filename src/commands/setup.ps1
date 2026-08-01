@@ -98,6 +98,56 @@ else {
     Write-BcfNote 'Windows не обновляет переменные в уже запущенных процессах — открой новое окно.'
 }
 
+# --- Автодополнение ---------------------------------------------------------------------
+#
+# Не украшение: команд уже под двадцать, и половина имеет подкоманды. Инструмент, в
+# котором надо помнить точное написание, используют на треть возможностей — остальное
+# просто не вспоминают. Дополнение ставится в профиль пользователя, потому что жить оно
+# должно между сессиями.
+$completer = @'
+
+# --- bcf: автодополнение (добавлено `bcf setup`) ---
+Register-ArgumentCompleter -Native -CommandName bcf -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $cmds = @('setup','update','init','install','migrate','doctor','detect','tasks','task',
+              'run','stop','watch','runs','board','report','cost','memory','research','prd','meta','help','version')
+    $subs = @{
+        run    = @('loop','night','queue','review')
+        task   = @('new','why','show')
+        memory = @('status','init','ask','stats','down')
+        meta   = @('list','register','audit','wiki','log')
+    }
+    $tokens = @($commandAst.CommandElements | Select-Object -Skip 1 | ForEach-Object { $_.ToString() } |
+                Where-Object { $_ -notlike '-*' })
+    if ($tokens.Count -ge 1 -and $subs.ContainsKey($tokens[0]) -and
+        ($tokens.Count -eq 1 -or ($tokens.Count -eq 2 -and $wordToComplete))) {
+        return $subs[$tokens[0]] | Where-Object { $_ -like "$wordToComplete*" } |
+               ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+    }
+    if ($tokens.Count -eq 0 -or ($tokens.Count -eq 1 -and $wordToComplete)) {
+        return $cmds | Where-Object { $_ -like "$wordToComplete*" } |
+               ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }
+    }
+}
+# --- /bcf ---
+'@
+
+$profilePath = $PROFILE.CurrentUserAllHosts
+$marker = '# --- bcf: автодополнение'
+$has = (Test-Path $profilePath) -and ((Get-Content -Raw -LiteralPath $profilePath) -match [regex]::Escape($marker))
+if ($has) {
+    Write-BcfOk 'автодополнение уже в профиле'
+} else {
+    try {
+        New-Item -ItemType Directory -Force -Path (Split-Path $profilePath -Parent) | Out-Null
+        Add-Content -LiteralPath $profilePath -Value $completer -Encoding UTF8
+        Write-BcfOk "автодополнение добавлено в профиль: $profilePath"
+        Write-BcfNote 'заработает в новых окнах — профиль читается при старте оболочки.'
+    } catch {
+        Write-BcfWarn "не удалось дописать профиль: $($_.Exception.Message)"
+    }
+}
+
 Write-Host ''
 Write-BcfLine '  ДАЛЬШЕ' 'White'
 Write-Host '    cd <путь к проекту>'

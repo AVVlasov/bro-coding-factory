@@ -60,7 +60,7 @@ if ($runId -or $graphAt -gt $loopAt) {
             elseif ($complete)     { "ГОТОВО   $($graphRun.Name)" }
             else                   { "НЕПОЛНО   $($graphRun.Name)" }
     Write-BcfTitle $head `
-                   ("{0} · узлов {1} · {2:hh\:mm\:ss} · {3} токенов" -f $graphRun.RunId, $graphRun.NodeCount, $graphRun.Duration, [int]$graphRun.Tokens)
+                   ("{0} · узлов {1} · {2} · {3} токенов" -f $graphRun.RunId, $graphRun.NodeCount, (Format-BcfDuration $graphRun.Duration), [int]$graphRun.Tokens)
 
     # Сухой прогон не исполнял НИ ОДНОГО узла, поэтому его «не закрыто» — свойство
     # режима, а не факт о задачах. Выдавать его за итог значит врать ровно тем способом,

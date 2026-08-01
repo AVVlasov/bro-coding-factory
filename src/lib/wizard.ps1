@@ -64,7 +64,7 @@ function Read-BcfListChoice {
         $L = New-Object 'System.Collections.Generic.List[object]'
         if ($Header) { foreach ($h in (& $Header)) { $L.Add($h) } }
         for ($i = 0; $i -lt $Items.Count; $i++) {
-            $mark = if ($i -eq $idx) { '▸' } else { ' ' }
+            $mark = if ($i -eq $idx) { Sym 'cursor' } else { ' ' }
             $c = if ($i -eq $idx) { 'Cyan' } elseif ($Items[$i].dim) { 'DarkGray' } else { '' }
             $L.Add(@{ t = ("  {0} {1}" -f $mark, $Items[$i].main); c = $c })
             if ($Items[$i].note) { $L.Add(@{ t = "      $($Items[$i].note)"; c = 'DarkGray' }) }

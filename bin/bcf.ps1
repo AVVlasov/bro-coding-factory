@@ -19,13 +19,18 @@ $BcfRoot = Split-Path $PSScriptRoot -Parent
 
 $COMMANDS = [ordered]@{
     'setup'    = @{ file = 'setup.ps1';    help = 'сделать команду bcf доступной из любого каталога (PATH)' }
+    'update'   = @{ file = 'update.ps1';   help = 'обновить саму фабрику и сказать, что это меняет для проектов' }
     'init'     = @{ file = 'init.ps1';     help = 'настроить фабрику под проект — восемь шагов, всё в текстовые файлы' }
     'install'  = @{ file = 'install.ps1';  help = 'записать/обновить обвязку в проекте: .claude, config, agents, tasks' }
     'migrate'  = @{ file = 'migrate.ps1';  help = 'перенести состояние прогонов из старого каталога loop/ в .bcf/' }
     'doctor'   = @{ file = 'doctor.ps1';   help = 'живая проба окружения: бэкенды, авторизации, память, проверки' }
     'detect'   = @{ file = 'detect.ps1';   help = 'разбор проекта: языки, сборка, тесты, git — ничего не пишет' }
     'tasks'    = @{ file = 'tasks.ps1';    help = 'бэклог: что готово к работе, что ждёт, что закрыто' }
+    'task'     = @{ file = 'task.ps1';     help = 'задача: new "<название>" | why <ID> | show <ID>' }
     'run'      = @{ file = 'run.ps1';      help = 'прогон: loop <TASK> | queue | review | night' }
+    'stop'     = @{ file = 'stop.ps1';     help = 'остановить прогон: мягко между задачами или --now' }
+    'log'      = @{ file = 'log.ps1';      help = 'что агент ответил: вывод узла, ошибки, промпт' }
+    'watch'    = @{ file = 'watch.ps1';    help = 'живая доска прогона: фазы, кто работает, токены, полоса' }
     'runs'     = @{ file = 'runs.ps1';     help = 'журналы прошлых прогонов графа' }
     'board'    = @{ file = 'board.ps1';    help = 'доска прогона: узлы, роли, стоимость' }
     'report'   = @{ file = 'report.ps1';   help = 'итог прогона одним экраном' }
@@ -52,6 +57,7 @@ function Show-BcfHelp {
     Write-Host '    --project <путь>   над каким проектом работать (по умолчанию — текущий репозиторий)'
     Write-Host '    --yes              не задавать вопросов: везде берётся значение по умолчанию'
     Write-Host '    --no-color         вывод без цвета'
+    Write-Host '    --ascii            только ASCII: для консолей, где нет ✓ ✗ ▸ в шрифте'
     Write-Host ''
     Write-BcfLine '  с чего начать' 'DarkGray'
     Write-Host '    bcf setup          сделать команду bcf доступной из любого каталога'
@@ -76,6 +82,7 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
         '^--project=(.+)$' { $projectArg = $Matches[1]; continue }
         '^(--yes|-y)$'     { Set-BcfAssumeYes $true; continue }
         '^--no-color$'     { $env:BCF_NO_COLOR = '1'; $script:BcfNoColor = $true; continue }
+        '^--ascii$'        { $env:BCF_ASCII = '1'; Set-BcfAscii $true; continue }
         '^(--help|-h)$'    { if (-not $cmd) { Show-BcfHelp; exit 0 } else { $rest += $a }; continue }
         '^(--version|-V)$' { Write-Host (Get-BcfVersion); exit 0 }
         default {
@@ -96,7 +103,33 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
 # показывает — человек всё равно идёт смотреть сам, а потом запускает по памяти.
 if (-not $cmd) { $cmd = 'launch' }
 if ($cmd -in @('help', '--help')) { Show-BcfHelp; exit 0 }
-if ($cmd -in @('version', '--version')) { Write-Host (Get-BcfVersion); exit 0 }
+if ($cmd -in @('version', '--version')) {
+    # Голая --version печатает ТОЛЬКО номер: её читают скрипты, и лишняя строка ломает их.
+    # `bcf version` — для человека: номер без коммита не отвечает на вопрос «а что у меня
+    # вообще стоит», когда фабрику правят локально.
+    Write-Host (Get-BcfVersion)
+    if ($cmd -eq 'version') {
+        $h = Get-BcfHome
+        $rev = ''; $br = ''; $dirty = 0
+        if (Test-Path (Join-Path $h '.git')) {
+            try {
+                $rev = (& git -C $h rev-parse --short HEAD 2>$null | Out-String).Trim()
+                $br  = (& git -C $h rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
+                $dirty = @(& git -C $h status --porcelain 2>$null | Where-Object { $_ }).Count
+            } catch { }
+        }
+        Write-BcfDim "фабрика: $h"
+        if ($rev) {
+            $suffix = if ($dirty) { " · $dirty локальных правок" } else { '' }
+            Write-BcfDim "версия:  $br $rev$suffix"
+        } else {
+            Write-BcfDim 'версия:  установлена не из git — обновление bcf update недоступно'
+        }
+        Write-BcfDim "pwsh:    $($PSVersionTable.PSVersion)"
+        Write-BcfDim 'новее ли есть — bcf update --check'
+    }
+    exit 0
+}
 
 if ($cmd -eq 'launch') { $COMMANDS['launch'] = @{ file = 'launch.ps1'; help = '' } }
 

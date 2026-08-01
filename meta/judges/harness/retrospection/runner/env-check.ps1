@@ -30,16 +30,16 @@ try {
 }
 
 # 3. Retrospector subagent
-$retroPath = '$(Join-Path $env:BCF_PROJECT_ROOT '.claudegentsetrospector.md')'
-if (-not (Test-Path $retroPath)) { $problems += "Missing subagent: $retroPath (C1)" }
+$retroPath = Join-Path $env:BCF_PROJECT_ROOT '.claude/agents/retrospector.md'
+$retroPath = Join-Path $env:BCF_PROJECT_ROOT '.claude/agents/retrospector.md'
 
 # 4. Subagent finding gate hook
-$gatePath = '$(Join-Path $env:BCF_PROJECT_ROOT '.claude\hooks\subagent-finding-gate.sh')'
-if (-not (Test-Path $gatePath)) { $problems += "Missing hook: $gatePath (C4)" }
+$gatePath = Join-Path $env:BCF_PROJECT_ROOT '.claude/hooks/subagent-finding-gate.sh'
+$gatePath = Join-Path $env:BCF_PROJECT_ROOT '.claude/hooks/subagent-finding-gate.sh'
 
 # 5. Memory inject hook
-$injectPath = '$(Join-Path $env:BCF_PROJECT_ROOT '.claude\hooks\pre-task-memory-inject.sh')'
-if (-not (Test-Path $injectPath)) { $problems += "Missing hook: $injectPath (C2)" }
+$injectPath = Join-Path $env:BCF_PROJECT_ROOT '.claude/hooks/pre-task-memory-inject.sh'
+$injectPath = Join-Path $env:BCF_PROJECT_ROOT '.claude/hooks/pre-task-memory-inject.sh'
 
 if ($problems.Count -gt 0) {
     Write-Host 'env-check FAILED:' -ForegroundColor Red

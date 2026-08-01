@@ -44,6 +44,74 @@ function Test-BcfColor {
     return $true
 }
 
+# --- Символы ----------------------------------------------------------------------------
+#
+# ✓ ✗ ⚠ ▸ ▀ — это не «просто символы»: в Consolas половины из них нет, и в старом conhost
+# вместо значка статуса рисуется пустой квадрат. Значок, который не отрисовался, хуже
+# отсутствующего: строка «□ память недоступна» читается как мусор, а не как ошибка.
+# Поэтому набор переключаемый: BCF_ASCII=1 (или --ascii) даёт заведомо рисуемые аналоги.
+$script:BcfAscii = [bool]$env:BCF_ASCII
+function Set-BcfAscii { param([bool]$Value) $script:BcfAscii = $Value }
+
+$script:BcfGlyphs = @{
+    ok      = @{ u = '✓'; a = '+' }
+    fail    = @{ u = '✗'; a = 'x' }
+    warn    = @{ u = '⚠'; a = '!' }
+    dim     = @{ u = '·'; a = '-' }
+    cursor  = @{ u = '▸'; a = '>' }
+    dot     = @{ u = '●'; a = '*' }
+    boxOn   = @{ u = '×'; a = 'x' }
+    rule    = @{ u = '─'; a = '-' }
+    sep     = @{ u = '·'; a = '|' }
+    down    = @{ u = '↓'; a = 'v' }
+    updown  = @{ u = '↑↓'; a = 'up/dn' }
+    arrow   = @{ u = '→'; a = '->' }
+}
+
+function Sym {
+    param([Parameter(Mandatory)][string]$Name)
+    $g = $script:BcfGlyphs[$Name]
+    if (-not $g) { return $Name }
+    if ($script:BcfAscii) { return $g.a }
+    return $g.u
+}
+
+# Обрезка по ширине окна. Строка, вылезшая за край, переносится терминалом и ломает
+# ВЕСЬ последующий кадр: перерисовка считает строки, а их стало больше, чем она думает.
+# Длительность прогона. Отдельная функция, потому что '{0:hh\:mm\:ss}' МОЛЧА теряет дни:
+# оборванный прогон недельной давности печатался как «05:12:33», то есть выглядел коротким.
+# Ошибка на порядок в единственном числе, по которому судят о прогоне.
+function Format-BcfDuration {
+    param($Span)
+    if ($null -eq $Span) { return '  --  ' }
+    if ($Span -isnot [timespan]) { $Span = [timespan]$Span }
+    if ($Span.TotalDays -ge 1) { return ('{0}д {1:00}:{2:00}' -f [int]$Span.TotalDays, $Span.Hours, $Span.Minutes) }
+    if ($Span.TotalHours -ge 1) { return ('{0:hh\:mm\:ss}' -f $Span) }
+    return ('{0:mm\:ss}' -f $Span)
+}
+
+function Fit-BcfWidth {
+    param([string]$Text, [int]$Reserve = 2)
+    $w = 100
+    try { $cw = [Console]::WindowWidth; if ($cw -gt 20) { $w = $cw } } catch { }
+    $limit = $w - $Reserve
+    # Длину считаем по ВИДИМЫМ символам: ANSI-коды ширины не имеют, и обрезка по сырой
+    # длине резала бы цветные строки втрое раньше нужного.
+    $plain = [regex]::Replace($Text, "`e\[[0-9;]*m", '')
+    if ($plain.Length -le $limit) { return $Text }
+    if ($Text -eq $plain) { return $plain.Substring(0, [math]::Max(0, $limit - 1)) + (Sym 'dim') }
+    # В цветной строке режем по видимым символам, сохраняя коды.
+    $sb = [System.Text.StringBuilder]::new()
+    $vis = 0; $i = 0
+    while ($i -lt $Text.Length -and $vis -lt ($limit - 1)) {
+        $m = [regex]::Match($Text.Substring($i), "^`e\[[0-9;]*m")
+        if ($m.Success) { [void]$sb.Append($m.Value); $i += $m.Length; continue }
+        [void]$sb.Append($Text[$i]); $i++; $vis++
+    }
+    [void]$sb.Append((Sym 'dim')); [void]$sb.Append("`e[0m")
+    return $sb.ToString()
+}
+
 # Раскрасить КУСОК строки. Нужно именно так: строка «TASK-02 готова crates/core/src.rs»
 # состоит из трёх разных по важности вещей, и красить её целиком одним цветом — значит
 # не сказать ничего. Текст передаётся уже дополненным до нужной ширины: ANSI-коды не
@@ -56,8 +124,8 @@ function Ink {
 
 function Write-BcfLine {
     param([string]$Text = '', [string]$Color = '')
-    if ($Color -and (Test-BcfColor)) { Write-Host (Ink $Text $Color) }
-    else { Write-Host $Text }
+    if ($Color -and (Test-BcfColor)) { Write-Host (Fit-BcfWidth (Ink $Text $Color)) }
+    else { Write-Host (Fit-BcfWidth $Text) }
 }
 
 function Write-BcfTitle {
@@ -68,13 +136,38 @@ function Write-BcfTitle {
     Write-Host ''
 }
 
-function Write-BcfRule { param([int]$Width = 78) Write-BcfLine ('  ' + ('─' * $Width)) 'DarkGray' }
+function Write-BcfRule {
+    param([int]$Width = 78)
+    $w = $Width
+    try { $cw = [Console]::WindowWidth; if ($cw -gt 20 -and $w -gt $cw - 4) { $w = $cw - 4 } } catch { }
+    Write-BcfLine ('  ' + ((Sym 'rule') * $w)) 'DarkGray'
+}
 
-function Write-BcfOk    { param([string]$T) Write-Host ('  ' + (Ink '✓' 'Green')  + ' ' + (Ink $T 'Green')) }
-function Write-BcfWarn  { param([string]$T) Write-Host ('  ' + (Ink '⚠' 'Yellow') + ' ' + (Ink $T 'Yellow')) }
-function Write-BcfFail  { param([string]$T) Write-Host ('  ' + (Ink '✗' 'Red')    + ' ' + (Ink $T 'Red')) }
-function Write-BcfDim   { param([string]$T) Write-Host ('  ' + (Ink ('· ' + $T) 'DarkGray')) }
-function Write-BcfNote  { param([string]$T) Write-BcfLine "    $T" 'DarkGray' }
+function Write-BcfOk    { param([string]$T) Write-Host (Fit-BcfWidth ('  ' + (Ink (Sym 'ok')   'Green')  + ' ' + (Ink $T 'Green'))) }
+function Write-BcfWarn  { param([string]$T) Write-Host (Fit-BcfWidth ('  ' + (Ink (Sym 'warn') 'Yellow') + ' ' + (Ink $T 'Yellow'))) }
+function Write-BcfFail  { param([string]$T) Write-Host (Fit-BcfWidth ('  ' + (Ink (Sym 'fail') 'Red')    + ' ' + (Ink $T 'Red'))) }
+function Write-BcfDim   { param([string]$T) Write-Host (Fit-BcfWidth ('  ' + (Ink ((Sym 'dim') + ' ' + $T) 'DarkGray'))) }
+# Пояснение под строкой. ПЕРЕНОСИТСЯ, а не обрезается: в пояснении лежит последствие —
+# то, ради чего блокер вообще напечатан. Обрезка по ширине окна съедала именно хвост,
+# и в узком терминале от «без репозитория не восстановить работу» оставалось «без репо·».
+# Строка превращалась из объяснения в намёк ровно там, где объяснение и нужно.
+function Write-BcfNote {
+    param([string]$T)
+    $w = 100
+    try { $cw = [Console]::WindowWidth; if ($cw -gt 30) { $w = $cw } } catch { }
+    $limit = $w - 6
+    if ($T.Length -le $limit) { Write-BcfLine "    $T" 'DarkGray'; return }
+    $line = ''
+    foreach ($word in ($T -split ' ')) {
+        if ($line -and ($line.Length + 1 + $word.Length) -gt $limit) {
+            Write-BcfLine "    $line" 'DarkGray'
+            $line = $word
+        } else {
+            $line = if ($line) { "$line $word" } else { $word }
+        }
+    }
+    if ($line) { Write-BcfLine "    $line" 'DarkGray' }
+}
 
 # Источник вывода. Печатается рядом со значением, а не в легенде внизу: легенду не
 # читают, а решение принимают по строке.
@@ -90,9 +183,11 @@ function Get-BcfSourceTag {
 function Write-BcfField {
     param([string]$Name, [string]$Value, [string]$Source = '', [int]$NameWidth = 16, [string]$ValueColor = 'White')
     $line = '  ' + (Ink ("{0,-$NameWidth}" -f $Name) 'DarkGray') + ' ' + (Ink $Value $ValueColor)
-    if (-not $Source) { Write-Host $line; return }
+    if (-not $Source) { Write-Host (Fit-BcfWidth $line); return }
     $tag = Get-BcfSourceTag $Source
-    Write-Host ($line + '   ' + (Ink $tag.text $tag.color))
+    # Метку источника режем последней: она короткая и важнее хвоста значения.
+    Write-Host (Fit-BcfWidth ($line) 16) -NoNewline
+    Write-Host ('   ' + (Ink $tag.text $tag.color))
 }
 
 # Таблица без выравнивания по содержимому — колонки заданы заранее. Автоширина ломается

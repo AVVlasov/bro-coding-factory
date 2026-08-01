@@ -76,9 +76,17 @@ Write-Host '  целостность' -ForegroundColor White
 # несуществующим, ВСЕ тестеры Фазы C молча пропускались строкой «предупреждение», а
 # вердикт считался по оставшимся зелёным гейтам: PASS выдавался за проверку, которой не
 # было. Глазами такой байт не виден, парсер на него не ругается — ловить можно только так.
-It 'в скриптах нет управляющих байтов' {
+function Get-RepoScripts {
+    # Весь репозиторий, а не только движок: тот же дефект нашёлся в мета-судьях, куда
+    # первая версия проверки не заглядывала. Судьи запускаются редко — поломка живёт в
+    # них месяцами и всплывает ровно тогда, когда на них рассчитывают.
+    return @(Get-ChildItem -Path $root -Recurse -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
+             Where-Object { $_.FullName -notmatch '[\\/]\.bcf[\\/]|[\\/]node_modules[\\/]|[\\/]\.git[\\/]' })
+}
+
+It 'в скриптах нет управляющих байтов и висячих CR' {
     $bad = @()
-    foreach ($f in (Get-ChildItem -Path (Join-Path $root 'harness'), (Join-Path $root 'src'), (Join-Path $root 'bin') -Recurse -Filter '*.ps1')) {
+    foreach ($f in (Get-RepoScripts)) {
         $text = Get-Content -Raw -LiteralPath $f.FullName
         for ($i = 0; $i -lt $text.Length; $i++) {
             $c = [int]$text[$i]
@@ -88,9 +96,29 @@ It 'в скриптах нет управляющих байтов' {
                 $bad += "$($f.Name):$line  байт 0x{0:X2}" -f $c
                 break
             }
+            # Одиночный CR — тот же дефект неэкранированного `\r`, но ХУЖЕ: он не только
+            # ломает путь, он невидим в выводе, потому что затирает начало строки.
+            if ($c -eq 13 -and ($i + 1 -ge $text.Length -or [int]$text[$i + 1] -ne 10)) {
+                $line = ($text.Substring(0, $i) -split "`n").Count
+                $bad += "$($f.Name):$line  одиночный CR"
+                break
+            }
         }
     }
-    Assert-True ($bad.Count -eq 0) ("управляющие байты: " + ($bad -join '; '))
+    Assert-True ($bad.Count -eq 0) ("порченые байты: " + ($bad -join '; '))
+}
+
+# Скрипт, который не разбирается, — это не «сломанная фича», это ветка, которой нет.
+# Именно так ported-судьи и лежали: файл на месте, в реестре числится, а исполнить его
+# нельзя. Парсер отвечает на этот вопрос за секунду и по всему репозиторию сразу.
+It 'каждый скрипт репозитория разбирается' {
+    $bad = @()
+    foreach ($f in (Get-RepoScripts)) {
+        $e = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$e)
+        if ($e -and $e.Count) { $bad += "$($f.Name):$($e[0].Extent.StartLineNumber)" }
+    }
+    Assert-True ($bad.Count -eq 0) ("не разбираются: " + ($bad -join '; '))
 }
 
 # --- Диспетчер -----------------------------------------------------------------------
@@ -132,11 +160,12 @@ It 'печатает карточку состояния, а не список �
     Bcf @('install', '--project', $p) | Out-Null
     $r = Bcf @('--project', $p)
     Assert-Match $r.Out 'BRO CODING FACTORY'
-    foreach ($row in @('проект', 'бэкенды', 'память', 'тарифы', 'подписки')) {
+    foreach ($row in @('проект', 'прогон', 'бэкенды', 'память', 'тарифы', 'подписки')) {
         Assert-Match $r.Out $row "в карточке нет строки «$row»"
     }
     # То, чего нет, называется словом «нет» и ценой, а не прячется и не выдумывается.
     Assert-Match $r.Out 'тарифы\s+не заданы'
+    Assert-Match $r.Out 'прогон\s+ещё не было' 'карточка молчит о том, был ли прогон'
     Assert-NoMatch $r.Out 'bcf <команда>' 'вместо состояния напечатана справка'
 }
 
@@ -723,6 +752,141 @@ It 'вывод прогона доходит до консоли, а не в в�
     Assert-Match $r.Out 'run-all' 'прогон отработал молча — его вывод потерян'
     Assert-Match $r.Out 'DRY-PLAN'
 }
+
+# --- Ежедневные команды ----------------------------------------------------------------
+
+It 'task new даёт следующий свободный номер, а не «количество + 1»' {
+    $p = New-Sandbox 'task-new'
+    Bcf @('install', '--project', $p) | Out-Null
+    $a = Bcf @('task', 'new', 'первая задача', '--project', $p)
+    Assert-Match $a.Out 'TASK-01'
+    $b = Bcf @('task', 'new', 'вторая задача', '--project', $p)
+    Assert-Match $b.Out 'TASK-02'
+
+    # Удаляем первую и создаём ещё одну. «Количество + 1» вернуло бы TASK-02 — занятый
+    # номер, и две задачи начали бы спорить за один id: одна перекрыла бы вердикт другой.
+    Remove-Item (Get-ChildItem (Join-Path $p 'tasks') -Filter 'TASK-01-*.md').FullName -Force
+    $c = Bcf @('task', 'new', 'третья задача', '--project', $p)
+    Assert-Match $c.Out 'TASK-03' 'номер выдан по количеству файлов, а не по максимуму — id столкнутся'
+}
+
+It 'имя файла задачи не содержит кириллицы' {
+    $p = New-Sandbox 'task-slug'
+    Bcf @('install', '--project', $p) | Out-Null
+    Bcf @('task', 'new', 'фильтры последующих сканов', '--project', $p) | Out-Null
+    $f = @(Get-ChildItem (Join-Path $p 'tasks') -Filter 'TASK-*.md')[0]
+    Assert-True ($f.Name -notmatch '[\u0400-\u04FF]') "кириллица в имени файла: $($f.Name)"
+    Assert-Match $f.Name 'filtry'
+}
+
+It 'task why называет ПРИЧИНУ, по которой задача не поедет' {
+    $p = New-Sandbox 'task-why'
+    Bcf @('install', '--project', $p) | Out-Null
+    Bcf @('task', 'new', 'а', '--project', $p) | Out-Null
+    $r = Bcf @('task', 'why', 'TASK-01', '--project', $p)
+    Assert-True ($r.Code -ne 0) 'задача без секции «Файлы» и без ролей объявлена готовой'
+    Assert-Match $r.Out 'Файлы'
+    Assert-Match $r.Out 'НЕ ПОЕДЕТ'
+}
+
+It 'task why видит незакрытого предшественника' {
+    $p = New-Sandbox 'task-why-pred'
+    Bcf @('init', '--yes', '--project', $p) | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-01-a.md') -Value @"
+# TASK-01 — a
+
+## Файлы
+- ``src/a.rs``
+
+**Gate-вход:** нет
+"@
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-02-b.md') -Value @"
+# TASK-02 — b
+
+## Файлы
+- ``src/b.rs``
+
+**Gate-вход:** TASK-01
+"@
+    $r = Bcf @('task', 'why', 'TASK-02', '--project', $p)
+    Assert-Match $r.Out 'TASK-01' 'предшественник не назван'
+    Assert-True ($r.Code -ne 0) 'задача с незакрытым предшественником объявлена готовой'
+}
+
+It 'stop пишет запрос на остановку и умеет его снять' {
+    $p = New-Sandbox 'stop'
+    Bcf @('install', '--project', $p) | Out-Null
+    $r = Bcf @('stop', '--project', $p)
+    Assert-True (Test-Path (Join-Path $p '.bcf\STOP')) 'файла-запроса нет — прогон не остановится'
+    Assert-Match $r.Out 'МЕЖДУ задачами'
+    Bcf @('stop', '--clear', '--project', $p) | Out-Null
+    Assert-True (-not (Test-Path (Join-Path $p '.bcf\STOP'))) '--clear не убрал запрос: следующий прогон не поедет'
+}
+
+# Регрессия: доска показывала у оборванного прогона РАСТУЩИЙ таймер узла. Это читается
+# как «работа идёт прямо сейчас», хотя процесса нет уже сутки.
+It 'watch --once не выдаёт оборванный прогон за идущий' {
+    $p = New-Sandbox 'watch'
+    Bcf @('install', '--project', $p) | Out-Null
+    $g = Join-Path $p '.bcf\graph\20200101-000000-dead'
+    New-Item -ItemType Directory -Force -Path $g | Out-Null
+    $j = Join-Path $g 'journal.jsonl'
+    Set-Content -Encoding UTF8 -LiteralPath $j -Value @(
+        '{"ts":"2020-01-01T00:00:00Z","event":"run-start","name":"queue","nodes":2}'
+        '{"ts":"2020-01-01T00:00:01Z","event":"node-start","key":"n1","label":"работа-TASK-01","phase":"work","role":"worker"}'
+        '{"ts":"2020-01-01T00:00:30Z","event":"node-finish","key":"n1","ok":true,"tokens":100}'
+        '{"ts":"2020-01-01T00:00:31Z","event":"node-start","key":"n2","label":"работа-TASK-02","phase":"work","role":"worker"}'
+    )
+    # Журнал оборванного прогона не дописывается — именно по этому его и отличают от идущего.
+    (Get-Item $j).LastWriteTime = (Get-Date).AddDays(-3)
+    $r = Bcf @('watch', '--once', '--project', $p)
+    Assert-Match $r.Out 'не завершились' 'оборванный прогон показан как идущий'
+    Assert-True ($r.Out -notmatch 'работают сейчас') 'мёртвый прогон объявлен живым'
+}
+
+# Ради этого команда и написана: у упавшего узла ответа обычно НЕТ, а причина лежит в
+# stderr бэкенда. Показывать надо её, а не пустой ответ с бодрым заголовком.
+It 'log показывает ошибки упавшего узла и не обещает пустой ответ' {
+    $p = New-Sandbox 'log'
+    Bcf @('install', '--project', $p) | Out-Null
+    $g = Join-Path $p '.bcf\graph\20260101-000000-run'
+    New-Item -ItemType Directory -Force -Path (Join-Path $g 'nodes') | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'journal.jsonl') -Value @(
+        '{"ts":"2026-01-01T00:00:00Z","event":"run-start","name":"queue","nodes":1}'
+        '{"ts":"2026-01-01T00:00:01Z","event":"node-start","key":"n1","label":"критик-TASK-01","phase":"critic","role":"critic"}'
+        '{"ts":"2026-01-01T00:01:00Z","event":"node-finish","key":"n1","ok":false,"reason":"агент не вернул текста"}'
+        '{"ts":"2026-01-01T00:01:01Z","event":"run-finish","ok":false}'
+    )
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'nodes\критик-TASK-01.err.log') -Value 'error: authentication required'
+    # Пустой файл ответа — ровно то, что оставляет молча умерший агент.
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'nodes\критик-TASK-01.out.jsonl') -Value ''
+
+    $list = Bcf @('log', '--project', $p)
+    Assert-Match $list.Out 'критик-TASK-01'
+    Assert-NoMatch $list.Out 'ответ' 'пустой файл ответа выдан за сохранённый ответ'
+
+    $one = Bcf @('log', 'критик', '--project', $p)
+    Assert-Match $one.Out 'authentication required' 'причина провала не показана'
+    Assert-Match $one.Out 'ПРОВАЛ'
+}
+
+It 'log без прогонов не притворяется, что что-то нашёл' {
+    $p = New-Sandbox 'log-empty'
+    Bcf @('install', '--project', $p) | Out-Null
+    $r = Bcf @('log', '--project', $p)
+    Assert-True ($r.Code -ne 0) 'пустая история отдана как успех'
+    Assert-Match $r.Out 'прогонов ещё не было'
+}
+
+It 'update --check не трогает рабочее дерево' {
+    $before = (& git -C (Get-Location) status --porcelain | Out-String)
+    $r = Bcf @('update', '--check')
+    $after = (& git -C (Get-Location) status --porcelain | Out-String)
+    Assert-True ($before -eq $after) '--check изменил рабочее дерево фабрики'
+}
+
+# Регрессия того же класса, что BEL в verify.ps1: управляющий байт в скрипте делает путь
+# невозможным, ветка молча пропускается, и проверка выдаёт PASS, ничего не проверив.
 
 # --- Итог ----------------------------------------------------------------------------
 Write-Host ''

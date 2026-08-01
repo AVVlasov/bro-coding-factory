@@ -45,7 +45,7 @@ foreach ($r in $runs) {
              elseif ($r.Failed) { "провалов узлов $($r.Failed)" }
              else { 'ок' }
     if ($r.Legacy) { $state += ' · старый кат.' }
-    Add-BcfRow $rows @($r.RunId, $r.Name, "$($r.NodeCount)", ('{0:hh\:mm\:ss}' -f $r.Duration), "$([int]$r.Tokens)", $state)
+    Add-BcfRow $rows @($r.RunId, $r.Name, "$($r.NodeCount)", (Format-BcfDuration $r.Duration), "$([int]$r.Tokens)", $state)
     $colors += $(if ($r.DryPlan) { 'DarkGray' }
                  elseif (-not $r.Complete) { 'DarkYellow' }
                  elseif ($state -eq 'ок') { 'Green' } else { 'Yellow' })

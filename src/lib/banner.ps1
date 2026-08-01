@@ -75,6 +75,13 @@ function Get-BcfBannerStatus {
     # --- тарифы и подписки ---
     $pricing = Get-BcfPricing -Project $Project
 
+    # --- последний прогон ---
+    # Единственная строка карточки, которая отвечает на вопрос «а сейчас-то что». Без неё
+    # человек открывает карточку, видит настроенный проект и не знает главного: идёт ли
+    # прогон прямо сейчас, оборвался ли он ночью и стоит ли вообще запускать второй.
+    $lastRun = $null
+    try { $lastRun = Get-BcfLastRun -Project $Project } catch { }
+
     return [pscustomobject]@{
         Project = $Project
         Name = (Split-Path $Project -Leaf)
@@ -87,6 +94,7 @@ function Get-BcfBannerStatus {
         Memory = $mem
         MemoryOn = [bool]($cfg -and $cfg.features -and $cfg.features.memory)
         Pricing = $pricing
+        LastRun = $lastRun
     }
 }
 
@@ -99,16 +107,6 @@ $script:BcfLogo = @(
     '█  █  █      █    '
     '████   ████  █    '
 )
-
-# Маскот. В дизайн-макете его не было — там только знак; но у инструмента, который зовут
-# «bro», лицо на месте знака работает лучше слова: по нему узнают окно, не читая.
-# Он же несёт состояние: выражение меняется по тому, поедет прогон или нет, — и это
-# единственная строка баннера, которую видно боковым зрением.
-$script:BcfMascotFaces = @{
-    ok    = @('  ___  ', ' / _ \ ', '|  ^ ^|', '|  ␣␣ |', ' \___/ ')
-    warn  = @('  ___  ', ' / _ \ ', '|  o o|', '|  ~~ |', ' \___/ ')
-    bad   = @('  ___  ', ' / _ \ ', '|  x x|', '|  ∩∩ |', ' \___/ ')
-}
 
 function Get-BcfMascotMood {
     param([Parameter(Mandatory)]$Status)
@@ -124,13 +122,18 @@ function Get-BcfMascotMood {
 function Write-BcfBanner {
     param([Parameter(Mandatory)]$Status)
 
+    # Маскот — ТОТ ЖЕ, что в мастере (src/lib/mascot.ps1). Своя ASCII-копия здесь жила
+    # ровно до первого взгляда на реальный терминал: в баннере рисовалась рожица из
+    # чёрточек, а в init — пиксельная. Один персонаж не может выглядеть двумя способами.
     $mood = Get-BcfMascotMood -Status $Status
-    $face = $script:BcfMascotFaces[$mood]
-    $faceColor = switch ($mood) { 'ok' { 'Green' } 'warn' { 'Yellow' } default { 'Red' } }
+    $face = @(Get-BcfMascotLines -Mood $mood)
 
     Write-Host ''
-    for ($i = 0; $i -lt $script:BcfLogo.Count; $i++) {
-        Write-Host ('  ' + (Ink $face[$i] $faceColor) + '   ' + (Ink $script:BcfLogo[$i] 'Cyan'))
+    $rows = [math]::Max($face.Count, $script:BcfLogo.Count)
+    for ($i = 0; $i -lt $rows; $i++) {
+        $l = if ($i -lt $face.Count) { $face[$i] } else { ' ' * 14 }
+        $g = if ($i -lt $script:BcfLogo.Count) { Ink $script:BcfLogo[$i] 'Cyan' } else { '' }
+        Write-Host ('  ' + $l + '   ' + $g)
     }
     Write-Host ''
     Write-Host ('  ' + (Ink 'BRO CODING FACTORY' 'White') + ' ' + (Ink "v$(Get-BcfVersion)" 'DarkGray'))
@@ -142,11 +145,34 @@ function Write-BcfBanner {
                else { "$($Status.Tasks.Count) задач в бэклоге · закрыто $($Status.Closed) · готово $($Status.Ready)" }
     Write-BcfLine ("  {0,-10} {1} · {2}" -f 'проект', $Status.Name, $backlog) 'White'
 
+    # прогон
+    if ($Status.LastRun) {
+        $r = $Status.LastRun
+        $age = (Get-Date) - $r.Finished
+        # «Идёт» определяем по свежести журнала, а не по файлу-маркеру: маркер переживает
+        # падение процесса и потом сутками уверяет, что прогон работает.
+        if (-not $r.Complete -and $age.TotalSeconds -lt 90) {
+            Write-BcfLine ("  {0,-10} идёт: {1} · узлов {2} · {3} (bcf watch · bcf stop)" -f `
+                           'прогон', $r.Name, $r.NodeCount, (Format-BcfDuration ((Get-Date) - $r.Started))) 'Cyan'
+        } elseif (-not $r.Complete) {
+            Write-BcfLine ("  {0,-10} $(Sym warn) ОБОРВАН {1} назад — работа задач осталась в ветках (bcf runs)" -f `
+                           'прогон', (Format-BcfDuration $age)) 'Yellow'
+        } elseif ($r.Failed -gt 0) {
+            Write-BcfLine ("  {0,-10} $(Sym fail) {1} назад, узлов не дали результата: {2} (bcf log --failed)" -f `
+                           'прогон', (Format-BcfDuration $age), $r.Failed) 'Red'
+        } else {
+            Write-BcfLine ("  {0,-10} $(Sym ok) {1} назад · {2} · узлов {3} (bcf report)" -f `
+                           'прогон', (Format-BcfDuration $age), $r.RunId, $r.NodeCount) 'Green'
+        }
+    } else {
+        Write-BcfLine ("  {0,-10} ещё не было — история пуста, смета считаться не по чему" -f 'прогон') 'DarkGray'
+    }
+
     # бэкенды
     if ($Status.Roles.Count) {
         $parts = foreach ($r in $Status.Roles) {
             $m = if ($r.Model) { " $($r.Model)" } else { '' }
-            "✓ $($r.Backend)$m"
+            "$(Sym ok) $($r.Backend)$m"
         }
         Write-BcfLine ("  {0,-10} {1}" -f 'бэкенды', (($parts | Select-Object -Unique) -join '  ')) 'Green'
     } else {
@@ -157,21 +183,21 @@ function Write-BcfBanner {
     if (-not $Status.MemoryOn) {
         Write-BcfLine ("  {0,-10} выключена — прогоны не учатся на прошлых ошибках (bcf memory init)" -f 'память') 'DarkGray'
     } elseif ($null -eq $Status.Memory) {
-        Write-BcfLine ("  {0,-10} ✗ недоступна — уроки не отзываются и не пишутся (bcf memory status)" -f 'память') 'Red'
+        Write-BcfLine ("  {0,-10} $(Sym fail) недоступна — уроки не отзываются и не пишутся (bcf memory status)" -f 'память') 'Red'
     } else {
         $m = $Status.Memory
         $grow = if ($null -ne $m.anti_patterns_last_7d -and [int]$m.anti_patterns_last_7d -gt 0) {
             "+$($m.anti_patterns_last_7d) за неделю — обучение живое"
         } else { 'за неделю без прироста — читает старое' }
         $col = if ([int]$m.anti_patterns -le 1) { 'Yellow' } else { 'Green' }
-        Write-BcfLine ("  {0,-10} ✓ уроков {1} · багов {2} · отзывов {3} · {4}" -f `
+        Write-BcfLine ("  {0,-10} $(Sym ok) уроков {1} · багов {2} · отзывов {3} · {4}" -f `
                        'память', $m.anti_patterns, $m.bugs, $m.recalls, $grow) $col
     }
 
     # тарифы
     if ($Status.Pricing) {
         $models = @($Status.Pricing.Models.PSObject.Properties).Count
-        Write-BcfLine ("  {0,-10} ✓ от {1} · моделей {2} · валюта {3}" -f `
+        Write-BcfLine ("  {0,-10} $(Sym ok) от {1} · моделей {2} · валюта {3}" -f `
                        'тарифы', $Status.Pricing.Updated, $models, $Status.Pricing.Currency) 'Green'
     } else {
         Write-BcfLine ("  {0,-10} не заданы — смета не считается, только токены (config/pricing.json)" -f 'тарифы') 'DarkGray'

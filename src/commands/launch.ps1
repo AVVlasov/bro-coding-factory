@@ -12,6 +12,7 @@
 . (Join-Path $BcfRoot 'src\lib\journal.ps1')
 . (Join-Path $BcfRoot 'src\lib\pricing.ps1')
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
+. (Join-Path $BcfRoot 'src\lib\mascot.ps1')
 . (Join-Path $BcfRoot 'src\lib\banner.ps1')
 
 $project = $script:BcfProject
@@ -90,8 +91,8 @@ function Build-Screen {
     $L.Add(@{ t = '  что запускаем'; c = 'White' })
 
     for ($i = 0; $i -lt $MODES.Count; $i++) {
-        $mark = if ($cursor -eq $i) { '▸' } else { ' ' }
-        $sel  = if ($modeIdx -eq $i) { '●' } else { ' ' }
+        $mark = if ($cursor -eq $i) { Sym 'cursor' } else { ' ' }
+        $sel  = if ($modeIdx -eq $i) { Sym 'dot' } else { ' ' }
         $extra = switch ($MODES[$i].key) {
             'queue'  { "$($status.Tasks.Count) задач · $($status.Closed) закрыто · готово $($status.Ready)" }
             'review' { 'по незакоммиченным правкам' }
@@ -112,8 +113,8 @@ function Build-Screen {
         for ($j = $scroll; $j -lt [math]::Min($scroll + $MAXROWS, $queueTasks.Count); $j++) {
             $t = $queueTasks[$j]
             $row = $MODES.Count + $j
-            $mark = if ($cursor -eq $row) { '▸' } else { ' ' }
-            $box  = if ($marked[$t.Id]) { '[×]' } else { '[ ]' }
+            $mark = if ($cursor -eq $row) { Sym 'cursor' } else { ' ' }
+            $box  = if ($marked[$t.Id]) { '[' + (Sym 'boxOn') + ']' } else { '[ ]' }
             $state = if ($t.Ready) { 'готова' }
                      elseif ($t.Preds.Count -gt 2) { "ждёт $($t.Preds.Count) задач" }
                      else { "ждёт $((($t.Preds | ForEach-Object { $_ -replace '^.*-', '' }) -join ','))" }
@@ -123,7 +124,7 @@ function Build-Screen {
             $L.Add(@{ t = ("  {0}{1} {2,-9} {3,-16} {4,-14} {5}" -f $mark, $box, $t.Id, $t.Slug, $state, $files); c = $c })
         }
         $rest = $queueTasks.Count - $scroll - $MAXROWS
-        if ($rest -gt 0) { $L.Add(@{ t = "      ещё $rest задач ↓"; c = 'DarkGray' }) }
+        if ($rest -gt 0) { $L.Add(@{ t = "      ещё $rest задач $(Sym down)"; c = 'DarkGray' }) }
         $L.Add('')
     }
 
@@ -144,7 +145,7 @@ function Build-Screen {
         $L.Add(@{ t = "  сметы нет: $($estimate.Why)"; c = 'DarkGray' })
     }
     $L.Add('')
-    $L.Add(@{ t = '  ↑↓ курсор · space отметить · a все · d готовые · enter запустить · p сухой план · q выход'; c = 'DarkGray' })
+    $L.Add(@{ t = "  $(Sym updown) курсор · space отметить · a все · d готовые · enter запустить · p сухой план · q выход"; c = 'DarkGray' })
     return $L.ToArray()
 }
 

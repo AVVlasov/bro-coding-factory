@@ -4,7 +4,7 @@
 $ErrorActionPreference = 'Continue'
 $here = $PSScriptRoot
 $today = Get-Date -Format 'yyyy-MM-dd'
-$reportDir  = '$(Join-Path $env:BCF_PROJECT_ROOT '.bcfetros')'
+$reportDir  = Join-Path $env:BCF_PROJECT_ROOT '.bcf/retros'
 $reportPath = Join-Path $reportDir "M-13-harness-run-$today.md"
 $outDir     = Join-Path $here "out\$today"
 New-Item -ItemType Directory -Force -Path $reportDir, $outDir | Out-Null

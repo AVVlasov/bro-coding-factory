@@ -13,7 +13,7 @@ Write-Host "[$name] running" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $actualPath = Join-Path $OutDir "$name.actual.json"
 
-$invoker = '$(Join-Path $env:BCF_PROJECT_ROOT '.claudegentsin\invoke-retrospector.ps1')'
+$invoker = Join-Path $env:BCF_PROJECT_ROOT '.claude/agents/bin/invoke-retrospector.ps1'
 if (-not (Test-Path $invoker)) {
     Write-Host "  SKIP-FAIL: invoker not found: $invoker (C1 not done)" -ForegroundColor Yellow
     exit 2

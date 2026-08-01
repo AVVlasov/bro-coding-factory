@@ -71,9 +71,24 @@ function Get-BcfMascotLines {
     $w = ($art | Measure-Object -Property Length -Maximum).Maximum
     $out = @()
     if (-not (Test-BcfMascotSupported)) {
-        # Без цвета полублоки превращаются в кашу — отдаём пустые строки нужной высоты,
-        # чтобы разметка шапки не поехала.
-        for ($r = 0; $r -lt [math]::Ceiling($art.Count / 2); $r++) { $out += (' ' * $w) }
+        # Без цвета полублоки превращаются в кашу. Но пустое место на месте персонажа
+        # читается как дефект отрисовки, а не как «здесь ничего не задумано», — поэтому
+        # рисуем его штрихами. Настроение сохраняется: оно и есть сообщение.
+        $eyes  = switch ($Mood) { 'ok' { '^ ^' } 'warn' { 'o o' } default { 'x x' } }
+        $mouth = switch ($Mood) { 'ok' { 'www' } 'warn' { '~~~' } default { 'AAA' } }
+        # Строки собираем по одной. В многострочном литерале конкатенация внутри элемента
+        # разъезжается на отдельные элементы, и лицо рассыпается по строкам — это уже
+        # случилось один раз.
+        $ascii = New-Object 'System.Collections.Generic.List[string]'
+        $ascii.Add('   _______   ')
+        $ascii.Add('  /#######\  ')
+        $ascii.Add(" | $eyes | ")
+        $ascii.Add(" | $mouth | ")
+        $ascii.Add('  \_______/  ')
+        $ascii.Add('   [|||||]   ')
+        $ascii.Add('             ')
+        $ascii.Add('             ')
+        foreach ($l in $ascii) { $out += $l.PadRight($w) }
         return $out
     }
 

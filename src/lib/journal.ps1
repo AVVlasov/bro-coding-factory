@@ -141,6 +141,10 @@ function Read-BcfRun {
         Failed   = $failed.Count
         Tokens   = $tokens
         Journal  = $JournalPath
+        # Каталог прогона: рядом с журналом лежат артефакты узлов (промпт, поток ответа,
+        # stderr). Их показывает `bcf log`, и вычислять путь заново в каждой команде —
+        # верный способ разъехаться с тем, куда рантайм на самом деле пишет.
+        Dir      = (Split-Path $JournalPath -Parent)
     }
 }
 

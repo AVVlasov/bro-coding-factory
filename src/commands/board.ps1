@@ -20,7 +20,7 @@ if (-not $run) {
 
 $state = if (-not $run.Complete) { 'ОБОРВАН' } elseif ($run.Failed) { "провалов $($run.Failed)" } else { 'завершён' }
 Write-BcfTitle "ГРАФ  $($run.Name)  ·  $($run.RunId)" `
-               ("{0}  ·  узлов {1}  ·  {2:hh\:mm\:ss}  ·  {3} токенов" -f $state, $run.NodeCount, $run.Duration, [int]$run.Tokens)
+               ("{0}  ·  узлов {1}  ·  {2}  ·  {3} токенов" -f $state, $run.NodeCount, (Format-BcfDuration $run.Duration), [int]$run.Tokens)
 
 $phases = @($run.Nodes | ForEach-Object { $_.Phase } | Where-Object { $_ } | Select-Object -Unique)
 if (-not $phases.Count) { $phases = @('') }
