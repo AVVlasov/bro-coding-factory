@@ -32,6 +32,45 @@ if (-not $sub) { $sub = 'status' }
 
 $env:BCF_PROJECT_ROOT = $project
 
+# Конфиг памяти — ТОТ ЖЕ, что возьмёт клиент, и в том же порядке.
+#
+# У клиента (memory_client.py, _config_candidates) приоритет такой: $BCF_MEM_CONFIG →
+# <проект>/config/memory.config.json → конфиг фабрики. Команда же читала ТОЛЬКО конфиг
+# фабрики — и на проекте со своей базой это расходилось молча: `bcf memory init` поднимал
+# контейнер фабрики (bcf-agent-memory:5433) и рапортовал об успехе, а клиент шёл в базу
+# проекта (например bgc-agent-memory:5434), которой никто не поднял. Человек видел
+# зелёный init и «память недоступна» на прогоне — одновременно.
+function Get-BcfMemoryConfig {
+    param([string]$Project)
+    $candidates = @()
+    if ($env:BCF_MEM_CONFIG) { $candidates += $env:BCF_MEM_CONFIG }
+    if ($Project) { $candidates += (Join-Path $Project 'config\memory.config.json') }
+    $candidates += (Join-Path (Get-BcfMemoryDir) 'memory.config.json')
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) {
+            try {
+                $cfg = Get-Content -Raw -LiteralPath $c | ConvertFrom-Json
+                return [pscustomobject]@{
+                    Path      = $c
+                    Port      = $(if ($cfg.port) { [int]$cfg.port } else { 5433 })
+                    Container = $(if ($cfg.container) { [string]$cfg.container } else { 'bcf-agent-memory' })
+                    Database  = [string]$cfg.database
+                    User      = [string]$cfg.user
+                    PwEnv     = $(if ($cfg.password_env) { [string]$cfg.password_env } else { 'BCF_PG_PASSWORD' })
+                    PwDefault = [string]$cfg.password_default
+                    Endpoint  = $(if ($cfg.embedding_endpoint) { [string]$cfg.embedding_endpoint } else { 'http://localhost:1234/v1/embeddings' })
+                    Model     = [string]$cfg.embedding_model
+                    Dim       = $cfg.embedding_dim
+                    DataDir   = [string]$cfg.data_dir
+                    Raw       = $cfg
+                }
+            } catch { }
+        }
+    }
+    return $null
+}
+
 function Invoke-MemClient {
     param([string[]]$MemArgs)
     if (-not (Test-Path $client)) { return $null }
@@ -68,6 +107,12 @@ switch ($sub) {
     $st = Get-MemStats
     if (-not $st) {
         Write-BcfFail 'база недоступна — уроки не отзываются и не пишутся'
+        $m0 = Get-BcfMemoryConfig -Project $project
+        if ($m0) {
+            # Адрес обязателен в сообщении: на проекте со своей базой «недоступна» без
+            # адреса отправляет чинить не тот контейнер.
+            Write-BcfNote "ходили в: $($m0.Container) на 127.0.0.1:$($m0.Port)   (конфиг: $($m0.Path))"
+        }
         Write-BcfNote 'поднять: bcf memory init'
         Write-Host ''
         exit 1
@@ -95,17 +140,11 @@ switch ($sub) {
     # выглядит это одинаково: «память недоступна» на прогоне при полностью живом
     # контейнере. Пока проба стояла только в `memory init`, статус показывал зелёную базу
     # и правильные числа — то есть отвечал «всё хорошо» на вопрос «почему не работает».
-    $cfgFile = Join-Path (Get-BcfMemoryDir) 'memory.config.json'
-    $endpoint = 'http://localhost:1234/v1/embeddings'
-    $model = ''
-    $mc = $null
-    if (Test-Path $cfgFile) {
-        try {
-            $mc = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
-            if ($mc.embedding_endpoint) { $endpoint = [string]$mc.embedding_endpoint }
-            if ($mc.embedding_model) { $model = [string]$mc.embedding_model }
-        } catch { }
-    }
+    $mcfg = Get-BcfMemoryConfig -Project $project
+    $cfgFile = $(if ($mcfg) { $mcfg.Path } else { '(конфиг не найден)' })
+    $endpoint = $(if ($mcfg) { $mcfg.Endpoint } else { 'http://localhost:1234/v1/embeddings' })
+    $model = $(if ($mcfg) { $mcfg.Model } else { '' })
+    $mc = $(if ($mcfg) { $mcfg.Raw } else { $null })
     try {
         $body = @{ model = $model; input = 'probe' } | ConvertTo-Json
         $resp = Invoke-RestMethod -Uri $endpoint -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 15
@@ -170,12 +209,16 @@ switch ($sub) {
     # Порт занят ЧУЖОЙ базой — самый неприятный из возможных исходов, и он молчаливый.
     # Compose не поднимет свой контейнер, клиент подключится к чужому, получит отказ
     # авторизации, и это будет выглядеть как «наша память сломалась». Проверяем ДО.
-    $port = 5433
-    $cfgFileEarly = Join-Path $memDir 'memory.config.json'
-    if (Test-Path $cfgFileEarly) {
-        try { $port = [int]((Get-Content -Raw -LiteralPath $cfgFileEarly | ConvertFrom-Json).port) } catch { }
+    $mcfg = Get-BcfMemoryConfig -Project $project
+    if (-not $mcfg) {
+        Write-BcfFail 'конфиг памяти не найден ни в проекте, ни в фабрике'
+        Write-BcfNote 'ожидается config/memory.config.json в проекте или memory/memory.config.json в фабрике.'
+        exit 2
     }
-    $ours = 'bcf-agent-memory'
+    $port = $mcfg.Port
+    $ours = $mcfg.Container
+    Write-BcfDim "конфиг: $($mcfg.Path)"
+    Write-BcfDim "цель: контейнер $ours, порт $port"
     $holder = ''
     try {
         foreach ($line in (& docker ps --format '{{.Names}}|{{.Ports}}' 2>$null)) {
@@ -188,11 +231,33 @@ switch ($sub) {
         Write-BcfFail "порт $port уже занят другим контейнером: $holder"
         Write-BcfNote 'это не просто «занято»: клиент подключится к ЧУЖОЙ базе, получит отказ'
         Write-BcfNote 'авторизации, и выглядеть это будет как поломка нашей памяти.'
-        Write-BcfNote "поправь port в $cfgFileEarly и BCF_PG_PORT в окружении на свободный, затем повтори."
+        Write-BcfNote "поправь port в $($mcfg.Path) и BCF_PG_PORT в окружении на свободный, затем повтори."
         exit 2
     }
 
-    Write-BcfDim 'поднимаю контейнер…'
+    # Compose параметризован переменными окружения (см. docker-compose.yml). Передаём ему
+    # ИМЕННО то, что прочитает клиент: иначе поднимется контейнер с другим именем и на
+    # другом порту, а команда отчитается об успехе.
+    Write-BcfDim "поднимаю контейнер $ours на порту $port…"
+    $env:BCF_MEM_CONTAINER = $ours
+    $env:BCF_PG_PORT = "$port"
+    if (-not $env:BCF_PG_PASSWORD -and $mcfg.PwDefault) { $env:BCF_PG_PASSWORD = $mcfg.PwDefault }
+
+    # КАТАЛОГ ДАННЫХ — СВОЙ НА КАЖДУЮ БАЗУ. Пока он был один на всех, второй контейнер
+    # монтировал чужой postgres: пароль применяется только при первой инициализации
+    # пустого каталога, поэтому клиент получал «password authentication failed», а при
+    # одновременной работе двух контейнеров данные просто портятся.
+    $dataDir = $mcfg.DataDir
+    if (-not $dataDir) {
+        if ($ours -eq 'bcf-agent-memory') { $dataDir = './data' }   # общая база фабрики, как было
+        else { $dataDir = (Join-Path $project '.bcf\memory\data') }
+    }
+    if ($dataDir -ne './data') {
+        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+        $dataDir = (Resolve-Path $dataDir).Path
+        Write-BcfDim "данные: $dataDir"
+    }
+    $env:BCF_MEM_DATA = $dataDir
     & docker compose -f $compose up -d 2>&1 | ForEach-Object { Write-BcfNote $_ }
     if ($LASTEXITCODE -ne 0) { Write-BcfFail 'docker compose up не отработал'; exit 1 }
 
@@ -200,26 +265,20 @@ switch ($sub) {
     # готова принимать соединения, и первая же запись после старта падала бы молча.
     $ok = $false
     for ($i = 0; $i -lt 30; $i++) {
-        $h = (& docker inspect -f '{{.State.Health.Status}}' bcf-agent-memory 2>$null | Out-String).Trim()
+        $h = (& docker inspect -f '{{.State.Health.Status}}' $ours 2>$null | Out-String).Trim()
         if ($h -eq 'healthy') { $ok = $true; break }
         Start-Sleep -Seconds 2
     }
     if ($ok) { Write-BcfOk 'база отвечает (healthy)' }
     else {
-        Write-BcfWarn 'база не сообщила healthy за минуту — проверь docker logs bcf-agent-memory'
+        Write-BcfWarn "база не сообщила healthy за минуту — проверь docker logs $ours"
     }
 
     # Эмбеддинги. Без них recall не работает вовсе, а выглядит это как «память пустая».
-    $cfgFile = Join-Path $memDir 'memory.config.json'
-    $endpoint = 'http://localhost:1234/v1/embeddings'
-    $model = ''
-    if (Test-Path $cfgFile) {
-        try {
-            $mc = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
-            if ($mc.embedding_endpoint) { $endpoint = [string]$mc.embedding_endpoint }
-            if ($mc.embedding_model) { $model = [string]$mc.embedding_model }
-        } catch { }
-    }
+    $cfgFile = $mcfg.Path
+    $endpoint = $mcfg.Endpoint
+    $model = $mcfg.Model
+    $mc = $mcfg.Raw
     $embedOk = $false
     try {
         $body = @{ model = $model; input = 'probe' } | ConvertTo-Json
@@ -244,9 +303,17 @@ switch ($sub) {
     if (Test-Path $cfgPath) {
         try {
             $hc = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
-            $hc.features.memory = $true
-            ($hc | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
-            Write-BcfOk 'features.memory = true в config/harness.json'
+            if ($hc.features -and $hc.features.memory) {
+                # УЖЕ ВКЛЮЧЕНО — НЕ ТРОГАЕМ ФАЙЛ. Круговой прогон через ConvertTo-Json
+                # переписывает конфиг целиком и уничтожает ручное форматирование: у
+                # человека 24 строки диффа там, где не поменялось ни одного значения.
+                Write-BcfDim 'features.memory уже true — конфиг не трогаю'
+            } else {
+                $hc.features.memory = $true
+                ($hc | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+                Write-BcfOk 'features.memory = true в config/harness.json'
+                Write-BcfNote 'файл перезаписан целиком — ручное форматирование JSON не сохраняется.'
+            }
         } catch { Write-BcfWarn "не удалось включить features.memory: $($_.Exception.Message)" }
     } else {
         Write-BcfWarn 'config/harness.json не найден — включи features.memory вручную после bcf init'
@@ -325,6 +392,20 @@ switch ($sub) {
     }
     if (-not (Test-Path $compose)) { Write-BcfFail "compose-файл не найден: $compose"; exit 2 }
 
+    # Тот же конфиг, что у init: иначе compose уберёт контейнер по умолчанию, а не тот,
+    # который подняли для этого проекта.
+    $mcfg = Get-BcfMemoryConfig -Project $project
+    if ($mcfg) {
+        $env:BCF_MEM_CONTAINER = $mcfg.Container
+        $env:BCF_PG_PORT = "$($mcfg.Port)"
+        $dd = $mcfg.DataDir
+        if (-not $dd) {
+            if ($mcfg.Container -eq 'bcf-agent-memory') { $dd = './data' }
+            else { $dd = (Join-Path $project '.bcf\memory\data') }
+        }
+        $env:BCF_MEM_DATA = $dd
+        Write-BcfDim "убираю контейнер $($mcfg.Container)"
+    }
     & docker compose -f $compose down 2>&1 | ForEach-Object { Write-BcfNote $_ }
     # Код возврата проверяем ДО слова «остановлен»: раньше строка успеха печаталась
     # безусловно, и отказ compose (чужой контекст, занятый ресурс) выглядел как успех.

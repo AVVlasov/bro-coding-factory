@@ -408,6 +408,12 @@ $detail  = ''
 
 if ($failed) {
     $verdict = 'ПРОВАЛ'; $vColor = 'Red'; $code = 1
+} elseif ($DryPlan) {
+    # У сухого плана НЕТ итога: ни один агент не запускался, и «закрыто 3 из 14» здесь —
+    # свойство режима, а не факт о задачах. Печатать это как вердикт значит выдать план
+    # за результат — ровно то, против чего сделан весь отчёт.
+    $verdict = 'СУХОЙ ПЛАН'; $vColor = 'DarkGray'; $code = 0
+    $detail = 'агентов не звали, о состоянии задач он не говорит ничего'
 } elseif ($result -is [hashtable] -or $result -is [pscustomobject]) {
     $has = { param($n) if ($result -is [hashtable]) { $result.ContainsKey($n) } else { $null -ne $result.PSObject.Properties[$n] } }
     $val = { param($n) if ($result -is [hashtable]) { $result[$n] } else { $result.$n } }

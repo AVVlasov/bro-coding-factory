@@ -13,7 +13,13 @@ services:
     ports:
       - "${BCF_PG_PORT:-5433}:5432"   # host port (default 5433) — set BCF_PG_PORT to avoid clashes
     volumes:
-      - ./data:/var/lib/postgresql/data
+      # КАТАЛОГ ДАННЫХ ИДЁТ ЗА КОНТЕЙНЕРОМ. Два контейнера на одном каталоге postgres —
+      # это не «шаринг», это повреждение данных при одновременной работе. Плюс пароль
+      # применяется только при ПЕРВОЙ инициализации пустого каталога: подняв второй
+      # контейнер поверх чужих данных, получаешь отказ авторизации, который выглядит как
+      # «память сломалась». Проектам с собственной базой bcf memory init передаёт сюда
+      # путь внутри проекта.
+      - ${BCF_MEM_DATA:-./data}:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bcf -d bcf_agent_memory"]

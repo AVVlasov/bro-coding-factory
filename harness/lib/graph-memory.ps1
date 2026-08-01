@@ -56,6 +56,17 @@ function _GMemPython {
     $out = Join-Path $env:TEMP ("gmem-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.out')
     $err = "$out.err"
     $inF = ''
+
+    # UTF-8 ОБЯЗАТЕЛЕН, и это не про красоту вывода.
+    #
+    # python читает stdin в кодировке локали (на этой машине cp1251), а PowerShell пишет
+    # файл в UTF-8. Байты UTF-8, прочитанные как cp1251, дают «Р—Р°РґР°С‡Р°» вместо
+    # «Задача» — и урок ложится в базу в таком виде НАВСЕГДА. Дальше хуже: эмбеддинг
+    # считается от этой абракадабры, поэтому отзыв по ней не находит ничего осмысленного,
+    # а то, что всё-таки находится, попадает агенту в контекст нечитаемым.
+    # Проверено живьём: все шесть уроков первого прогона легли двойной кодировкой.
+    $env:PYTHONIOENCODING = 'utf-8'
+
     try {
         # Аргументы с пробелами ОБЯЗАНЫ быть в кавычках: Start-Process отдаёт их через
         # командную строку Windows и сам не экранирует. Без этого `--text проверка
@@ -184,6 +195,13 @@ function Add-GraphLesson {
     if (-not (Test-GraphMemory)) { return 'off' }
     if ([string]::IsNullOrWhiteSpace($Trigger)) { return 'err' }
 
+    # СУХОЙ ПЛАН НЕ ПИШЕТ УРОКОВ. Наблюдалось живьём: `bcf run queue --dry-plan` на свежей
+    # базе записал шесть «уроков» вида «задача не закрылась: сухой план: узел не
+    # исполнялся». Во-первых, режим обещает не создавать НИЧЕГО. Во-вторых, это отравление
+    # обучения: выдуманные провалы потом отзываются в настоящие прогоны как прошлый опыт,
+    # и агент получает в контекст утверждение о поломке, которой не было.
+    if ($script:GraphCtx -and $script:GraphCtx.DryPlan) { return 'dry' }
+
     # Дедуп: ищем почти-совпадение ДО записи.
     $near = _GMemPython -MemArgs @('recall', '--text', $Trigger, '--scope', $Scope,
                                    '--k', '1', '--threshold', "$script:GMemDedupThreshold") -TimeoutSec 20
@@ -212,8 +230,18 @@ function Add-GraphLesson {
 # не строка «память доступна», а РОСТ чисел от прогона к прогону.
 function Get-GraphMemoryStats {
     if (-not (Test-GraphMemory)) { return $null }
-    $cfgFile = Join-Path $script:GMemRoot 'config/memory.config.json'
-    if (-not (Test-Path $cfgFile)) { return $null }
+    # Конфиг ищем ТАМ ЖЕ, где клиент: проект, потом фабрика. Прежний путь
+    # (<фабрика>/config/memory.config.json) не существует вовсе — функция всегда возвращала
+    # $null, то есть приёмка прогона молча оставалась без сводки по памяти.
+    $cfgFile = ''
+    foreach ($c in @(
+        $env:BCF_MEM_CONFIG,
+        (Join-Path (Get-BcfProjectRoot) 'config\memory.config.json'),
+        (Join-Path $script:GMemRoot 'memory\memory.config.json')
+    )) {
+        if ($c -and (Test-Path $c)) { $cfgFile = $c; break }
+    }
+    if (-not $cfgFile) { return $null }
     try {
         $cfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
         $sql = "select (select count(*) from agent_memory.anti_patterns) || '|' || (select count(*) from agent_memory.bugs) || '|' || (select count(*) from agent_memory.recall_events);"
