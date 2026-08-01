@@ -28,8 +28,19 @@ function Get-DotEnvValue([string]$Path, [string]$Name) {
     return $null
 }
 $dotenv = Join-Path $projectRoot '.env'
-if (-not $env:BCF_API_KEY)  { $v = Get-DotEnvValue $dotenv 'BCF_API_KEY';  if ($v) { $env:BCF_API_KEY  = $v } }
-if (-not $env:BCF_API_HOST) { $v = Get-DotEnvValue $dotenv 'BCF_API_HOST'; if ($v) { $env:BCF_API_HOST = $v } }
+# ВСЕ переменные ретроспектора, а не только ключ и хост.
+#
+# Модель тоже обязана подтягиваться из .env: без неё тело запроса уходит без поля "model",
+# провайдер отвечает 400, и ретроспектор молча перестаёт работать — при этом цикл обучения
+# снаружи выглядит включённым. Ровно на это напоролись в bro-game-cheat и правили там
+# локально; правка возвращена в шаблон, чтобы её не пришлось повторять в каждом проекте.
+foreach ($__name in @('BCF_API_KEY', 'BCF_API_HOST', 'BCF_RETROSPECTOR_MODEL', 'BCF_MODEL',
+                      'BCF_RETROSPECTOR_ENDPOINT', 'BCF_RETROSPECTOR_API_KEY')) {
+    if (-not (Get-Item "env:$__name" -ErrorAction SilentlyContinue)) {
+        $v = Get-DotEnvValue $dotenv $__name
+        if ($v) { Set-Item "env:$__name" $v }
+    }
+}
 
 # Robust JSON extraction from an LLM response. Some models wrap the answer in
 # <think>...</think> that itself contains braces — a greedy `(\{.*\})` breaks intermittently.
