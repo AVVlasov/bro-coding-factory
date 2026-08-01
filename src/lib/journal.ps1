@@ -5,6 +5,30 @@
 # отдельно ведомой сводки: сводка, живущая рядом с журналом, рано или поздно начинает
 # расходиться с ним, и расходится молча.
 
+# Метка времени из журнала — ВСЕГДА в локальном времени.
+#
+# ConvertFrom-Json сам разбирает ISO-строки в [datetime], и для метки с «Z» отдаёт значение
+# с Kind=Utc, НЕ переводя его в локальное. Дальше это вычитается из локального Get-Date —
+# и разница уезжает ровно на часовой пояс: четырёхминутный прогон показывал длительность
+# «03:04:12». Число выглядит правдоподобным, поэтому проверить его глазами нельзя, а
+# решение «ждать или гасить» принимают по нему.
+#
+# Харнесс пишет метки со смещением (+03:00) и на них не спотыкается — но журнал,
+# написанный на машине в UTC или другим инструментом, ломает все времена молча.
+function ConvertTo-BcfLocalTime {
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    $dt = $null
+    if ($Value -is [datetime]) { $dt = $Value }
+    else {
+        try { $dt = [datetime]::Parse([string]$Value, $null, [System.Globalization.DateTimeStyles]::RoundtripKind) }
+        catch { try { $dt = [datetime]$Value } catch { return $null } }
+    }
+    if ($dt.Kind -eq [System.DateTimeKind]::Utc) { return $dt.ToLocalTime() }
+    if ($dt.Kind -eq [System.DateTimeKind]::Unspecified) { return [datetime]::SpecifyKind($dt, [System.DateTimeKind]::Local) }
+    return $dt
+}
+
 function Get-BcfGraphRoot {
     param([Parameter(Mandatory)][string]$Project)
     return (Join-Path $Project '.bcf\graph')
@@ -74,7 +98,7 @@ function Read-BcfRun {
                 # экранов: человек проверял окружение, а карточка потом сообщала ему про
                 # оборванный прогон, которого не было.
                 $isDoctor = ([bool]$r.doctor) -or ($name -eq 'doctor')
-                if ($r.ts) { $started = [datetime]$r.ts }
+                if ($r.ts) { $started = ConvertTo-BcfLocalTime $r.ts }
             }
             'phase' { $curPhase = [string]$r.phase }
             'node-start' {
@@ -88,7 +112,7 @@ function Read-BcfRun {
                     Label = $(if ($r.label) { [string]$r.label } else { $id })
                     Phase = $(if ($r.phase) { [string]$r.phase } else { $curPhase })
                     Role = [string]$r.role; Model = [string]$r.model
-                    Started = $(if ($r.ts) { [datetime]$r.ts } else { $null })
+                    Started = $(if ($r.ts) { ConvertTo-BcfLocalTime $r.ts } else { $null })
                     Finished = $null; Ok = $null; Tokens = 0.0; Reason = ''
                     Cached = $false; Dry = [bool]$r.dry
                 }
@@ -106,7 +130,7 @@ function Read-BcfRun {
                     }
                 }
                 $n = $nodes[$id]
-                $n.Finished = $(if ($r.ts) { [datetime]$r.ts } else { $null })
+                $n.Finished = $(if ($r.ts) { ConvertTo-BcfLocalTime $r.ts } else { $null })
                 $n.Ok = [bool]$r.ok
                 if ($r.tokens)  { $n.Tokens = [double]$r.tokens }
                 if ($r.role)    { $n.Role = [string]$r.role }
@@ -117,7 +141,7 @@ function Read-BcfRun {
             }
             'run-finish' {
                 $done = $true
-                if ($r.ts) { $finished = [datetime]$r.ts }
+                if ($r.ts) { $finished = ConvertTo-BcfLocalTime $r.ts }
                 # Итог, который вернул САМ граф. Он авторитетнее счётчика узлов: узлы
                 # могут все отработать, а очередь при этом остаться незакрытой — ровно
                 # тот случай, когда отчёт по узлам говорит «готово» о неполном прогоне.
@@ -176,7 +200,7 @@ function Get-BcfFleetPulse {
     foreach ($f in (Get-ChildItem $dir -Filter '*.worker.json' -File -ErrorAction SilentlyContinue)) {
         try {
             $rec = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json
-            $hb = if ($rec.heartbeat) { [datetime]$rec.heartbeat } else { $f.LastWriteTime }
+            $hb = if ($rec.heartbeat) { ConvertTo-BcfLocalTime $rec.heartbeat } else { $f.LastWriteTime }
         } catch { $hb = $f.LastWriteTime; $rec = $null }
         if (-not $best -or $hb -gt $best.At) {
             $best = [pscustomobject]@{

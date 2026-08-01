@@ -1044,6 +1044,77 @@ It 'docker зовётся с корректно закавыченными ар�
     Assert-True ($null -ne $r.Err) 'Invoke-BcfDocker не возвращает stderr — причину отказа печатать нечем'
 }
 
+# Регрессия. ConvertFrom-Json сам разбирает ISO-строки и для метки с «Z» отдаёт значение
+# с Kind=Utc, НЕ переводя его в локальное. Дальше оно вычиталось из локального Get-Date, и
+# длительность уезжала ровно на часовой пояс: четырёхминутный прогон показывал «03:04:12».
+# Число выглядит правдоподобным — глазами такое не ловится.
+It 'метки времени журнала приводятся к локальным' {
+    . (Join-Path $root 'src\lib\journal.ps1')
+    $utc = ConvertTo-BcfLocalTime '2026-08-01T18:00:00.0000000Z'
+    Assert-True ($utc.Kind -eq [System.DateTimeKind]::Local) "Kind=$($utc.Kind), а должен быть Local"
+    $off = ConvertTo-BcfLocalTime '2026-08-01T21:00:00.0000000+03:00'
+    Assert-True ($off.Kind -eq [System.DateTimeKind]::Local) 'метка со смещением не приведена'
+
+    # И то же самое на настоящем журнале: длительность считается по меткам.
+    $p = New-Sandbox 'tz'
+    Bcf @('install', '--project', $p) | Out-Null
+    $g = Join-Path $p '.bcf\graph\g_20260801-180000_tz'
+    New-Item -ItemType Directory -Force -Path $g | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'journal.jsonl') -Value @(
+        '{"ts":"2026-08-01T18:00:00.0000000Z","event":"run-start","name":"queue","nodes":1}'
+        '{"ts":"2026-08-01T18:00:01.0000000Z","event":"node-start","key":"n1","label":"работа","phase":"Работа","role":"worker"}'
+        '{"ts":"2026-08-01T18:04:12.0000000Z","event":"node-finish","key":"n1","ok":true,"tokens":10}'
+        '{"ts":"2026-08-01T18:04:12.0000000Z","event":"run-finish","ok":true,"result":"{\"complete\":true,\"passed\":1,\"total\":1}"}'
+    )
+    $r = Bcf @('runs', '--project', $p)
+    Assert-Match $r.Out '04:12' "длительность посчитана мимо часового пояса:`n$($r.Out)"
+}
+
+# Лента прогона: сырую строку движка показывать нельзя — «[graph]» повторяется в каждой
+# строке и не несёт ничего, а провал ничем не выделен.
+It 'строка движка превращается в событие ленты' {
+    . (Join-Path $root 'src\lib\ui.ps1')
+    . (Join-Path $root 'src\lib\runview.ps1')
+
+    $e = Convert-BcfFeedLine '[20:22:04] [graph] волна 1: 5 задач параллельно — TASK-02'
+    Assert-True ($e.Time -eq '20:22:04') "время не разобрано: $($e.Time)"
+    Assert-True ($e.Kind -eq 'wave') "вид не распознан: $($e.Kind)"
+    Assert-NoMatch $e.Text 'graph' 'служебный префикс остался в тексте события'
+
+    $f = Convert-BcfFeedLine '[20:24:05] [graph] ✗ работа-TASK-12 — агент не вернул текста'
+    Assert-True ($f.Kind -eq 'fail') "провал не распознан: $($f.Kind)"
+    Assert-True ($f.Color -eq 'Red') 'провал не выделен цветом'
+
+    $m = Convert-BcfFeedLine '[20:23:31] [memory] урок записан в память'
+    Assert-True ($m.Topic -eq 'memory') "тема потеряна: $($m.Topic)"
+
+    Assert-True ($null -eq (Convert-BcfFeedLine '   ')) 'пустая строка попала в ленту'
+}
+
+# Доска прогона строится по журналу и не выдумывает того, чего в нём нет.
+It 'доска живого прогона собирается и не врёт про деньги' {
+    . (Join-Path $root 'src\lib\ui.ps1')
+    . (Join-Path $root 'src\lib\runview.ps1')
+    $p = New-Sandbox 'runboard'
+    Bcf @('install', '--project', $p) | Out-Null
+    $g = Join-Path $p '.bcf\graph\g_20260801-200000_b'
+    New-Item -ItemType Directory -Force -Path $g | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'journal.jsonl') -Value @(
+        '{"ts":"2026-08-01T20:00:00.0000000+03:00","event":"run-start","name":"queue","nodes":2}'
+        '{"ts":"2026-08-01T20:00:01.0000000+03:00","event":"node-start","key":"n1","label":"работа-TASK-01","phase":"Работа","role":"worker","model":"m"}'
+        '{"ts":"2026-08-01T20:01:00.0000000+03:00","event":"node-finish","key":"n1","ok":true,"tokens":1000}'
+        '{"ts":"2026-08-01T20:01:01.0000000+03:00","event":"node-start","key":"n2","label":"работа-TASK-02","phase":"Работа","role":"worker","model":"m"}'
+    )
+    $run = Get-BcfLastRun -Project $p
+    $lines = @(Get-BcfRunBoardLines -Run $run -Tick 0 -Pricing $null -Project $p -Concurrency 4)
+    $txt = ($lines | ForEach-Object { if ($_ -is [string]) { $_ } else { [string]$_.t } }) -join "`n"
+    Assert-Match $txt 'queue' 'на доске нет имени графа'
+    Assert-Match $txt 'работают сейчас'
+    Assert-Match $txt 'готово 1'
+    # Тарифов у песочницы нет — денег на доске быть не должно.
+    Assert-NoMatch $txt '₽' 'доска показала деньги без тарифов'
+}
+
 It 'update --check не трогает рабочее дерево' {
     $before = (& git -C (Get-Location) status --porcelain | Out-String)
     $r = Bcf @('update', '--check')

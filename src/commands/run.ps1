@@ -117,11 +117,23 @@ $env:BCF_HOME = Get-BcfHome
 $script:HarnessExit = 0
 
 function Invoke-Harness {
-    param([Parameter(Mandatory)][string]$Script, [string[]]$HarnessArgs)
+    param([Parameter(Mandatory)][string]$Script, [string[]]$HarnessArgs, [switch]$Live, [int]$Concurrency = 0)
     $full = Join-Path $harness $Script
     if (-not (Test-Path $full)) { Write-BcfFail "нет скрипта харнесса: $full"; exit 3 }
-    $all = @('-NoProfile', '-File', $full) + $HarnessArgs + @('-ProjectRoot', $project)
-    & pwsh @all
+    $all = @($HarnessArgs) + @('-ProjectRoot', $project)
+
+    # ЖИВОЙ ЭКРАН — только в консоли и только для графа.
+    #
+    # Без консоли (пайп, CI, планировщик) перерисовка на месте превращается в кашу из
+    # управляющих последовательностей, а лог прогона нужен именно в сыром виде. Поэтому
+    # там honest pass-through: тот же вывод, что и раньше.
+    if ($Live -and (Test-BcfInteractive)) {
+        . (Join-Path $BcfRoot 'src\lib\runview.ps1')
+        $script:HarnessExit = Invoke-BcfRunLive -ScriptPath $full -HarnessArgs $all -Project $project -Concurrency $Concurrency
+        return
+    }
+
+    & pwsh @('-NoProfile', '-File', $full) @all
     $script:HarnessExit = $LASTEXITCODE
 }
 
@@ -154,13 +166,26 @@ switch ($mode) {
     { $_ -in @('queue', 'review') } {
         $a = @($mode)
         if ($dryPlan)          { $a += '-DryPlan' }
-        if (Get-BcfAssumeYes)  { $a += '-Yes' }
+
+        # Живой экран рисуем сами, а значит подтверждение обязано спроситься ЗДЕСЬ:
+        # вопрос движка ушёл бы в перенаправленный поток, и прогон встал бы молча,
+        # ожидая ответа, которого никто не увидит.
+        $live = (-not $dryPlan) -and (Test-BcfInteractive)
+        if ($live -and -not (Get-BcfAssumeYes)) {
+            Write-Host ''
+            if (-not (Read-BcfConfirm "запустить граф $mode?" $true)) {
+                Write-BcfDim 'отменено — ни один агент не вызван'
+                Write-Host ''
+                exit 130
+            }
+        }
+        if ($live -or (Get-BcfAssumeYes)) { $a += '-Yes' }
         if ($budget -gt 0)     { $a += @('-Budget', $budget) }
         if ($conc -gt 0)       { $a += @('-Concurrency', $conc) }
         if ($resume)           { $a += @('-ResumeFromRunId', $resume) }
         if ($task)             { $a += @('-ArgsJson', $task) }   # граф читает вход как JSON
         $a += $passthru
-        Invoke-Harness -Script 'graph.ps1' -HarnessArgs $a
+        Invoke-Harness -Script 'graph.ps1' -HarnessArgs $a -Live:$live -Concurrency $conc
         exit $script:HarnessExit
     }
 
