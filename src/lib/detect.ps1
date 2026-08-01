@@ -28,11 +28,19 @@ function Get-BcfLanguageStats {
     }
     $skip = '(^|[\\/])(\.git|node_modules|target|dist|build|out|vendor|__pycache__|\.venv|venv|\.bcf|\.next|coverage)([\\/]|$)'
 
+    # ХАРНЕСС — НЕ ПРОДУКТ. Считая его вместе с проектом, разбор врёт о том, на чём проект
+    # написан: у Rust-проекта с обвязкой на PowerShell первым языком выходил PowerShell
+    # (43% против 22% у Rust), и по этому чтению дальше выбирались продуктовые пути и
+    # раннер тестов. Список каталогов печатается на экране — чтобы человек мог возразить.
+    $harness = '(^|[\\/])(loop|harness|\.claude|meta|tasks|docs|memory)([\\/]|$)'
+
     $counts = @{}
     $total = 0
+    $harnessFiles = 0
     foreach ($f in (Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue)) {
         $rel = $f.FullName.Substring($Root.Length).TrimStart('\', '/')
         if ($rel -match $skip) { continue }
+        if ($rel -match $harness) { $harnessFiles++; continue }
         $lang = $map[$f.Extension.ToLower()]
         if (-not $lang) { continue }
         if (-not $counts.ContainsKey($lang)) { $counts[$lang] = 0 }
@@ -44,7 +52,7 @@ function Get-BcfLanguageStats {
         $out += [pscustomobject]@{ Language = $k; Files = $counts[$k]
                                    Percent = if ($total) { [math]::Round(100.0 * $counts[$k] / $total) } else { 0 } }
     }
-    return [pscustomobject]@{ Total = $total; Languages = $out }
+    return [pscustomobject]@{ Total = $total; Languages = $out; HarnessFiles = $harnessFiles }
 }
 
 # --- Экосистемы -----------------------------------------------------------------------
@@ -134,6 +142,35 @@ function Get-BcfNodeScripts {
     if (-not (Test-Path $pkg)) { return $null }
     try { $j = Get-Content -Raw -LiteralPath $pkg | ConvertFrom-Json } catch { return $null }
     return $j.scripts
+}
+
+# Сколько тестов НА САМОМ ДЕЛЕ. «Раннер найден» и «тесты есть» — разные утверждения, и
+# гейт «фича доказана тестами» держится на втором. Пустой набор при живом раннере означает,
+# что первая же задача закроется, ничего не доказав, — и это надо видеть до прогона.
+function Get-BcfTestCounts {
+    param([Parameter(Mandatory)][string]$Root, [string[]]$ProductPaths = @())
+
+    $pats = @(
+        @{ Runner = 'cargo';  Ext = @('.rs');            Rx = '#\[(tokio::)?test\]' }
+        @{ Runner = 'vitest'; Ext = @('.ts', '.tsx', '.js', '.jsx'); Rx = '(?m)^\s*(it|test)\s*\(' }
+        @{ Runner = 'pytest'; Ext = @('.py');            Rx = '(?m)^\s*def\s+test_' }
+        @{ Runner = 'go';     Ext = @('.go');            Rx = '(?m)^func\s+Test\w+\(' }
+    )
+    $dirs = @($ProductPaths | ForEach-Object { Join-Path $Root ($_ -replace '/', '\') } | Where-Object { Test-Path $_ })
+    if (-not $dirs.Count) { $dirs = @($Root) }
+
+    $out = @{}
+    foreach ($p in $pats) {
+        $n = 0
+        foreach ($dir in $dirs) {
+            foreach ($f in (Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue |
+                            Where-Object { $p.Ext -contains $_.Extension.ToLower() })) {
+                try { $n += ([regex]::Matches((Get-Content -Raw -LiteralPath $f.FullName -EA SilentlyContinue), $p.Rx)).Count } catch { }
+            }
+        }
+        if ($n -gt 0) { $out[$p.Runner] = $n }
+    }
+    return $out
 }
 
 function Get-BcfGitState {
@@ -305,6 +342,7 @@ function Invoke-BcfDetect {
         Generated   = @($generated | Select-Object -Unique)
         Typechecks  = @($typechecks | Select-Object -Unique)
         Tests       = $tests
+        TestCounts  = (Get-BcfTestCounts -Root $Root -ProductPaths @(_BcfDropNested @($product | Select-Object -Unique)))
         Runners     = @($runners)
         Probes      = $probes
     }

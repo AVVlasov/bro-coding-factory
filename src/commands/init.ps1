@@ -122,6 +122,30 @@ function Show-Step2 {
     $top = @($d.Languages.Languages | Select-Object -First 4)
     Write-BcfField 'языки' $(if ($top.Count) { ($top | ForEach-Object { "$($_.Language) $($_.Percent)%" }) -join '   ' } else { '(исходников не найдено)' })
     Write-BcfField 'сборка' $(if ($d.Ecosystems.Count) { $d.Ecosystems -join ', ' } else { '(манифестов не найдено)' })
+
+    # ТЕСТЫ ЧИСЛОМ, а не фактом наличия раннера: гейт «фича доказана тестами» держится на
+    # том, что тесты есть. Пустой набор при живом раннере — это задача, закрывшаяся ничего
+    # не доказав, и увидеть это надо здесь, а не после прогона.
+    $tc = $d.TestCounts
+    $tcTxt = if ($tc -and $tc.Keys.Count) {
+        (@($tc.Keys | Sort-Object | ForEach-Object { "$_ найдено $($tc[$_])" }) -join ' · ')
+    } else { '(тестов не нашлось — гейт «доказано тестами» держаться не на чем)' }
+    Write-BcfField 'тесты' $tcTxt '' 16 $(if ($tc -and $tc.Keys.Count) { 'White' } else { 'Yellow' })
+
+    if ($d.Git.IsGit) {
+        $dirty = if ($d.Git.Dirty.Count) { "$($d.Git.Dirty.Count) грязных" } else { 'чисто' }
+        $wt = if ($d.Git.Worktree) { 'worktree работает' } else { 'worktree НЕ отвечает' }
+        $hk = if (@($d.Git.Hooks).Count) { "git-хуков $(@($d.Git.Hooks).Count)" } else { 'git-хуков нет' }
+        Write-BcfField 'git' "$($d.Git.Branch) · $dirty · $wt · $hk"
+    } else {
+        Write-BcfField 'git' 'НЕ репозиторий' '' 16 'Red'
+    }
+
+    $docsFound = @($d.Docs.Files | Where-Object { $_.Exists })
+    $docsTxt = if ($docsFound.Count) { (($docsFound | ForEach-Object { $_.Path }) -join ', ') } else { '(README/CLAUDE.md/PRD не найдены)' }
+    if ($d.Docs.DocsMdCount -gt 0) { $docsTxt += "  ·  docs/ — $($d.Docs.DocsMdCount) файлов" }
+    Write-BcfField 'доки' $docsTxt
+
     Write-Host ''
     Write-Host ('  ' + (Ink 'ПРЕДЛАГАЕМ ЗАПИСАТЬ В config/harness.json' 'Cyan'))
     Write-Host ''
@@ -140,7 +164,7 @@ function Show-Step2 {
             $why = if ($p) { "упало (exit $($p.ExitCode))" } else { 'не проверялось' }
             Write-BcfField 'backpressure' "$t   ← $why" 'догадка' 18 'Yellow'
             if ($p) {
-                $script:blocking += @{ what = "быстрая проверка падает: $t"
+                $script:blocking += @{ step = 2; what = "быстрая проверка падает: $t"
                                 why  = 'она вызывается КАЖДУЮ итерацию — гейт будет красным всегда, и агент начнёт чинить несуществующее.'
                                 fix  = "последние строки вывода:`n     " + ($p.Output -replace "`n", "`n     ") }
             }
@@ -156,6 +180,15 @@ function Show-Step2 {
     Write-BcfField 'tests.runner' $runnerVal `
                    $(if (-not $d.Tests.runner -or $d.Runners.Count -gt 1) { 'догадка' } else { 'уверенно' }) 18
 
+    Write-BcfField 'taskIdPattern' 'TASK-\d+' 'уверенно' 18
+
+    # ЧТО СЧИТАЕТСЯ НЕ ПРОДУКТОМ — печатаем явно. Разбор исключает обвязку из подсчёта
+    # языков и продуктовых путей; молча это делать нельзя: человек должен иметь
+    # возможность возразить, если у него код лежит там, где мы ждём харнесс.
+    if ($d.Languages.HarnessFiles -gt 0) {
+        Write-BcfField 'вне продукта' ("loop/ .claude/ tasks/ docs/ meta/ memory/ — обвязка, $($d.Languages.HarnessFiles) файлов") 'уверенно' 18
+    }
+
     Write-Host ''
     Write-BcfNote 'productPaths решает, где искать «прогресса нет» и расползание скоупа.'
     Write-BcfNote 'generatedFiles — что не блокирует слияние: один лок-файл уже валил семь задач подряд.'
@@ -167,8 +200,26 @@ function Show-Step2 {
         $script:later += "раннеров тестов найдено $($d.Runners.Count) ($((($d.Runners | ForEach-Object { $_.Runner }) -join ', '))), а гейт «фича доказана тестами» одноместный: задачи второго стека будут проверяться чужим раннером."
     }
 
+    # РЕШИТЬ РУКАМИ — здесь, а не только в итоге.
+    #
+    # Список в конце восьми шагов человек читает уже уставшим и «потом посмотрю» ставит
+    # ровно на том, что ломает первый же прогон. Поэтому то, что нашёл ЭТОТ шаг,
+    # показывается на ЭТОМ шаге — с последствием и готовой командой.
+    $mine = @($script:blocking | Where-Object { $_.step -eq 2 -or -not $_.step })
+    if ($mine.Count) {
+        Write-Host ''
+        Write-BcfLine "  ⚠ РЕШИТЬ РУКАМИ  $($mine.Count)" 'Red'
+        $n = 0
+        foreach ($b in $mine) {
+            $n++
+            Write-BcfLine ("  $n  " + $b.what) 'White'
+            if ($b.why) { Write-BcfNote $b.why }
+            if ($b.fix) { Write-BcfLine ('     ' + $b.fix) 'Cyan' }
+        }
+    }
+
     if ($interactive) {
-        Write-BcfKeyHints -Pairs @(@('enter', 'принять всё'), @('x', 'пропустить и разобраться потом'), @('q', 'выход'))
+        Write-BcfKeyHints -Pairs @(@('enter', 'принять всё'), @('e', 'править'), @('x', 'пропустить и разобраться потом'), @('q', 'выход'))
         $k = Read-BcfKey
         if ($k -and $k.Key -in @('Q', 'Escape')) { return $null }
     }
