@@ -878,6 +878,15 @@ It 'log без прогонов не притворяется, что что-т�
     Assert-Match $r.Out 'прогонов ещё не было'
 }
 
+It 'setup --check не создаёт ярлык и не трогает PATH' {
+    $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\BCF-test-should-not-exist.lnk'
+    $pathBefore = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    $r = Bcf @('setup', '--check')
+    Assert-True (-not (Test-Path $lnk)) '--check создал ярлык'
+    Assert-True ($pathBefore -eq [Environment]::GetEnvironmentVariable('PATH', 'User')) '--check изменил PATH'
+    Assert-Match $r.Out 'КОМАНДА bcf'
+}
+
 It 'update --check не трогает рабочее дерево' {
     $before = (& git -C (Get-Location) status --porcelain | Out-String)
     $r = Bcf @('update', '--check')

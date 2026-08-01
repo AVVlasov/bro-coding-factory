@@ -1,8 +1,9 @@
 # bcf setup — сделать так, чтобы команда называлась `bcf`.
 #
-#   bcf setup           добавить bin/ в PATH пользователя
-#   bcf setup --check   только проверить, ничего не менять
-#   bcf setup --remove  убрать из PATH
+#   bcf setup                добавить bin/ в PATH, ярлык в «Пуск», автодополнение
+#   bcf setup --check        только проверить, ничего не менять
+#   bcf setup --remove       убрать из PATH и убрать ярлык
+#   bcf setup --no-shortcut  без ярлыка в меню «Пуск»
 #
 # ЗАЧЕМ ОТДЕЛЬНАЯ КОМАНДА. `pwsh D:\...\bin\bcf.ps1 detect --project D:\...` — это не
 # работа с CLI, это вызов скрипта: путь набирается руками, каталог проекта повторяется в
@@ -16,6 +17,7 @@
 
 $check  = $script:BcfArgs -contains '--check'
 $remove = $script:BcfArgs -contains '--remove'
+$noShortcut = $script:BcfArgs -contains '--no-shortcut'
 $binDir = Join-Path (Get-BcfHome) 'bin'
 
 Write-BcfTitle 'КОМАНДА bcf' $binDir
@@ -64,7 +66,35 @@ $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
 if ($null -eq $userPath) { $userPath = '' }
 $parts = @($userPath -split ';' | Where-Object { $_ })
 
+# Ярлык в меню «Пуск». Не украшение: без него CLI существует только для того, кто уже
+# сидит в консоли с открытым нужным каталогом. Ярлык — способ открыть фабрику так же, как
+# открывают любое другое приложение, и он же делает её видимой средствам запуска системы.
+$startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+$lnkPath = Join-Path $startMenu 'BCF.lnk'
+
+function New-BcfShortcut {
+    param([string]$Path, [string]$HomeDir)
+    # pwsh с -NoExit: окно обязано ОСТАТЬСЯ после карточки. Иначе всё, что даёт пункт меню, —
+    # мелькнувшее состояние, которое исчезает вместе с окном.
+    $pwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+    if (-not $pwshExe) { return 'pwsh не найден на PATH — ярлык не на что нацелить' }
+    try {
+        $sh = New-Object -ComObject WScript.Shell
+        $sc = $sh.CreateShortcut($Path)
+        $sc.TargetPath = $pwshExe
+        $sc.Arguments = '-NoLogo -NoExit -Command bcf'
+        $sc.WorkingDirectory = $HomeDir
+        $sc.Description = 'Bro Coding Factory — карточка состояния и запуск прогона'
+        $sc.Save()
+        return ''
+    } catch { return $_.Exception.Message }
+}
+
 if ($remove) {
+    if (Test-Path $lnkPath) {
+        Remove-Item -LiteralPath $lnkPath -Force -ErrorAction SilentlyContinue
+        Write-BcfOk 'ярлык из меню «Пуск» убран'
+    }
     $kept = @($parts | Where-Object { $_.TrimEnd('\') -ne $binDir.TrimEnd('\') })
     if ($kept.Count -eq $parts.Count) {
         Write-BcfDim 'в PATH пользователя этого каталога и не было — убирать нечего'
@@ -96,6 +126,15 @@ if ($now) { Write-BcfOk "bcf → $now" }
 else {
     Write-BcfWarn 'в ЭТОМ окне команда ещё не видна'
     Write-BcfNote 'Windows не обновляет переменные в уже запущенных процессах — открой новое окно.'
+}
+
+# --- Ярлык -------------------------------------------------------------------------------
+if (-not $noShortcut) {
+    $lnkErr = New-BcfShortcut -Path $lnkPath -HomeDir (Get-BcfHome)
+    if ($lnkErr) { Write-BcfWarn "ярлык не создан: $lnkErr" }
+    else { Write-BcfOk 'ярлык в меню «Пуск»: BCF' }
+} else {
+    Write-BcfDim 'ярлык не создавался (--no-shortcut)'
 }
 
 # --- Автодополнение ---------------------------------------------------------------------
