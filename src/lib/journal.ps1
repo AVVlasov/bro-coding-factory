@@ -148,6 +148,36 @@ function Read-BcfRun {
     }
 }
 
+# Закрылся ли прогон на самом деле.
+#
+# ОДНА функция на все экраны, потому что правило здесь ровно одно и оно неочевидное:
+# авторитет итога — то, что вернул САМ граф (поле result события run-finish), а НЕ счётчик
+# отработавших узлов. Узлы могут все отработать до одного, а очередь остаться незакрытой:
+# узел «работа-TASK-01» честно завершается и тогда, когда задача не достигла PASS.
+# Экран, считающий по узлам, показывает зелёные 100% для прогона, который не сделал
+# ничего, — и такой прогон принимают за успешный. Отчёт это уже учитывал, доска и
+# карточка — нет, и они противоречили отчёту по одному и тому же прогону.
+function Get-BcfRunComplete {
+    param([Parameter(Mandatory)]$Run)
+    $res = $Run.Result
+    if ($null -ne $res -and $res.PSObject.Properties['complete']) { return [bool]$res.complete }
+    if ($null -ne $res -and $res.PSObject.Properties['ok']) { return [bool]$res.ok }
+    $failed = @($Run.Nodes | Where-Object { $_.Ok -eq $false }).Count
+    return ($Run.Complete -and -not $failed)
+}
+
+# Короткая подпись «закрыто X из Y», если граф её сообщил. Пусто — если не сообщил:
+# выдумывать числа хуже, чем не показать их.
+function Get-BcfRunTally {
+    param([Parameter(Mandatory)]$Run)
+    $res = $Run.Result
+    if ($null -eq $res) { return '' }
+    if ($res.PSObject.Properties['passed'] -and $res.PSObject.Properties['total']) {
+        return "закрыто $($res.passed) из $($res.total)"
+    }
+    return ''
+}
+
 # Путь для показа человеку: относительный, со слэшами вперёд.
 #
 # Нужен потому, что подсказка «журнал лежит там-то» обязана указывать на файл, который

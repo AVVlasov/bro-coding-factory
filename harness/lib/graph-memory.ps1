@@ -35,6 +35,7 @@ Set-StrictMode -Off
 $script:GMemRoot   = Get-BcfHomeRoot
 $script:GMemClient = Join-Path $script:GMemRoot 'memory/pgvector/memory_client.py'
 $script:GMemState  = $null    # $null = ещё не проверяли; $true/$false = результат
+$script:GMemNextProbe = $null # когда можно пробовать снова после отрицательного ответа
 
 # Похожесть, выше которой урок считается уже известным. 0.92 — намеренно высокий порог:
 # ложный пропуск (не записали похожее) дешевле ложного дубля, потому что дубль портит
@@ -103,19 +104,36 @@ function _GMemPython {
 
 function Test-GraphMemory {
     param([switch]$Recheck)
-    if (-not $Recheck -and $null -ne $script:GMemState) { return $script:GMemState }
-    $script:GMemState = $false
+
+    # КЭШИРУЕМ ТОЛЬКО «ДА». Раньше кэшировался любой ответ, и один медленный первый
+    # пробник выключал память на весь прогон. Выглядело это так: префлайт честно
+    # доложил «pgvector healthy, эмбеддинги загружены, обучение АКТИВНО», а через восемь
+    # секунд граф напечатал «память недоступна» — и дальше все узлы шли без уроков,
+    # хотя память работала. «Не ответила за 8 секунд» и «недоступна» — разные вещи, и
+    # склеивать их нельзя: первое лечится повтором, второе нет.
+    if ($script:GMemState -eq $true) { return $true }
     if ($env:BCF_MEMORY_DISABLED) { return $false }
     if (-not (Test-Path $script:GMemClient)) { return $false }
 
-    # Пробник намеренно короткий: он выполняется в КАЖДОЙ ветке веера (свой runspace —
-    # свой кэш), и платить за него по полминуты на узел недопустимо.
-    $probe = _GMemPython -MemArgs @('recall', '--text', 'проверка доступности памяти',
-                                    '--scope', 'code', '--k', '1', '--threshold', '0.99') -TimeoutSec 8
-    if ($null -eq $probe) { return $false }
-    if ($probe -match 'Traceback|OperationalError|could not connect') { return $false }
-    $script:GMemState = $true
-    return $true
+    # Отрицательный ответ придерживаем на минуту: пробник зовётся на КАЖДОМ узле, и
+    # долбить недоступную базу по разу на узел — это минуты мёртвого времени на прогон.
+    if (-not $Recheck -and $script:GMemNextProbe -and (Get-Date) -lt $script:GMemNextProbe) { return $false }
+
+    # Пробуем ДЕШЁВОЙ командой: stats ходит в базу и не считает эмбеддинг. Прежний
+    # пробник делал recall, то есть round-trip к модели, и первый же вызов на холодной
+    # модели не укладывался в отведённые восемь секунд.
+    $probe = _GMemPython -MemArgs @('stats') -TimeoutSec 10
+    $ok = $false
+    if ($null -ne $probe -and $probe -notmatch 'Traceback|OperationalError|could not connect') { $ok = $true }
+
+    if ($ok) {
+        $script:GMemState = $true
+        $script:GMemNextProbe = $null
+        return $true
+    }
+    $script:GMemState = $false
+    $script:GMemNextProbe = (Get-Date).AddSeconds(60)
+    return $false
 }
 
 # Блок уроков для вставки в промпт узла. Пусто, если памяти нет или совпадений нет —

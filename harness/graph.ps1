@@ -328,7 +328,22 @@ if (-not $Yes -and -not $DryPlan) {
 # полностью исправной установке: узел работы поднимал память САМ, а узлы графа шли без неё.
 #
 # Префлайт НЕ блокирует прогон: память вспомогательна, и её отсутствие не повод не работать.
-if (-not $DryPlan) {
+#
+# И НЕ ЗОВЁТ ЕЁ, ЕСЛИ ПРОЕКТ СКАЗАЛ «НЕ НАДО». features.memory выключен по умолчанию, а
+# префлайт звался безусловно: обычный проект, ничего про память не просивший, получал
+# запуск Docker Desktop, поднятый контейнер pgvector и строку «цикл обучения АКТИВЕН» —
+# при том, что его собственная карточка в это же время писала «память выключена».
+# Тяжёлый побочный эффект вопреки явной настройке и два экрана, противоречащих друг другу.
+$memWanted = $false
+try {
+    $cfgFile = Join-Path $root 'config\harness.json'
+    if (Test-Path $cfgFile) {
+        $cfgJson = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+        $memWanted = [bool]($cfgJson.features -and $cfgJson.features.memory)
+    }
+} catch { $memWanted = $false }
+
+if (-not $DryPlan -and $memWanted) {
     . (Join-Path $PSScriptRoot 'lib\m13-bridge.ps1')
     Write-Host "`n  окружение:" -ForegroundColor Cyan
     $memReady = $false
@@ -336,6 +351,11 @@ if (-not $DryPlan) {
     if (-not $memReady) {
         Write-Host "  ⚠ память не поднялась — прогон пойдёт БЕЗ уроков (обучение выключено)." -ForegroundColor Yellow
     }
+} elseif (-not $DryPlan) {
+    # Говорим об этом одной строкой: молчание здесь читается как «память работает».
+    Write-Host "`n  окружение:" -ForegroundColor Cyan
+    Write-Host "  · память выключена в config/harness.json → features.memory — узлы идут без уроков (bcf memory init)" -ForegroundColor DarkGray
+    $env:BCF_MEMORY_DISABLED = '1'
 }
 
 $parsedArgs = $null
@@ -367,12 +387,47 @@ $sw.Stop()
 
 Complete-GraphRun -Result $result | Out-Null
 
+# Итог берём из ТОГО, ЧТО ВЕРНУЛ ГРАФ, а не из факта «скрипт не бросил исключение».
+# Раньше здесь стояло `if ($failed) 'ПРОВАЛ' else 'ок'`, где $failed означал только
+# необработанное исключение. Прогон, закрывший 0 задач из 1, печатал зелёное «итог: ок»
+# и возвращал код 0 — то есть ночной запуск по расписанию записывал в историю успех там,
+# где не было сделано ничего. Ровно этот же дефект уже правился в `bcf report`; сам
+# прогон продолжал врать.
+$verdict = 'ок'
+$vColor  = 'Green'
+$code    = 0
+$detail  = ''
+
+if ($failed) {
+    $verdict = 'ПРОВАЛ'; $vColor = 'Red'; $code = 1
+} elseif ($result -is [hashtable] -or $result -is [pscustomobject]) {
+    $has = { param($n) if ($result -is [hashtable]) { $result.ContainsKey($n) } else { $null -ne $result.PSObject.Properties[$n] } }
+    $val = { param($n) if ($result -is [hashtable]) { $result[$n] } else { $result.$n } }
+
+    if ((& $has 'complete') -and -not (& $val 'complete')) {
+        # Очередь закрылась не вся. Узлы при этом могли отработать все до одного —
+        # именно поэтому судить по узлам нельзя.
+        $verdict = 'НЕПОЛНО'; $vColor = 'Yellow'; $code = 1
+        $detail = "закрыто $(& $val 'passed') из $(& $val 'total'), осталось $(& $val 'stuck')"
+    } elseif ((& $has 'ok') -and -not (& $val 'ok')) {
+        $verdict = 'ПРОВАЛ'; $vColor = 'Red'; $code = 1
+        if (& $has 'reason') { $detail = [string](& $val 'reason') }
+    }
+}
+
+# Путь к журналу печатаем ФАКТИЧЕСКИЙ. Захардкоженный «.bcf/graph/…» врал бы проекту,
+# у которого состояние ещё лежит в старом каталоге.
+$journalRel = $ctx.Dir
+if ($journalRel.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+    $journalRel = $journalRel.Substring($root.Length)
+}
+$journalRel = ($journalRel -replace '\\', '/').TrimStart('/')
+
 Write-Host ""
-Write-Host ("  итог: {0}, за {1:mm\:ss}" -f $(if ($failed) { 'ПРОВАЛ' } else { 'ок' }), $sw.Elapsed) `
-    -ForegroundColor $(if ($failed) { 'Red' } else { 'Green' })
-Write-Host "  журнал: .bcf/graph/$($ctx.RunId)/journal.jsonl"
+Write-Host ("  итог: {0}{1}, за {2:mm\:ss}" -f $verdict, $(if ($detail) { " — $detail" } else { '' }), $sw.Elapsed) `
+    -ForegroundColor $vColor
+Write-Host "  журнал: $journalRel/journal.jsonl"
 Write-Host ""
 
-if ($failed) { exit 1 }
-exit 0
+exit $code
 

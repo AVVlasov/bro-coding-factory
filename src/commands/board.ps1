@@ -18,7 +18,17 @@ if (-not $run) {
     exit 2
 }
 
-$state = if (-not $run.Complete) { 'ОБОРВАН' } elseif ($run.Failed) { "провалов $($run.Failed)" } else { 'завершён' }
+# Состояние берём по общему правилу (см. Get-BcfRunComplete): узлы могут отработать все,
+# а очередь остаться незакрытой. Доска, судящая по узлам, писала «завершён» для прогона,
+# про который отчёт в ту же секунду говорил «НЕПОЛНО».
+$state = if (-not $run.Complete) { 'ОБОРВАН' }
+         elseif ($run.DryPlan) { 'сухой план' }
+         elseif (-not (Get-BcfRunComplete -Run $run)) {
+             $t = Get-BcfRunTally -Run $run
+             if ($t) { "НЕПОЛНО · $t" } else { 'НЕПОЛНО' }
+         }
+         elseif ($run.Failed) { "провалов $($run.Failed)" }
+         else { 'завершён' }
 Write-BcfTitle "ГРАФ  $($run.Name)  ·  $($run.RunId)" `
                ("{0}  ·  узлов {1}  ·  {2}  ·  {3} токенов" -f $state, $run.NodeCount, (Format-BcfDuration $run.Duration), [int]$run.Tokens)
 

@@ -61,11 +61,19 @@ function Build-Board {
     $live = (-not $Run.Complete) -and ($age.TotalSeconds -lt $LIVE_SEC)
     $elapsed = if ($live) { (Get-Date) - $Run.Started } else { $Run.Duration }
 
+    # «Завершён» ≠ «сделал дело». Узлы могут отработать все до одного, а очередь остаться
+    # незакрытой — доска с зелёными 100% на таком прогоне противоречит отчёту, который в
+    # ту же секунду говорит «НЕПОЛНО». Правило одно на все экраны: Get-BcfRunComplete.
+    $doneOk = (-not $Run.DryPlan) -and $Run.Complete -and (Get-BcfRunComplete -Run $Run)
     $state = if ($Run.DryPlan) { 'сухой план' }
              elseif ($live) { 'идёт' }
              elseif (-not $Run.Complete) { 'ОБОРВАН' }
-             else { 'завершён' }
-    $stateColor = if ($live) { 'Cyan' } elseif ($Run.DryPlan) { 'DarkGray' } elseif (-not $Run.Complete) { 'Yellow' } else { 'Green' }
+             elseif ($doneOk) { 'завершён' }
+             else {
+                 $t = Get-BcfRunTally -Run $Run
+                 if ($t) { "НЕПОЛНО · $t" } else { 'НЕПОЛНО' }
+             }
+    $stateColor = if ($live) { 'Cyan' } elseif ($Run.DryPlan) { 'DarkGray' } elseif ($doneOk) { 'Green' } else { 'Yellow' }
 
     $head = '  ' + (Ink 'ГРАФ' 'White') + ' ' + (Ink $Run.Name 'Cyan') +
             '  ' + (Ink $Run.RunId 'DarkGray') +

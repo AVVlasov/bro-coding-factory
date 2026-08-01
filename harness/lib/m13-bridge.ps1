@@ -106,18 +106,23 @@ function Ensure-LmStudioEmbedding {
     return $false
 }
 
+. (Join-Path $PSScriptRoot 'docker.ps1')
+
 function Get-M13Health {
     # 'healthy'|'starting'|'unhealthy'|'stopped'|'absent'|'no-daemon'|'no-docker'.
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return 'no-docker' }
-    # Демон (Docker Desktop) поднят? `docker version` падает быстро если нет.
-    & docker version --format '{{.Server.Version}}' 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { return 'no-daemon' }
-    $state = (& docker inspect -f '{{.State.Status}}' $script:MemContainer 2>$null | Out-String).Trim()
-    if (-not $state) { return 'absent' }
+    # НЕ `docker version`: на Windows он не падает, а ЗАПУСКАЕТ Docker Desktop и ждёт его
+    # — прогон вис минутами, ничего не печатая. Канал демона существует ровно тогда,
+    # когда демон слушает, и проверка по нему ничего не запускает. См. lib/docker.ps1.
+    if (-not (Test-BcfDockerDaemon)) { return 'no-daemon' }
+    $r = Invoke-BcfDocker -DockerArgs @('inspect', '-f', '{{.State.Status}}', $script:MemContainer) -TimeoutSec 15
+    $state = ([string]$r.Out).Trim()
+    if (-not $r.Ok -or -not $state) { return 'absent' }
     if ($state -ne 'running') { return 'stopped' }
-    $h = (& docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' $script:MemContainer 2>$null | Out-String).Trim()
-    if ($h -eq 'none') { return 'healthy' }   # без healthcheck — running считаем healthy
-    return $h                                  # healthy | starting | unhealthy
+    $r2 = Invoke-BcfDocker -DockerArgs @('inspect', '-f', '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}', $script:MemContainer) -TimeoutSec 15
+    $h = ([string]$r2.Out).Trim()
+    if (-not $h -or $h -eq 'none') { return 'healthy' }   # без healthcheck — running считаем healthy
+    return $h                                              # healthy | starting | unhealthy
 }
 
 function Test-M13Available {

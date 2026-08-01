@@ -121,6 +121,29 @@ It 'каждый скрипт репозитория разбирается' {
     Assert-True ($bad.Count -eq 0) ("не разбираются: " + ($bad -join '; '))
 }
 
+# Регрессия. В проверке доступности памяти стояло `docker version` с комментарием
+# «падает быстро если нет». На Windows это неверно: при незапущенном Docker Desktop
+# docker.exe не падает, а ЗАПУСКАЕТ его и ждёт готовности. Наблюдалось: `bcf run queue`
+# висел больше шести минут, не напечатав ни строки, поднял Docker Desktop на машине
+# человека и вывесил поверх всего его диалог об ошибке. Снаружи — намертво зависший
+# прогон, зависший ещё до первой задачи.
+It 'проба демона docker отвечает мгновенно и ничего не запускает' {
+    . (Join-Path $root 'harness\lib\docker.ps1')
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $null = Test-BcfDockerDaemon
+    $sw.Stop()
+    Assert-True ($sw.ElapsedMilliseconds -lt 5000) "проба заняла $($sw.ElapsedMilliseconds) мс — она обязана отвечать мгновенно"
+
+    # И сам источник: возврат к `docker version` в проверке здоровья вернёт зависание.
+    $bridge = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\lib\m13-bridge.ps1')
+    $health = [regex]::Match($bridge, '(?ms)function Get-M13Health\s*\{.*?\n\}')
+    Assert-True $health.Success 'Get-M13Health не найдена — проверять нечего'
+    # Ищем ВЫЗОВ, а не упоминание: в коде стоит комментарий, объясняющий, почему так
+    # делать нельзя, и он обязан там остаться.
+    $call = [regex]::Match($health.Value, '(?m)^[^#\r\n]*docker\s+version')
+    Assert-True (-not $call.Success) 'в проверке здоровья снова вызывается docker version — на Windows он поднимает Docker Desktop и ждёт'
+}
+
 # --- Диспетчер -----------------------------------------------------------------------
 Write-Host '  диспетчер' -ForegroundColor White
 
@@ -885,6 +908,32 @@ It 'setup --check не создаёт ярлык и не трогает PATH' {
     Assert-True (-not (Test-Path $lnk)) '--check создал ярлык'
     Assert-True ($pathBefore -eq [Environment]::GetEnvironmentVariable('PATH', 'User')) '--check изменил PATH'
     Assert-Match $r.Out 'КОМАНДА bcf'
+}
+
+# Регрессия. Доска и карточка судили по УЗЛАМ, а отчёт — по итогу, который вернул сам
+# граф. На прогоне, где узлы отработали все до одного, а очередь закрылась 0 из 1, доска
+# показывала зелёные «завершён» и 100%, карточка — зелёную галочку, а отчёт в ту же
+# секунду говорил «НЕПОЛНО». Из трёх экранов два врали, и врали в сторону успеха.
+It 'доска, карточка и отчёт говорят о прогоне одно и то же' {
+    $p = New-Sandbox 'verdict-agree'
+    Bcf @('install', '--project', $p) | Out-Null
+    $g = Join-Path $p '.bcf\graph\g_20260101-000000_x'
+    New-Item -ItemType Directory -Force -Path $g | Out-Null
+    # Узел один и он УСПЕШЕН; очередь при этом закрылась 0 из 1 — это штатный исход,
+    # а не выдумка: «работа-TASK-01» завершается и тогда, когда задача не достигла PASS.
+    $res = '{\"complete\":false,\"passed\":0,\"total\":1,\"stuck\":1}'
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $g 'journal.jsonl') -Value @(
+        '{"ts":"2026-01-01T00:00:00Z","event":"run-start","name":"queue","nodes":1}'
+        '{"ts":"2026-01-01T00:00:01Z","event":"node-start","key":"n1","label":"работа-TASK-01","phase":"Работа","role":"worker"}'
+        '{"ts":"2026-01-01T00:00:30Z","event":"node-finish","key":"n1","ok":true,"tokens":10}'
+        ('{"ts":"2026-01-01T00:00:31Z","event":"run-finish","ok":true,"result":"' + $res + '"}')
+    )
+    foreach ($cmd in @(@('report'), @('board'), @('watch', '--once'))) {
+        $r = Bcf ($cmd + @('--project', $p))
+        Assert-Match $r.Out 'НЕПОЛНО' "bcf $($cmd -join ' ') выдаёт незакрытую очередь за успех"
+    }
+    $card = Bcf @('--project', $p)
+    Assert-Match $card.Out 'НЕПОЛНО' 'карточка выдаёт незакрытую очередь за успех'
 }
 
 It 'update --check не трогает рабочее дерево' {

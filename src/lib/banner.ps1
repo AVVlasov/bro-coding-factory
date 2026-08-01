@@ -160,6 +160,15 @@ function Write-BcfBanner {
         } elseif ($r.Failed -gt 0) {
             Write-BcfLine ("  {0,-10} $(Sym fail) {1} назад, узлов не дали результата: {2} (bcf log --failed)" -f `
                            'прогон', (Format-BcfDuration $age), $r.Failed) 'Red'
+        } elseif (-not $r.DryPlan -and -not (Get-BcfRunComplete -Run $r)) {
+            # Ни один узел не провалился, а очередь всё равно не закрылась — самый
+            # обманчивый исход: по узлам всё зелено, а сделано ничего.
+            $t = Get-BcfRunTally -Run $r
+            Write-BcfLine ("  {0,-10} $(Sym warn) {1} назад, НЕПОЛНО{2} (bcf report)" -f `
+                           'прогон', (Format-BcfDuration $age), $(if ($t) { " — $t" } else { '' })) 'Yellow'
+        } elseif ($r.DryPlan) {
+            Write-BcfLine ("  {0,-10} {1} назад — сухой план, агентов не звали (bcf run queue)" -f `
+                           'прогон', (Format-BcfDuration $age)) 'DarkGray'
         } else {
             Write-BcfLine ("  {0,-10} $(Sym ok) {1} назад · {2} · узлов {3} (bcf report)" -f `
                            'прогон', (Format-BcfDuration $age), $r.RunId, $r.NodeCount) 'Green'
