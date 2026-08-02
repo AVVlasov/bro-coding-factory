@@ -13,6 +13,7 @@
 . (Join-Path $BcfRoot 'src\lib\pricing.ps1')
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
 . (Join-Path $BcfRoot 'src\lib\mascot.ps1')
+. (Join-Path $BcfRoot 'src\lib\queue.ps1')
 . (Join-Path $BcfRoot 'src\lib\banner.ps1')
 
 $project = $script:BcfProject

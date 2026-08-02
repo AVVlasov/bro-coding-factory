@@ -322,6 +322,66 @@ It 'мастер сохраняет и убирает состояние .bcf/in
     Assert-True (Test-Path (Join-Path $p '.bcf\project.json')) 'карточка проекта не записана'
 }
 
+# Регрессия к сути шага 4: он объясняет, за что человек заплатит. «По задаче + слияния»
+# на это не отвечает — разница между очередью из двух задач и из двадцати и есть ответ.
+# Числа обязаны приходить из tasks/, а не из примера в шаблоне экрана.
+It 'шаг 4 считает узлы по настоящей очереди' {
+    $p = New-Sandbox 'init-step4-queue'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'tasks') | Out-Null
+    foreach ($t in @(@('01', 'a', 'src/a.rs'), @('02', 'b', 'src/b.rs'), @('03', 'c', 'src/c.rs'))) {
+        Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p "tasks\TASK-$($t[0])-$($t[1]).md") -Value @"
+# TASK-$($t[0]) — $($t[1])
+
+## Вход
+нет
+
+## Файлы
+- $($t[2])
+"@
+    }
+    $r = Bcf @('init', '--yes', '--dry', '--project', $p)
+    Assert-Match $r.Out 'узлов на очередь из 3 задач' 'заголовок колонки не назвал размер очереди'
+    Assert-Match $r.Out '3 \+ слияния' 'узлы работы не посчитаны по очереди'
+    # Владение чистое — планировщика граф не зовёт, и экран обязан говорить это же.
+    Assert-Match $r.Out '0 — владение непротиворечиво'
+}
+
+It 'шаг 4 называет коллизию владения и задачу без деклараций' {
+    $p = New-Sandbox 'init-step4-collision'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'tasks') | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-01-a.md') -Value @"
+# TASK-01 — a
+
+## Файлы
+- src/main.rs
+"@
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-02-b.md') -Value @"
+# TASK-02 — b
+
+## Файлы
+- src/main.rs
+"@
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-03-c.md') -Value "# TASK-03 — c`n`n## Готовность`n- работает`n"
+    $r = Bcf @('init', '--yes', '--dry', '--project', $p)
+    Assert-Match $r.Out 'владение пересекается: src/main\.rs — TASK-01 и TASK-02'
+    Assert-Match $r.Out 'файлы не объявлены: TASK-03'
+    Assert-Match $r.Out '1 — ревизия владения' 'узел планировщика при коллизии обязан быть посчитан'
+    # Задача без деклараций к работе не допускается — значит и в узлы работы не входит.
+    Assert-Match $r.Out '2 \+ слияния'
+}
+
+# Число критиков — свойство графа, а не мастера. Записанное в init константой, оно
+# останется тройкой и после того, как в граф добавят четвёртый ракурс.
+It 'критиков на экране столько, сколько ракурсов в графе' {
+    $graph = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\graphs\queue.graph.ps1')
+    $angles = @([regex]::Matches($graph, "-Label\s+'приёмка-([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+    Assert-True ($angles.Count -gt 0) 'в графе не нашлось ни одного узла приёмки — разошёлся разбор'
+    $p = New-Sandbox 'init-step4-critics'
+    $r = Bcf @('init', '--yes', '--dry', '--project', $p)
+    Assert-Match $r.Out "critic ×$($angles.Count)"
+    foreach ($a in $angles) { Assert-Match $r.Out ([regex]::Escape($a)) "ракурс '$a' не назван" }
+}
+
 It 'init --dry проходит все экраны и ничего не пишет' {
     $p = New-Sandbox 'init-dry'
     $r = Bcf @('init', '--yes', '--dry', '--project', $p)

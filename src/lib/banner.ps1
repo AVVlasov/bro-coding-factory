@@ -22,34 +22,11 @@ function Get-BcfBannerStatus {
     $cfg = $null
     try { $cfg = Get-BcfHarnessConfig -Project $Project } catch { }
 
-    # --- бэклог: считаем тем же, чем bcf tasks, чтобы числа не разъезжались ---
-    $prefix = if ($cfg -and $cfg.taskIdPrefix) { [string]$cfg.taskIdPrefix } else { 'TASK' }
-    $tasksRel = if ($cfg -and $cfg.paths -and $cfg.paths.tasks) { [string]$cfg.paths.tasks } else { 'tasks' }
-    $verdictsRel = if ($cfg -and $cfg.paths -and $cfg.paths.verdicts) { [string]$cfg.paths.verdicts } else { "$tasksRel/.verdicts" }
-    $tasksDir = Join-Path $Project ($tasksRel -replace '/', '\')
-    $verdictsDir = Join-Path $Project ($verdictsRel -replace '/', '\')
-
-    $tasks = @()
-    if (Test-Path $tasksDir) {
-        foreach ($f in (Get-ChildItem $tasksDir -Filter "$prefix-*.md" -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
-            if ($f.BaseName -match "^$([regex]::Escape($prefix))-\d+\.\d+") { continue }
-            $id = ($f.BaseName -split '-')[0..1] -join '-'
-            $vf = Join-Path $verdictsDir "$id.md"
-            $pass = (Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
-            $tasks += [pscustomobject]@{
-                Id = $id
-                Slug = ($f.BaseName -replace "^$([regex]::Escape($prefix))-\d+-", '')
-                Files = @(Get-TaskDeclaredFiles -TaskId $id -Root $Project)
-                Preds = @(Get-TaskPredecessors -TaskId $id -Root $Project -Prefix $prefix)
-                Pass = $pass
-            }
-        }
-    }
-    $passSet = @{}; foreach ($t in $tasks) { if ($t.Pass) { $passSet[$t.Id] = $true } }
-    foreach ($t in $tasks) {
-        $t | Add-Member -NotePropertyName 'Ready' `
-            -NotePropertyValue (-not $t.Pass -and (@($t.Preds | Where-Object { -not $passSet.ContainsKey($_) }).Count -eq 0)) -Force
-    }
+    # --- бэклог: тем же разборщиком, что у bcf tasks и у мастера, чтобы числа на
+    #     соседних экранах не разъезжались (см. src/lib/queue.ps1) ---
+    $q = Get-BcfQueue -Project $Project -Config $cfg
+    $prefix = $q.Prefix
+    $tasks = $q.Tasks
 
     # --- роли и бэкенды ---
     $roles = @()
@@ -88,8 +65,9 @@ function Get-BcfBannerStatus {
         Config = $cfg
         Prefix = $prefix
         Tasks = $tasks
-        Closed = @($tasks | Where-Object { $_.Pass }).Count
-        Ready = @($tasks | Where-Object { $_.Ready }).Count
+        Queue = $q
+        Closed = $q.Closed
+        Ready = $q.Ready
         Roles = $roles
         Memory = $mem
         MemoryOn = [bool]($cfg -and $cfg.features -and $cfg.features.memory)

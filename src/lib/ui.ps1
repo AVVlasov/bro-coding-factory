@@ -183,6 +183,20 @@ function Write-BcfNote {
 
 # Источник вывода. Печатается рядом со значением, а не в легенде внизу: легенду не
 # читают, а решение принимают по строке.
+# «1 задач» и «2 задача» — это не мелочь стиля: экран, который не умеет согласовать
+# число со словом, читается как черновик, и доверия к его числам меньше. Формы задаются
+# вызывающим: именительный (1), родительный единственного (2–4), родительный
+# множественного (5–20).
+function Format-BcfCount {
+    param([int]$N, [Parameter(Mandatory)][string[]]$Forms)
+    $n = [math]::Abs($N)
+    $form = if ($n % 100 -ge 11 -and $n % 100 -le 14) { $Forms[2] }
+            elseif ($n % 10 -eq 1) { $Forms[0] }
+            elseif ($n % 10 -ge 2 -and $n % 10 -le 4) { $Forms[1] }
+            else { $Forms[2] }
+    return "$N $form"
+}
+
 function Get-BcfSourceTag {
     param([ValidateSet('проверено', 'уверенно', 'догадка')][string]$Source)
     switch ($Source) {

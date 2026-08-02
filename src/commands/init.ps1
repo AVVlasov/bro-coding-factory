@@ -20,6 +20,7 @@
 . (Join-Path $BcfRoot 'src\lib\tui.ps1')
 . (Join-Path $BcfRoot 'src\lib\mascot.ps1')
 . (Join-Path $BcfRoot 'src\lib\wizard.ps1')
+. (Join-Path $BcfRoot 'src\lib\queue.ps1')
 
 $dry         = $script:BcfArgs -contains '--dry'
 $reconfigure = $script:BcfArgs -contains '--reconfigure'
@@ -298,23 +299,87 @@ function Show-Step3 {
 # ======================================================================================
 #  ШАГ 4 — РОЛИ ГРАФА
 # ======================================================================================
+#
+# ЧИСЛА ЗДЕСЬ — ИЗ НАСТОЯЩЕЙ ОЧЕРЕДИ, А НЕ ИЗ ПРИМЕРА.
+#
+# Экран объясняет, за что человек будет платить, и «по задаче + слияния» на этот вопрос
+# не отвечает: разница между очередью из двух задач и из двадцати — это разница между
+# прогоном за пять минут и прогоном на ночь. Всё, что тут названо, вычислимо без единого
+# токена: задачи лежат в tasks/, ракурсы приёмки — в самом графе.
 function Show-Step4 {
+    param([string]$Root)
+
+    $q = $null
+    try { $q = Get-BcfQueue -Project $Root } catch { }
+    $angles = @(Get-BcfCriticAngles)
+    $nCritic = $angles.Count
+
     Write-BcfStepHeader -Step 4 -Total $TOTAL -Title 'роли графа'
-    Write-Host ('  ' + (Ink 'РОЛИ ГРАФА' 'Cyan') + '  ' + (Ink 'шаблон «рой, 4 роли»' 'DarkGray'))
+    $queueNote = if (-not $q -or -not $q.Exists) { "папки $(if ($q) { $q.TasksRel } else { 'tasks' })/ нет — очередь пустая" }
+                 elseif (-not $q.Open) { 'открытых задач нет — очередь пустая' }
+                 else { "очередь: $(Format-BcfCount $q.Open @('задача','задачи','задач')) · $(Format-BcfCount $q.Waves.Count @('волна','волны','волн'))" }
+    Write-Host ('  ' + (Ink 'РОЛИ ГРАФА' 'Cyan') + '  ' + (Ink "шаблон «рой, 4 роли» · $queueNote" 'DarkGray'))
     Write-Host ''
 
+    $live = [bool]($q -and $q.Open)
     $rows = New-BcfRows
-    Add-BcfRow $rows @('Разметка', 'planner',          '1 — дорогой, решает рамку')
-    Add-BcfRow $rows @('Работа',   'worker → arbiter', 'по задаче + слияния — дешёвые, их много')
-    Add-BcfRow $rows @('Приёмка',  'critic ×N',        'N — читают слитое дерево')
-    Add-BcfRow $rows @('Итог',     '(скрипт)',         '0 — без модели')
-    Write-BcfTable -Headers @('фаза', 'роли', 'узлов на очередь') -Widths @(12, 20, 42) -Rows $rows
+    if ($live) {
+        # planner зовут ТОЛЬКО при коллизии владения или задаче без объявленных файлов:
+        # при чистых декларациях граф этот узел не запускает вовсе.
+        $needPlan = [bool]($q.Collisions.Count -or $q.Undeclared.Count)
+        $planCell = if ($needPlan) { '1 — ревизия владения, разбор ниже' }
+                    else { '0 — владение непротиворечиво, узел не запускается' }
+        $workCell = if ($q.Admitted -eq $q.Open) { "$($q.Admitted) + слияния — дешёвые, их много" }
+                    else { "$($q.Admitted) + слияния — не допущено: $($q.Open - $q.Admitted)" }
+        Add-BcfRow $rows @('Разметка', 'planner',          $planCell)
+        Add-BcfRow $rows @('Работа',   'worker → arbiter', $workCell)
+        Add-BcfRow $rows @('Приёмка',  "critic ×$nCritic", "$nCritic — читают слитое дерево")
+        Add-BcfRow $rows @('Итог',     '(скрипт)',         '0 — без модели')
+        Write-BcfTable -Headers @('фаза', 'роли', "узлов на очередь из $(Format-BcfCount $q.Open @('задачи','задач','задач'))") -Widths @(12, 20, 46) -Rows $rows
+
+        # ЧЕМ ЗАНЯТ ЛИШНИЙ УЗЕЛ. Строка таблицы называет число, но не причину, а причина
+        # здесь — единственное, с чем человек может что-то сделать до прогона: развести
+        # владение руками дешевле, чем платить планировщику за то же решение.
+        if ($needPlan) {
+            Write-Host ''
+            foreach ($c in @($q.Collisions | Select-Object -First 4)) { Write-BcfWarn "владение пересекается: $c" }
+            if ($q.Collisions.Count -gt 4) { Write-BcfNote "… ещё $($q.Collisions.Count - 4)" }
+            if ($q.Undeclared.Count) {
+                Write-BcfWarn "файлы не объявлены: $($q.Undeclared -join ', ') — к работе не допустят"
+                Write-BcfNote 'секция «## Файлы» — это допуск: без неё проверить, что задача не залезет в чужой'
+                Write-BcfNote 'файл, нечем, и расползание скоупа обнаружится только на слиянии.'
+            }
+        }
+        if ($q.Blocked.Count) {
+            Write-BcfWarn "не попадут ни в одну волну: $($q.Blocked -join ', ') — предшественник не закроется"
+        }
+    } else {
+        Add-BcfRow $rows @('Разметка', 'planner',          '1, и только при коллизии владения')
+        Add-BcfRow $rows @('Работа',   'worker → arbiter', 'по задаче + слияния — дешёвые, их много')
+        Add-BcfRow $rows @('Приёмка',  "critic ×$nCritic", "$nCritic — читают слитое дерево")
+        Add-BcfRow $rows @('Итог',     '(скрипт)',         '0 — без модели')
+        Write-BcfTable -Headers @('фаза', 'роли', 'узлов на очередь') -Widths @(12, 20, 46) -Rows $rows
+        Write-Host ''
+        Write-BcfNote 'числа появятся, когда в tasks/ лягут задачи: узлы считаются по очереди, а не по шаблону.'
+    }
 
     Write-Host ''
     Write-BcfOk 'planner   рамка: DAG по зависимостям, коллизии владения файлами, вердикт'
     Write-BcfOk 'worker    исполнение: одна задача — один агент — один файл-владелец'
     Write-BcfOk 'arbiter   слияние: снимает конфликты, решает, чей вариант остаётся'
-    Write-BcfOk 'critic    приёмка с разных ракурсов по слитому дереву'
+    $angleTxt = if ($nCritic) { "приёмка, ракурсы: $($angles -join ' · ')" } else { 'приёмка по слитому дереву' }
+    Write-BcfOk "critic    $angleTxt"
+
+    # ОПЦИОНАЛЬНЫЕ РОЛИ. Их здесь не включают галочкой — включать пока некуда: в графе
+    # очереди нет узла, на который они бы встали. Промолчать нельзя: роль, у которой есть
+    # файл в agents/ и строка в config/agents.json, выглядит подключённой.
+    Write-Host ''
+    Write-Host ('  ' + (Ink 'ОСТАЛЬНЫЕ РОЛИ — НЕ УЗЛЫ ЭТОГО ГРАФА' 'White'))
+    Write-BcfNote '· researcher     отдельной командой до работы: bcf research TASK-NN'
+    Write-BcfNote '· retrospector   внутри цикла задачи, после вердикта — если подключена память'
+    Write-BcfNote '· test-author · judge · ux-vision   описания есть, узлов в графе нет'
+    Write-BcfNote 'поставить их в очередь галочкой нельзя — это правка графа, а не настройки.'
+
     Write-Host ''
     Write-Host ('  ' + (Ink 'правила, которые init не даст нарушить' 'White'))
     Write-BcfNote '· critic не сидит на модели worker: одна модель на одном контексте приходит к одной'
@@ -564,7 +629,12 @@ $survey = Show-Step3
 if (-not $survey) { Write-Host ''; Write-BcfDim 'выход — ничего не записано'; Write-Host ''; exit 130 }
 Save-BcfWizardState -Project $project -State @{ step = 3; root = $root }
 
-if (-not (Show-Step4)) { Write-Host ''; Write-BcfDim 'выход — ничего не записано'; Write-Host ''; exit 130 }
+# Префикс задач нужен уже четвёртому шагу (он считает очередь), а не только записи:
+# проект мог переименовать TASK- во что-то своё, и очередь по чужому префиксу пуста.
+$prefix = 'TASK'
+try { $c0 = Get-BcfHarnessConfig -Project $root; if ($c0 -and $c0.taskIdPrefix) { $prefix = [string]$c0.taskIdPrefix } } catch { }
+
+if (-not (Show-Step4 -Root $root)){ Write-Host ''; Write-BcfDim 'выход — ничего не записано'; Write-Host ''; exit 130 }
 Save-BcfWizardState -Project $project -State @{ step = 4; root = $root }
 
 $roles = Show-Step5 -Survey $survey -Roles (Get-DefaultRoles -Survey $survey)
@@ -574,8 +644,7 @@ Save-BcfWizardState -Project $project -State @{ step = 5; root = $root; roles = 
 if (-not (Show-Step6 -Root $root -Detect $d)) { Write-Host ''; Write-BcfDim 'выход'; Write-Host ''; exit 130 }
 Save-BcfWizardState -Project $project -State @{ step = 6; root = $root; roles = $roles }
 
-$prefix = 'TASK'
-if (-not (Show-Step7 -Root $root -Prefix $prefix)) { Write-Host ''; Write-BcfDim 'выход'; Write-Host ''; exit 130 }
+if (-not (Show-Step7 -Root $root -Prefix $prefix)){ Write-Host ''; Write-BcfDim 'выход'; Write-Host ''; exit 130 }
 Save-BcfWizardState -Project $project -State @{ step = 7; root = $root; roles = $roles }
 
 # ======================================================================================
