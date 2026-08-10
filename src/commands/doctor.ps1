@@ -211,11 +211,20 @@ if (-not (Test-Path $memClient)) {
         try {
             $j = $stats | ConvertFrom-Json
             $ap = [int]$j.anti_patterns; $bg = [int]$j.bugs; $rc = [int]$j.recalls
-            $col = if ($ap -le 1) { 'Yellow' } else { 'Green' }
+            # ПУСТАЯ БАЗА — НЕ ДИАГНОЗ «ЗАПИСЬ СЛОМАНА». Вердикт общий с графом и
+            # `bcf memory status`: три копии этого текста уже разъехались однажды.
+            . (Join-Path (Get-BcfHarness) 'lib\graph-memory.ps1')
+            $v = Get-BcfLearningVerdict -Lessons $ap -Project $project
+
+            $col = if ($v.Level -eq 'broken') { 'Yellow' } else { 'Green' }
             Write-BcfLine ("  ✓ доступна · уроков {0} · багов {1} · отзывов {2}" -f $ap, $bg, $rc) $col
-            if ($ap -le 1) {
-                Write-BcfLine '    ⚠ уроков почти нет: чтение работает, запись — нет. После прогона число обязано вырасти.' 'Yellow'
+            if ($v.Level -eq 'broken') {
+                Write-BcfLine "    ⚠ $($v.Text)" 'Yellow'
+                Write-BcfNote 'провал узла и подтверждённая находка критика обязаны становиться уроками.'
                 $warn++
+            } elseif ($v.Level -eq 'empty') {
+                Write-BcfLine "    · $($v.Text)" 'DarkGray'
+                Write-BcfNote 'после первого прогона число обязано вырасти; если не выросло — запись не работает.'
             }
         } catch { Write-BcfOk 'доступна (счётчики не разобрались)' }
     } else {
@@ -275,6 +284,163 @@ if (Test-Path $checksFile) {
 } else {
     Write-BcfWarn 'config/checks.json нет — вердикт не на чем строить (bcf install)'
     $warn++
+}
+
+# --- ЕСТЬ ЛИ ЧЕМ ВЫПОЛНИТЬ ГЕЙТ -------------------------------------------------------
+#
+# Проверка, инструмента для которой в проекте нет, — это не «строгий гейт», это гейт,
+# который падает всегда и по причине, не имеющей отношения к работе. Хуже того, npm на
+# отсутствующий локальный бинарь подсовывает одноимённый пакет из реестра: `npx tsc`
+# отвечает «This is not the tsc command you are looking for», и в логе это выглядит как
+# поломка компилятора, а не как незаявленная зависимость.
+#
+# Цена измерена: 2026-08-06 typescript не был объявлен в package.json и жил в node_modules
+# случайно. Первая же чистая установка его вымела — и слияние ДВУХ готовых задач волны
+# упало на «проверки на слитом дереве красные». Проверяется дёшево и до прогона.
+$allCmds = @($bp)
+if (Test-Path $checksFile) {
+    try {
+        $cj2 = Get-Content -Raw -LiteralPath $checksFile | ConvertFrom-Json
+        foreach ($p in $cj2.PSObject.Properties) {
+            if ($p.Name -like '_*') { continue }
+            $allCmds += @($p.Value | Where-Object { $_ -is [string] })
+        }
+        $allCmds += @($cj2._default | Where-Object { $_ -is [string] })
+    } catch { }
+}
+
+$missingBins = @{}
+foreach ($c in @($allCmds | Where-Object { $_ })) {
+    # Интересует ровно форма «npx [--флаги] <бинарь>»: она обещает локальный инструмент.
+    $m = [regex]::Match([string]$c, '^\s*npx\s+((?:--[\w-]+\s+)*)([\w.@/-]+)')
+    if (-not $m.Success) { continue }
+    $bin = $m.Groups[2].Value
+    if ($bin -like '-*') { continue }
+    $hit = @("$bin", "$bin.cmd", "$bin.ps1") | Where-Object {
+        Test-Path (Join-Path $project (Join-Path 'node_modules\.bin' $_))
+    }
+    if (-not $hit) { $missingBins[$bin] = $c }
+}
+foreach ($bin in ($missingBins.Keys | Sort-Object)) {
+    Write-BcfFail "гейт нечем выполнить: '$bin' не установлен (node_modules/.bin пуст на него)"
+    Write-BcfNote "команда: $($missingBins[$bin])"
+    Write-BcfNote 'npx подставит одноимённый пакет из реестра, и падение будет выглядеть'
+    Write-BcfNote "поломкой инструмента. Объяви зависимость в package.json и поставь: npm i -D $bin"
+    $bad++
+}
+
+# --- ЧТО ДОКАЗЫВАЕТ ЗЕЛЁНЫЙ ПРОГОН ------------------------------------------------------
+#
+# Разбор clinic-scheduler (2026-08-09): прогон закрыл 35 задач из 35 и напечатал COMPLETE,
+# а продуктом пользоваться было нельзя — ни одного работающего клиентского пути. Гейты не
+# соврали, они отвечали на другой вопрос: «дерево в порядке», а не «человек может работать».
+# Здесь doctor говорит заранее, ЧТО именно докажет зелёный прогон этого проекта.
+Write-Host ''
+Write-BcfLine '  ЧТО ДОКАЖЕТ ЗЕЛЁНЫЙ ПРОГОН' 'White'
+Write-Host ''
+
+$jFile = Join-Path $project 'config\journeys.json'
+if (-not (Test-Path $jFile)) {
+    Write-BcfWarn 'сквозные сценарии не заведены (config/journeys.json)'
+    Write-BcfNote 'зелёный прогон докажет состояние дерева, но НЕ то, что продуктом можно пользоваться:'
+    Write-BcfNote 'ни один гейт не запускает приложение и не проходит путь пользователя.'
+    Write-BcfNote 'завести: config/journeys.json со списком путей, ради которых продукт существует.'
+    $warn++
+} else {
+    try {
+        $jr = Get-Content -Raw -LiteralPath $jFile | ConvertFrom-Json
+        $js = @($jr.journeys | Where-Object { $_ -and $_.id })
+        if (-not $js.Count) {
+            Write-BcfFail 'config/journeys.json заведён, но список сценариев пуст'
+            $bad++
+        } else {
+            # planned — путь назван, но ещё не доказан: это состояние плана, а не дефект
+            # настройки. Требовать файл для него значило бы запретить объявлять цели.
+            $plannedJ  = @($js | Where-Object { ([string]$_.status) -eq 'planned' })
+            $requiredJ = @($js | Where-Object { ([string]$_.status) -ne 'planned' })
+            $noProof = @($requiredJ | Where-Object {
+                (-not $_.proof) -or -not (Test-Path (Join-Path $project ([string]$_.proof -replace '/', [IO.Path]::DirectorySeparatorChar)))
+            })
+            if ($noProof.Count) {
+                Write-BcfFail "сценариев без файла-доказательства: $($noProof.Count) из $($requiredJ.Count) обязательных"
+                foreach ($n in $noProof) { Write-BcfNote "$($n.id) -> $($n.proof)" }
+                Write-BcfNote 'объявленный, но не доказанный сценарий выглядит покрытым — это хуже отсутствующего.'
+                Write-BcfNote 'если путь ещё не делается — поставь ему "status": "planned".'
+                $bad++
+            } elseif (-not $requiredJ.Count) {
+                Write-BcfWarn "все $($js.Count) сценариев в статусе planned — ни один путь продукта пока не доказан"
+                Write-BcfNote 'зелёный прогон докажет состояние дерева, но не работу пользователя.'
+                $warn++
+            } else {
+                Write-BcfOk "сквозных сценариев доказано: $($requiredJ.Count) из $($js.Count)"
+                Write-BcfNote 'прогнать: pwsh harness/journey-gate.ps1'
+            }
+            if ($plannedJ.Count -and $noProof.Count -eq 0 -and $requiredJ.Count) {
+                Write-BcfWarn "путей объявлено, но ещё не доказано (planned): $($plannedJ.Count)"
+                foreach ($p in $plannedJ) { Write-BcfNote "$($p.id) — $($p.title)" }
+                Write-BcfNote 'пока они planned, «продукт готов» сказать нельзя — доказана только часть путей.'
+                $warn++
+            }
+        }
+    } catch { Write-BcfFail "config/journeys.json не разобран: $($_.Exception.Message)"; $bad++ }
+}
+
+# --- КОНФИГ ПРОТИВ ФАЙЛОВОЙ СИСТЕМЫ ------------------------------------------------------
+#
+# `bcf init` кладёт шаблоны-примеры (scope-map с slug'ами home/settings, пути src/api/,
+# server/). Проект, который их не переписал, получает не «строгую настройку», а тихую
+# деградацию: правка не попадает ни в один slug, визуальная фаза схлопывается в __none__,
+# скоуп тестеров не матчится ни на что. Всё это выглядит в логе как «нечего проверять».
+$fsProblems = 0
+
+$pp = @()
+if ($cfg -and $cfg.productPaths) { $pp = @($cfg.productPaths | Where-Object { $_ }) }
+if (-not $pp.Count) {
+    Write-BcfWarn 'productPaths пуст — «прогресса нет» и область ревью определить нечем'
+    $warn++
+} else {
+    $ppMissing = @($pp | Where-Object { -not (Test-Path (Join-Path $project ([string]$_ -replace '/', [IO.Path]::DirectorySeparatorChar))) })
+    if ($ppMissing.Count) {
+        Write-BcfFail "productPaths указывает на несуществующие каталоги: $($ppMissing -join ', ')"
+        Write-BcfNote 'правки вне реальных productPaths не считаются работой над задачей.'
+        $bad++
+    } else { Write-BcfOk "productPaths: $($pp -join ', ')" }
+}
+
+$smFile = Join-Path $project 'config\scope-map.json'
+if (Test-Path $smFile) {
+    try {
+        $sm = Get-Content -Raw -LiteralPath $smFile | ConvertFrom-Json
+        $deadTesters = @()
+        foreach ($t in @($sm.testers)) {
+            if (-not $t.patterns) { continue }
+            $alive = @($t.patterns | Where-Object {
+                $p = ([string]$_).TrimEnd('/*') -replace '/', [IO.Path]::DirectorySeparatorChar
+                $p -and (Test-Path (Join-Path $project $p))
+            })
+            if (-not $alive.Count) { $deadTesters += [string]$t.tester }
+        }
+        if ($deadTesters.Count) {
+            Write-BcfWarn "скоуп тестеров не матчится ни на один реальный путь: $($deadTesters -join ', ')"
+            Write-BcfNote 'похоже на неотредактированный шаблон из bcf init — тестер будет молча отбрасываться.'
+            $warn++; $fsProblems++
+        }
+        $deadSlugs = @()
+        foreach ($r in @($sm.vision.rules)) {
+            if (-not $r.patterns) { continue }
+            $alive = @($r.patterns | Where-Object {
+                $p = ([string]$_).TrimEnd('/*') -replace '/', [IO.Path]::DirectorySeparatorChar
+                $p -and (Test-Path (Join-Path $project $p))
+            })
+            if (-not $alive.Count) { $deadSlugs += [string]$r.slug }
+        }
+        if ($deadSlugs.Count) {
+            Write-BcfWarn "визуальные slug'и не матчатся ни на один реальный путь: $($deadSlugs -join ', ')"
+            Write-BcfNote 'любая правка отобразится в __none__, и визуальная фаза пропустится целиком.'
+            $warn++; $fsProblems++
+        }
+        if (-not $fsProblems) { Write-BcfOk 'scope-map совпадает с деревом проекта' }
+    } catch { Write-BcfFail "config/scope-map.json не разобран: $($_.Exception.Message)"; $bad++ }
 }
 
 # --- Итог -----------------------------------------------------------------------------

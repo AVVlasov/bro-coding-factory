@@ -1220,14 +1220,30 @@ $culprit
     Append-Event -EventType 'verify-requested' -TaskId $focus -Phase 'C-E' -Iteration $i `
       -Payload @{ marker_content = ((Get-Content $verifyMarker -Raw) -join "`n") }
     $verifyPs1 = Join-Path $PSScriptRoot "verify.ps1"
-    $vArgs = @('-NoProfile', '-File', $verifyPs1, $focus)
+    # КОРЕНЬ ПЕРЕДАЁТСЯ ЯВНО — ИНАЧЕ ВЕРИФИКАЦИЯ УХОДИТ В ЧУЖОЕ ДЕРЕВО.
+    #
+    # verify.ps1 без -ProjectRoot берёт корень из $env:BCF_PROJECT_ROOT, а его выставляет
+    # `bcf` на ОСНОВНОЙ проект. В графе цикл работает в worktree задачи, и расхождение
+    # даёт расщеплённый прогон целиком: проверки исполняются на основном дереве (то есть
+    # на коде БЕЗ работы агента и потому красные), вердикт пишется туда же, а цикл ищет
+    # его у себя и не находит. Дальше цикл рапортует агенту «verify не дал вердикта» —
+    # то есть требует от него починить дефект обвязки. Наблюдалось живьём 2026-08-06:
+    # TASK-01 сделан правильно (гейты в ветке зелёные), но задача умерла по
+    # loop-detection, а за ней каскадом не поехали остальные восемь.
+    $vArgs = @('-NoProfile', '-File', $verifyPs1, $focus, '-ProjectRoot', $root)
     if ($Model) { $vArgs += @('-Model', $Model) }
     # M-09 F-fix (2026-05-25): пробрасываем свой session_id, чтобы verify не считал
     # эту loop-сессию «конкурентной» (см. verify.ps1 F-check).
     $env:RALPH_PARENT_SESSION_ID = (Get-EventBusSession)
     # M-13/M (2026-05-28): pre-iter ref для impact-mode тестеров.
     if ($preIterTreeRef) { $env:RALPH_PRE_ITER_REF = $preIterTreeRef }
+    # Переменную окружения подменяем тоже: verify запускает тестеров и судью отдельными
+    # процессами, и они возьмут корень из окружения, а не из нашего параметра.
+    $prevProjectRoot = $env:BCF_PROJECT_ROOT
+    $env:BCF_PROJECT_ROOT = $root
     & pwsh @vArgs
+    if ($null -ne $prevProjectRoot) { $env:BCF_PROJECT_ROOT = $prevProjectRoot }
+    else { Remove-Item env:BCF_PROJECT_ROOT -ErrorAction SilentlyContinue }
     Remove-Item env:RALPH_PARENT_SESSION_ID -ErrorAction SilentlyContinue
     Remove-Item env:RALPH_PRE_ITER_REF      -ErrorAction SilentlyContinue
     Log "verify.ps1 завершён (exit $LASTEXITCODE)."
@@ -1457,8 +1473,10 @@ $culprit
 
 ## Итерация $i — ТЫ ЗАСТРЯЛ, НО ЗАДАЧА НЕ ЗАКРЫТА
 
-$NoProgressLimit итерации подряд БЕЗ изменений продуктового кода (src/, electron/, backend/).
-Правки в .bcf/ (STATE.md, human-callout.md и пр.) НЕ считаются прогрессом — раннер их игнорирует.
+$NoProgressLimit итерации подряд БЕЗ изменений продуктового кода ($(@($Cfg.productPaths | Where-Object { $_ }) -join ', ')).
+Правки в .bcf/ (STATE.md, contract.json, human-callout.md и пр.) НЕ считаются прогрессом —
+раннер их игнорирует. Договорённости и планы прогрессом тоже не являются: итерация без правки
+продуктового файла потрачена впустую, сколько бы артефактов в ней ни появилось.
 
 У тебя ещё $remaining итераций. НЕ останавливайся. Сделай СЛЕДУЮЩЕЕ:
 1. Возьми КОНКРЕТНУЮ упавшую проверку из remediation последнего вердикта (ниже) и почини её

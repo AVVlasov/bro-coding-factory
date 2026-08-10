@@ -112,11 +112,43 @@ function Emit-RunAllReport {
   # $StatusFile переопределяется ради сухих прогонов: у них «не закрыто» — артефакт
   # режима, а не факт, и записывать его в боевой статус нельзя.
   param([array]$Passed, [array]$Stuck, [int]$Total, [string]$Root, [string]$ReviewFile, [string]$Ts,
-        [string]$StatusFile = '')
+        [string]$StatusFile = '',
+        # Число P1, найденных приёмкой на слитом дереве. Граф уже их считает, а отчёт о
+        # них не знал: круг приёмки печатал «COMPLETE» и следом список из трёх P1.
+        # Находка уровня «пользователь видит неверные данные» — это не примечание к
+        # готовности, это её отсутствие.
+        [int]$AcceptanceP1 = 0)
 
   $gateBlocked = @($Stuck | Where-Object { $_.Reason -like 'gate-block*' })
   $needsHuman  = @($Stuck | Where-Object { $_.Reason -notlike 'gate-block*' })
-  $complete    = (@($Stuck).Count -eq 0)
+  $queueClosed = (@($Stuck).Count -eq 0)
+
+  # СКВОЗНЫЕ СЦЕНАРИИ — условие уровня ПРОДУКТА, а не суммы задач.
+  #
+  # 2026-08-09, clinic-scheduler: этот отчёт напечатал «COMPLETE — все 35 задач закрыты
+  # (PASS)» ровно в тот момент, когда в продукте не работал ни один клиентский путь.
+  # Отчёт не соврал про задачи — он соврал тем, что молча приравнял закрытую очередь к
+  # готовому продукту. Закрытая очередь означает только, что каждая задача доказала себя
+  # своими тестами; она ничего не говорит о стыках между ними и об отсутствующих кусках.
+  # Поэтому COMPLETE теперь требует ДВУХ условий, и каждое называется отдельно.
+  $journeyState   = 'not-configured'
+  $journeySummary = ''
+  try {
+    $jgScript = Join-Path $PSScriptRoot 'journey-gate.ps1'
+    if (Test-Path -LiteralPath $jgScript) {
+      $jgOut  = (& pwsh -NoProfile -NonInteractive -File $jgScript -ProjectRoot $Root -Json 2>&1 | Out-String)
+      $jgCode = $LASTEXITCODE
+      try {
+        $jg = $jgOut | ConvertFrom-Json
+        if ($jg.state) { $journeyState = [string]$jg.state }
+        $journeySummary = [string]$jg.summary
+      } catch {
+        $journeyState = switch ($jgCode) { 0 { 'ok' } 3 { 'not-configured' } 4 { 'partial' } default { 'fail' } }
+      }
+    }
+  } catch { $journeyState = 'unknown'; $journeySummary = $_.Exception.Message }
+
+  $complete = $queueClosed -and ($journeyState -eq 'ok') -and ($AcceptanceP1 -eq 0)
 
   $reasonOf = @{}
   foreach ($s in $Stuck) { $reasonOf[$s.Task] = $s.Reason }
@@ -129,7 +161,10 @@ function Emit-RunAllReport {
 
   # run-all.status.json — машиночитаемый сигнал для вызывающего агента/автоматизации.
   $statusObj = [ordered]@{
-    complete     = $complete
+    complete       = $complete
+    queue_closed   = $queueClosed
+    journeys       = $journeyState
+    acceptance_p1  = $AcceptanceP1
     when         = $Ts
     total        = $Total
     passed       = @($Passed).Count
@@ -152,9 +187,35 @@ function Emit-RunAllReport {
   } else { "- (нет)" }
   $gateLines = if ($gateBlocked.Count) { ($gateBlocked | ForEach-Object { "- **$($_.Task)** — $($_.Reason)" }) -join "`n" } else { "- (нет)" }
   $statusLine = if ($complete) {
-    "**Статус:** COMPLETE — все $Total задач закрыты (PASS)."
+    "**Статус:** COMPLETE — все $Total задач закрыты (PASS) И сквозные сценарии продукта зелёные."
+  } elseif ($queueClosed -and $journeyState -eq 'not-configured') {
+    "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ПРОДУКТ НЕ ПРОВЕРЕН — все $Total задач закрыты (PASS), " +
+    "но сквозные сценарии не заведены (config/journeys.json). Это НЕ «готово»: закрытая очередь " +
+    "означает, что каждая задача доказала себя своими тестами, и ничего не говорит о том, может ли " +
+    "человек выполнить работу. Заведи реестр сценариев — иначе следующий такой отчёт снова будет " +
+    "прочитан как «продукт готов»."
+  } elseif ($queueClosed -and $journeyState -eq 'ok' -and $AcceptanceP1 -gt 0) {
+    "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ЕСТЬ P1 ПРИЁМКИ — все $Total задач закрыты (PASS) и сценарии зелёные, " +
+    "но приёмка на слитом дереве нашла P1: $AcceptanceP1. P1 — это «пользователь видит неверные данные» " +
+    "или «путь не проходится»; такие находки не бывают примечанием к готовности. НЕ принимать за «готово»."
+  } elseif ($queueClosed -and $journeyState -eq 'partial') {
+    "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ПРОДУКТ ДОКАЗАН ЧАСТИЧНО — все $Total задач закрыты (PASS), " +
+    "доказанные пути зелёные, но часть путей в config/journeys.json ещё объявлена planned " +
+    "($journeySummary). Готовность продукта равна доле доказанных путей, а не доле закрытых задач."
+  } elseif ($queueClosed) {
+    "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, СЦЕНАРИИ КРАСНЫЕ — все $Total задач закрыты (PASS), но сквозные " +
+    "сценарии продукта не проходят ($journeySummary). Пользоваться продуктом нельзя. НЕ принимать за «готово»."
   } else {
     "**Статус:** INCOMPLETE — не закрыто $(@($Stuck).Count) из $Total (требуют человека: $($needsHuman.Count), каскад-гейт: $($gateBlocked.Count)). НЕ принимать за «готово»."
+  }
+  $journeyBlock = switch ($journeyState) {
+    'ok'             { "## Сквозные сценарии продукта`nЗелёные — $journeySummary`n`n" }
+    'partial'        { "## Сквозные сценарии продукта`n**Доказана часть** — $journeySummary`n" +
+                       "Остальные пути объявлены в config/journeys.json как planned: они названы, но ещё не доказаны.`n`n" }
+    'fail'           { "## Сквозные сценарии продукта`n**КРАСНЫЕ** — $journeySummary`nПодробности: ``pwsh harness/journey-gate.ps1```n`n" }
+    'not-configured' { "## Сквозные сценарии продукта`n**Не заведены** (config/journeys.json). Ни один гейт этого прогона не запускал приложение: " +
+                       "проверено состояние дерева, а не работа пользователя.`n`n" }
+    default          { "## Сквозные сценарии продукта`nСостояние неизвестно: $journeySummary`n`n" }
   }
   $rootHint = if ($needsHuman.Count) {
     "## Корень: почини это первым`n" +
@@ -169,6 +230,7 @@ function Emit-RunAllReport {
     "# Ralph overnight run-all — итог`n`n" +
     "**Когда:** $Ts`n$statusLine`n**Закрыто (PASS):** $(@($Passed).Count) / $Total`n`n" +
     $rootHint +
+    $journeyBlock +
     "## PASS`n$passLines`n`n" +
     "## Требуют вмешательства (сама задача застряла/упала)`n$humanLines`n`n" +
     "## Заблокированы каскад-гейтом (закроются после фикса предшественника)`n$gateLines`n`n" +

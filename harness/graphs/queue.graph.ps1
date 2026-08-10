@@ -94,15 +94,23 @@ foreach ($t in ($tasks | Sort-Object Num)) {
 
 # Владение файлами — та самая мина, которая ломала прогоны: три UI-задачи подряд
 # лезли в файл, закреплённый за четвёртой. Ловим ДО запуска, а не по факту слияния.
+#
+# ЗАКРЫТЫЕ ЗАДАЧИ В АНАЛИЗЕ НЕ УЧАСТВУЮТ. Они не поедут, значит столкнуться ни с кем не
+# могут. Пока они считались наравне со всеми, повторный прогон по бэклогу с исправлениями
+# звал ПЛАНИРОВЩИКА (рамочная модель, дорогая) ради разведения задачи с той, что закрыта
+# неделю назад: «строго последовательно: TASK-06 → TASK-11» — сериализация, не меняющая
+# ничего. То же и с необъявленными файлами: закрытая задача без секции «## Файлы» тянула
+# за собой ревизию плана на каждом прогоне.
 $owner = @{}
 $collisions = @()
 foreach ($t in $tasks) {
+    if ($t.Pass) { continue }
     foreach ($fl in $t.Files) {
         if ($owner.ContainsKey($fl)) { $collisions += "$fl — $($owner[$fl]) и $($t.Id)" }
         else { $owner[$fl] = $t.Id }
     }
 }
-$undeclared = @($tasks | Where-Object { -not $_.Files.Count } | ForEach-Object { $_.Id })
+$undeclared = @($tasks | Where-Object { -not $_.Pass -and -not $_.Files.Count } | ForEach-Object { $_.Id })
 
 if ($collisions.Count -or $undeclared.Count) {
     $planPrompt = @"
@@ -253,6 +261,33 @@ while ($true) {
             $vf = Join-Path $wt "tasks\.verdicts\$task.md"
             $isPass = (Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
 
+            # ВЕРДИКТ ОБЯЗАН ПЕРЕЖИТЬ WORKTREE.
+            #
+            # Он пишется в дерево задачи (только там проверки честные — там лежит её
+            # работа), а каталог вердиктов в .gitignore, то есть слиянием он не переносится
+            # и умирает вместе с worktree. Между тем именно по нему считается готовность
+            # СЛЕДУЮЩЕЙ волны (Get-Verdict читает корень) и состояние бэклога в `bcf tasks`.
+            # Пока копии не было, прогон закрывал первую волну и вставал: остальные задачи
+            # навсегда оставались «ждёт», а отчёт называл это «не закрыто» — при том что
+            # работа была сделана и слита. Наблюдалось живьём 2026-08-06, прогон
+            # g_20260806-141305: TASK-01 слита за 7 минут, восемь задач не поехали.
+            #
+            # НО PASS ПЕРЕНОСИТСЯ ТОЛЬКО ПОСЛЕ УДАЧНОГО СЛИЯНИЯ.
+            #
+            # Закрытие — это «работа в основном дереве», а не «в своей ветке всё зелёное».
+            # Пока PASS копировался здесь, задача с провалившейся интеграцией объявлялась
+            # закрытой: 2026-08-06 TASK-02 и TASK-03 получили PASS в основном дереве, их
+            # код туда не попал (слияние упало на красных проверках), и следующая волна
+            # честно взялась строить TASK-04 поверх несуществующих стабов.
+            #
+            # FAIL переносим сразу: он ничего не закрывает, а список ремедиации нужен
+            # человеку и следующей попытке. PASS — ниже, после Merge-TaskWorktree.
+            $vdirRoot = Join-Path $root 'tasks\.verdicts'
+            if ((Test-Path $vf) -and -not $isPass) {
+                New-Item -ItemType Directory -Force -Path $vdirRoot | Out-Null
+                Copy-Item -LiteralPath $vf -Destination (Join-Path $vdirRoot "$task.md") -Force -ErrorAction SilentlyContinue
+            }
+
             # Диагностика расщеплённого прогона. Если вердикта в worktree нет, а в
             # основном дереве он есть и он PASS — значит цикл считал своим корнем не то
             # дерево, и «не достиг PASS» будет ЛОЖЬЮ: задача отработала. Молчаливая
@@ -269,13 +304,43 @@ while ($true) {
             }
 
             if (-not $isPass) {
+                # ЗАПИСКА ЧЕЛОВЕКУ ПЕРЕЖИВАЕТ WORKTREE — иначе позвали и промолчали.
+                #
+                # Цикл встаёт на friction-триггере (необратимая правка: зависимости, CI,
+                # авторизация, крупное удаление) и пишет, ЧТО именно требует ревью. Записка
+                # лежит в .bcf задачи, а он удаляется вместе с деревом: человек видит
+                # «не достиг PASS» и идёт искать причину по логам. Наблюдалось 2026-08-08 —
+                # две готовые задачи встали, причину пришлось восстанавливать вручную.
+                $reason = 'не достиг PASS (лимит/затык)'
+                $co = Join-Path $wt ".bcf\callouts\$task.md"
+                if (Test-Path $co) {
+                    $codir = Join-Path $root '.bcf\callouts'
+                    New-Item -ItemType Directory -Force -Path $codir | Out-Null
+                    Copy-Item -LiteralPath $co -Destination (Join-Path $codir "$task.md") -Force -ErrorAction SilentlyContinue
+                    $reason = "требует ревью человека — .bcf/callouts/$task.md (правка попала под friction-триггер)"
+                }
                 Remove-TaskClaim -TaskId $task
                 Remove-TaskWorktree -Root $root -Task $task -KeepBranch
-                return @{ Task = $task; Ok = $false; Reason = 'не достиг PASS (лимит/затык)' }
+                return @{ Task = $task; Ok = $false; Reason = $reason }
             }
 
             # Работа уже закоммичена выше, до проверки вердикта — здесь коммитить нечего.
             $outcome = Invoke-WithGraphLock 'merge' {
+                # Замер «до»: какие сквозные пути работали на основном дереве ДО этого
+                # слияния. Ниже он сравнивается с замером «после» — так гейт отличает
+                # поломку от предсуществующего долга. Замер снимается ВНУТРИ замка мержа,
+                # иначе соседняя задача успеет изменить дерево между замерами.
+                $greenBefore = @()
+                $jgPre = Join-Path (Get-BcfHarnessRoot) 'journey-gate.ps1'
+                if (Test-Path -LiteralPath $jgPre) {
+                    $pre = Invoke-CommandNode "pwsh -NoProfile -File `"$jgPre`" -ProjectRoot `"$root`" -Json" `
+                              -Label "сценарии-до-$task" -WorkDir $root -TimeoutSec 1800 -OkExitCodes @(0,1,3,4)
+                    try {
+                        $pj = $pre.Output | ConvertFrom-Json
+                        $greenBefore = @($pj.journeys | Where-Object { $_.status -eq 'ok' } | ForEach-Object { [string]$_.id })
+                    } catch { }
+                }
+
                 $m = Merge-TaskWorktree -Root $root -Task $task -GeneratedFiles (Get-GraphVar generated) -KeepConflictForArbiter
 
                 if (-not $m.Ok -and $m.Kind -eq 'conflict-open') {
@@ -319,7 +384,54 @@ while ($true) {
                         return @{ Task = $task; Ok = $false; Reason = 'семантический конфликт: проверки на слитом дереве красные' }
                     }
                 }
+
+                # СКВОЗНЫЕ СЦЕНАРИИ — ТОЖЕ ГЕЙТ СЛИЯНИЯ, И САМЫЙ ВАЖНЫЙ ИЗ НИХ.
+                #
+                # Проверки выше — это `_default` задачи: типы и стиль. Они ничего не
+                # говорят о том, не сломала ли эта задача чужой путь. Разбор
+                # clinic-scheduler показал, чем это кончается: задачи вливались по одной,
+                # каждая со своими зелёными гейтами, а сложенные вместе давали продукт,
+                # в котором не работал ни один сценарий. Красный сценарий здесь означает
+                # ОТКАТ слияния, а не строчку в отчёте в конце прогона: строчку в отчёте
+                # читают, когда всё уже слито и разбирать поздно.
+                #
+                # ГЕЙТ ЛОВИТ РЕГРЕССИЮ, А НЕ ПРЕДСУЩЕСТВУЮЩИЙ ДОЛГ.
+                #
+                # «Любой красный сценарий = откат» останавливает волну на первой задаче:
+                # пока волна не доехала, часть путей красная по определению, и задача,
+                # которая к ним не относится, починить их не может. Поэтому сравниваются
+                # ДВА замера: какие пути были зелёными до слияния и какие после. Ушедший
+                # из зелёных путь — это поломка ИМЕННО этим слиянием, и она откатывается.
+                # Красный до и красный после — чужой долг, он не блокирует.
+                #
+                # Замер «до» снимается на дереве ДО мержа, поэтому обе точки сравнимы.
+                $jgScript = Join-Path (Get-BcfHarnessRoot) 'journey-gate.ps1'
+                if (Test-Path -LiteralPath $jgScript) {
+                    $greenAfter = @()
+                    $post = Invoke-CommandNode "pwsh -NoProfile -File `"$jgScript`" -ProjectRoot `"$root`" -Json" `
+                                -Label "сценарии-после-$task" -WorkDir $root -TimeoutSec 1800 -OkExitCodes @(0,1,3,4)
+                    try {
+                        $aj = $post.Output | ConvertFrom-Json
+                        $greenAfter = @($aj.journeys | Where-Object { $_.status -eq 'ok' } | ForEach-Object { [string]$_.id })
+                    } catch { }
+                    $lost = @($greenBefore | Where-Object { $_ -and ($_ -notin $greenAfter) })
+                    if ($lost.Count) {
+                        & git -C $root reset --hard HEAD~1 2>&1 | Out-Null
+                        return @{ Task = $task; Ok = $false
+                                  Reason = "слияние сломало работавший сквозной путь: $($lost -join ', ')" }
+                    }
+                    $gained = @($greenAfter | Where-Object { $_ -and ($_ -notin $greenBefore) })
+                    if ($gained.Count) { Write-GraphLog "задача $task закрыла сквозной путь: $($gained -join ', ')" }
+                }
                 return @{ Task = $task; Ok = $true; Arbitrated = ($m.Kind -eq 'arbitrated') }
+            }
+
+            # ВОТ ЗДЕСЬ задача действительно закрыта: её работа в основном дереве и прошла
+            # проверки на слитом. Только теперь PASS-вердикт становится фактом проекта —
+            # по нему следующая волна считает готовность, а `bcf tasks` показывает закрытое.
+            if ($outcome.Ok -and (Test-Path $vf)) {
+                New-Item -ItemType Directory -Force -Path $vdirRoot | Out-Null
+                Copy-Item -LiteralPath $vf -Destination (Join-Path $vdirRoot "$task.md") -Force -ErrorAction SilentlyContinue
             }
 
             Remove-TaskClaim -TaskId $task
@@ -349,16 +461,36 @@ while ($true) {
             # единицы: на прогоне 2026-07-26 из 14 задач не закрылись 12, и память не
             # выучила из этого ничего. Здесь урок пишется в момент провала.
             $tf = @($tasks | Where-Object { $_.Id -eq $r.Task })[0]
-            $res = Add-GraphLesson -Scope 'code' `
-                -Trigger "Задача $($r.Task) ($($tf.Files -join ', ')) не закрылась: $($r.Reason)" `
-                -WentWrong $r.Reason `
-                -Alternative $(switch -Regex ($r.Reason) {
-                    'дерев[оa] грязн'   { 'Перед слиянием убирать из основного дерева воспроизводимые файлы (локи, сгенерированные манифесты) — они не несут работы человека и не должны блокировать интеграцию.' }
-                    'конфликт'          { 'Файл, объявленный в «## Файлы» другой задачи, не трогать: правку туда вносит владелец файла, иначе слияние встаёт.' }
-                    'провер(ки|ка).*красн' { 'Задача обязана проходить обязательные проверки на СЛИТОМ дереве, а не только в своей ветке: текстово чистый мерж семантику не гарантирует.' }
-                    default             { '' }
-                }) `
-                -Evidence @{ task = $r.Task; run = (Get-GraphRunId); files = @($tf.Files); reason = $r.Reason }
+
+            # СОВЕТ ВЫБИРАЕТСЯ ОДИН, И ЭТО НЕ КОСМЕТИКА.
+            #
+            # `switch -Regex` без break возвращает ВСЕ совпавшие ветки, то есть массив. У
+            # причины «семантический конфликт: проверки на слитом дереве красные» совпадают
+            # сразу две — и привязка к [string]$Alternative падает с «Cannot convert value
+            # to type System.String». Падает не запись урока, а ВЕСЬ граф: прогон
+            # g_20260806-143941 умер на этой строке, потеряв обе задачи волны, обе уже
+            # сделанные. Побочная запись в память не имеет права ронять прогон.
+            $altAll = @(switch -Regex ($r.Reason) {
+                'дерев[оa] грязн'      { 'Перед слиянием убирать из основного дерева воспроизводимые файлы (локи, сгенерированные манифесты) — они не несут работы человека и не должны блокировать интеграцию.' }
+                'провер(ки|ка).*красн' { 'Задача обязана проходить обязательные проверки на СЛИТОМ дереве, а не только в своей ветке: текстово чистый мерж семантику не гарантирует.' }
+                'конфликт'             { 'Файл, объявленный в «## Файлы» другой задачи, не трогать: правку туда вносит владелец файла, иначе слияние встаёт.' }
+            })
+            # Порядок веток задаёт приоритет: красные проверки конкретнее слова «конфликт»,
+            # которое встречается и в их формулировке.
+            $alt = [string](@($altAll) | Select-Object -First 1)
+
+            $res = ''
+            try {
+                $res = Add-GraphLesson -Scope 'code' `
+                    -Trigger "Задача $($r.Task) ($($tf.Files -join ', ')) не закрылась: $($r.Reason)" `
+                    -WentWrong $r.Reason `
+                    -Alternative $alt `
+                    -Evidence @{ task = $r.Task; run = (Get-GraphRunId); files = @($tf.Files); reason = $r.Reason }
+            } catch {
+                # Память — вспомогательная подсистема. Её отказ обязан выглядеть строкой в
+                # журнале, а не падением прогона: работа задач уже сделана и лежит в ветках.
+                Write-GraphLog "  ⚠ урок в память не записан: $($_.Exception.Message)"
+            }
             if ($res -eq 'new') { Write-GraphLog "  урок записан в память" }
         }
     }
@@ -384,39 +516,227 @@ Set-Phase 'Приёмка'
 # ---------------------------------------------------------------------------
 # Барьер здесь ОПРАВДАН: сведение отчёта требует всех ракурсов разом.
 # Ракурсы разные намеренно — избыточность ловит меньше, чем непохожесть.
+#
+# ОТВЕТ КРИТИКА — СТРУКТУРА, А НЕ ТОЛЬКО ПРОЗА.
+#
+# Пока критики отдавали свободный текст, их работа не влияла ни на что: прогон
+# g_20260806-195014 напечатал «итог: ок» и вернул ноль, имея в приёмке восемь
+# семантических конфликтов, четыре из них P1 — включая «оператор может записать пациента
+# в отсутствие врача». Человек читает последнюю строку, а не приложение к ней. Схема даёт
+# число, которое можно вынести в вердикт; проза остаётся — она в поле summary.
+$criticSchema = @{
+    type = 'object'; required = @('summary', 'findings')
+    properties = @{
+        summary  = @{ type = 'string' }
+        findings = @{ type = 'array'; items = @{
+            type = 'object'; required = @('severity', 'what', 'file')
+            properties = @{
+                severity = @{ type = 'string'; enum = @('P1', 'P2', 'P3') }
+                what     = @{ type = 'string' }
+                file     = @{ type = 'string' }
+                line     = @{ type = 'integer' }
+            } } }
+    }
+}
+$criticTail = @"
+
+ОТВЕТ — JSON по схеме: summary (проза: что проверял, чем ограничен, вывод) и findings
+(массив находок; каждая — severity P1/P2/P3, what, file, line). Ничего не нашёл —
+findings пустой массив. P1 — то, из-за чего система работает неверно у пользователя.
+"@
+
+#
+# ФАКТЫ О ДЕРЕВЕ КРИТИКАМ ДАЁТ ОБВЯЗКА, А НЕ ОНИ САМИ.
+#
+# Критик живёт на песочнице «только чтение» — это осознанно: роль, обязанная лишь смотреть,
+# не должна иметь права править. Но тестовый раннер пишет во временный каталог, поэтому у
+# критика он падает с EPERM. Дважды подряд (прогоны g_20260806-151836 и -195014) все три
+# критика потратили часть работы на попытки запустить vitest и завершили отчёт оговоркой
+# «судил по исходникам». Проверки на слитом дереве обвязка и так умеет запускать — значит
+# отдаём результат готовым, а не заставляем добывать.
+$gateFacts = ''
+if ($passed.Count -and -not $script:GraphCtx.DryPlan) {
+    # КАЖДАЯ КОМАНДА ВЫПОЛНЯЕТСЯ ОДИН РАЗ.
+    #
+    # Проверки разных задач в основном совпадают («vitest run src/pages/operator» стоит у
+    # четырёх), а дерево одно — второй запуск той же команды не приносит нового знания и
+    # стоит столько же. На бэклоге из 32 задач фаза фактов разрослась до шестидесяти с
+    # лишним прогонов и обогнала по времени саму приёмку. Собираем множество команд, а
+    # потом выполняем.
+    $factCmds = [ordered]@{}
+    foreach ($cmd in @(Get-GraphVar mergeChecks)) { if ($cmd) { $factCmds[$cmd] = @() } }
+    if ($cj) {
+        foreach ($t in $passed) {
+            foreach ($cmd in @($cj.$t | Where-Object { $_ -is [string] -and $_.Trim() })) {
+                if (-not $factCmds.Contains($cmd)) { $factCmds[$cmd] = @() }
+                $factCmds[$cmd] += $t
+            }
+        }
+    }
+
+    $lines = @()
+    $i = 0
+    foreach ($cmd in @($factCmds.Keys)) {
+        $i++
+        $owners = @($factCmds[$cmd])
+        $r = Invoke-CommandNode $cmd -Label "факты-$i" -WorkDir $root -TimeoutSec 1800
+        $who = if ($owners.Count -eq 1) { " ($($owners[0]))" }
+               elseif ($owners.Count -gt 1) { " ($($owners.Count) задач)" } else { '' }
+        $lines += "- ``$cmd``$who → $(if ($r.Ok) { 'PASS' } else { 'FAIL' })"
+    }
+    if ($lines.Count) {
+        $gateFacts = "`nПРОВЕРКИ НА ЭТОМ ЖЕ ДЕРЕВЕ УЖЕ ВЫПОЛНЕНЫ ОБВЯЗКОЙ (запускать их не нужно,`nу тебя песочница только на чтение):`n" + ($lines -join "`n") + "`n"
+        Write-GraphLog "факты для приёмки: $($lines.Count) проверок"
+    }
+
+    # СОСТОЯНИЕ СКВОЗНЫХ СЦЕНАРИЕВ — ТОЖЕ ФАКТ, И САМЫЙ ДОРОГОЙ ИЗ НИХ.
+    # Все проверки выше говорят о дереве. Эта — о том, может ли человек работать.
+    # Критик с песочницей на чтение сам её не выполнит, поэтому отдаём готовой.
+    $jgScript = Join-Path (Get-BcfHarnessRoot) 'journey-gate.ps1'
+    if (Test-Path -LiteralPath $jgScript) {
+        $jgRes = Invoke-CommandNode "pwsh -NoProfile -File `"$jgScript`" -ProjectRoot `"$root`"" -Label 'факты-сценарии' -WorkDir $root -TimeoutSec 1800
+        $jgWord = if ($jgRes.Ok) { 'ЗЕЛЁНЫЕ' } else { 'КРАСНЫЕ ИЛИ НЕ ЗАВЕДЕНЫ' }
+        $gateFacts += "`nСКВОЗНЫЕ СЦЕНАРИИ ПРОДУКТА (harness/journey-gate.ps1): $jgWord`n"
+        Write-GraphLog "факты для приёмки: сквозные сценарии → $jgWord"
+    }
+}
+
 $acceptance = @()
 if ($passed.Count) {
     Set-GraphVar merged ($passed -join ', ')
+    # ВЕТКИ БАРЬЕРА ЖИВУТ В ОТДЕЛЬНЫХ ПРОСТРАНСТВАХ И ВИДЯТ ТОЛЬКО GraphVars.
+    #
+    # Invoke-Barrier пересоздаёт thunk ИЗ ТЕКСТА в другом runspace, поэтому обычные
+    # переменные скрипта там просто не существуют: `-Schema $criticSchema` превращался в
+    # `-Schema $null` (узел молча возвращал прозу вместо структуры), а блок фактов —
+    # в пустую строку. Наблюдалось 2026-08-08: журнал печатал «критик: находок 1», отчёт —
+    # «Находок нет», итог — «ок»; в промпте не было ни схемы, ни фактов. Общее состояние
+    # графа переживает границу runspace — значит всё, что нужно ветке, кладём туда.
+    Set-GraphVar criticSchema $criticSchema
+    Set-GraphVar criticFacts  $gateFacts
+    Set-GraphVar criticTail   $criticTail
+
+    # Откуда критику брать инварианты — свойство проекта. Перечисляем реально
+    # существующие у него файлы: ссылка на отсутствующий документ читается агентом как
+    # «требование есть, но я его не вижу», и он начинает додумывать.
+    $invSources = @()
+    foreach ($cand in @(
+        @{ p = 'config\invariants.json'; d = 'config/invariants.json — если есть, это главный и закрытый список' }
+        @{ p = 'CLAUDE.md';              d = 'CLAUDE.md — раздел про правила, которые дороже всего нарушить' }
+        @{ p = 'docs\PRD.md';            d = 'docs/PRD.md — границы MVP: то, что объявлено не входящим, не должно появиться в коде' }
+        @{ p = 'config\journeys.json';   d = 'config/journeys.json — сквозные сценарии: их поведение тоже инвариант' }
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $root $cand.p)) { $invSources += "- $($cand.d)" }
+    }
+    if (-not $invSources.Count) {
+        $invSources += '- (ни одного документа с инвариантами в проекте нет — так и скажи в summary и верни пустой список находок: выдумывать инварианты нельзя)'
+    }
+    Set-GraphVar invariantsHint ($invSources -join "`n")
     $acceptance = @(Invoke-Barrier -Thunks @(
         {
-            Invoke-Node -Role critic -Recall -Label 'приёмка-инварианты' -Prompt @"
+            # ИНВАРИАНТЫ НАЗЫВАЕТ ПРОЕКТ, А НЕ ДВИЖОК.
+            #
+            # Здесь был перечень инвариантов другого проекта: «один JSON в stdout,
+            # hex-адреса, чтение чужой памяти». В clinic-scheduler ничего этого нет —
+            # и критик честно отвечал «указанные требования отсутствуют в CLAUDE.md и
+            # неприменимы к React/Express-коду». Треть бюджета каждого круга приёмки
+            # уходила в пустоту, а два круга вообще дали находки про этот несуществующий
+            # инвариант. Список инвариантов читается из проекта; движок только спрашивает.
+            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-инварианты' -Prompt @"
 На слитом дереве закрыты задачи: $(Get-GraphVar merged).
-Ракурс: ИНВАРИАНТЫ ПРОЕКТА из CLAUDE.md (границы ядра, один JSON в stdout, hex-адреса,
-запись только по явному подтверждению, нефатальность ошибок чтения памяти).
-Найди нарушения В СЛИТОМ КОДЕ. Каждое — с файлом и строкой. Нет нарушений — так и скажи.
+Ракурс: ИНВАРИАНТЫ ЭТОГО ПРОЕКТА.
+
+Инварианты не перечислены здесь намеренно: их называет проект, а не проверяющий.
+Возьми их сам — в таком порядке источников:
+$(Get-GraphVar invariantsHint)
+
+Из найденного составь список инвариантов, каждый из которых можно нарушить кодом, и
+найди нарушения В СЛИТОМ КОДЕ. Если инвариант из документа неприменим к этому коду —
+пропусти его молча, не превращай в находку. Каждое нарушение — с файлом и строкой.
+$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
 "@
         },
         {
-            Invoke-Node -Role critic -Recall -Label 'приёмка-склейка' -Prompt @"
+            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-склейка' -Prompt @"
 На слитом дереве закрыты задачи: $(Get-GraphVar merged).
 Ракурс: СЕМАНТИКА СКЛЕЙКИ. Задачи писались параллельно и разными агентами. Ищи места,
 где куски по отдельности верны, а вместе — нет: рассогласованные сигнатуры, дублирующие
 реализации одного и того же, несогласованные имена ошибок, мёртвые ветки после слияния.
-Каждое — с файлом и строкой. Нет находок — так и скажи.
+Каждое — с файлом и строкой.
+$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
 "@
         },
         {
-            Invoke-Node -Role critic -Recall -Label 'приёмка-гейты' -Prompt @"
+            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-гейты' -Prompt @"
 На слитом дереве закрыты задачи: $(Get-GraphVar merged).
 Ракурс: ЧЕСТНОСТЬ ГЕЙТОВ. Проверь тесты этих задач: есть ли среди них такие, что
 проходят, ничего не проверяя (ассерт на константу, замоканный объект проверки, тест без
 ассертов, `assert!(true)`). Тест, который не проверяет поведение, хуже отсутствующего.
-Каждое — с файлом и строкой. Нет находок — так и скажи.
+Каждое — с файлом и строкой.
+$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
+"@
+        },
+        {
+            # ЧЕТВЁРТЫЙ РАКУРС ДОБАВЛЕН ПО РАЗБОРУ clinic-scheduler (2026-08-09).
+            #
+            # Три ракурса выше спрашивают «правилен ли написанный код». За пять кругов
+            # приёмки они дали 30+ находок про стыки и ни одной про то, что оператор не
+            # может записать пациента, у регистратора кнопки оплаты и печати талона —
+            # вечно disabled, а врач видит чужой день. Эти дефекты не в коде, они в
+            # ОТСУТСТВИИ кода: их нельзя найти, читая то, что написано. Нужен вопрос
+            # «может ли человек выполнить работу», заданный явно.
+            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-сценарий' -Prompt @"
+На слитом дереве закрыты задачи: $(Get-GraphVar merged).
+Ракурс: РАБОТА ПОЛЬЗОВАТЕЛЯ. Не «правилен ли код», а «может ли человек сделать то,
+ради чего продукт существует».
+
+Возьми сквозные пути продукта — в таком порядке источников: config/journeys.json,
+затем docs/PRD.md, затем макеты. Для КАЖДОГО пути пройди его по коду шаг за шагом
+и найди шаг, на котором человек встанет.
+
+Ищи именно это:
+- шаг пути, для которого вообще нет UI (например, нельзя выбрать дату/врача/услугу);
+- кнопку без обработчика или с disabled навсегда — «сделаю позже», оставленное в проде;
+- действие, которое меняет только локальное состояние и не доходит до сервера;
+- экран, который берёт данные не за тот период или не того владельца;
+- заголовок, противоречащий содержимому («смена 09.08» над записями за 10.08);
+- захардкоженное значение, выданное за настоящие данные;
+- ложное утверждение в тексте интерфейса (сообщение об интеграции, которой нет).
+
+Находка обязана называть ШАГ ПУТИ и то, что человек НЕ может сделать. severity P1 —
+если путь не проходится или пользователю показывают неверные данные.
+$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
 "@
         }
     ))
-    foreach ($a in @($acceptance | Where-Object { $_ })) { Write-GraphLog "критик: $((($a -split "`r?`n") | Select-Object -First 1))" }
+    foreach ($a in @($acceptance | Where-Object { $_ })) {
+        $n = @($a.findings).Count
+        $p1 = @($a.findings | Where-Object { $_.severity -eq 'P1' }).Count
+        Write-GraphLog ("критик: находок $n$(if ($p1) { " (P1: $p1)" })")
+    }
 }
+
+$findAll = @($acceptance | Where-Object { $_ } | ForEach-Object { @($_.findings) } | Where-Object { $_ })
+$findP1  = @($findAll | Where-Object { $_.severity -eq 'P1' })
+
+# КРИТИК, КОТОРЫЙ НЕ ОТВЕТИЛ, — ЭТО НЕ «НАХОДОК НЕТ».
+#
+# Узел роли возвращает $null, когда агент не дал текста: протух путь к CLI, кончилась
+# квота, оборвался поток. Пока это не считалось, отчёт печатал «Находок нет» и итог «ок»
+# — при том что приёмка не выполнялась вовсе. Наблюдалось живьём 2026-08-08: у codex
+# сменился хэш сборки в пути, все три критика упали по три попытки, а прогон отчитался
+# «PASS 19/19, ок». Отсутствие ответа обязано выглядеть отсутствием ответа.
+#
+# СТРАХОВКА ОТ ПРОЗЫ. Узел со схемой обязан вернуть ОБЪЕКТ; строка означает, что схема до
+# него не доехала (например, переменная не пережила границу runspace) и никакой валидации
+# не было. Считать такой ответ находками нельзя: `.findings` у строки пусто, и «Находок
+# нет» получится из ничего — ровно это и случилось 2026-08-08.
+$criticsRun    = @($acceptance).Count
+$criticsFailed = @($acceptance | Where-Object {
+    (-not $_) -or ($_ -is [string]) -or ($null -eq $_.PSObject.Properties['findings'])
+}).Count
+$acceptance = @($acceptance | Where-Object { $_ -and -not ($_ -is [string]) -and $_.PSObject.Properties['findings'] })
+if ($criticsFailed) { Write-GraphLog "⚠ приёмка неполна: не ответило критиков — $criticsFailed из $criticsRun" }
 
 # ---------------------------------------------------------------------------
 Set-Phase 'Итог'
@@ -438,14 +758,96 @@ $reviewFile = if ($script:GraphCtx.DryPlan) {
 }
 $statusFile = if ($script:GraphCtx.DryPlan) { Join-Path $script:GraphCtx.Dir 'run-all.status.dry.json' } else { '' }
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $tasks.Count -Root $root `
-    -ReviewFile $reviewFile -StatusFile $statusFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    -ReviewFile $reviewFile -StatusFile $statusFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `
+    -AcceptanceP1 $findP1.Count
 
 if ($acceptance.Count) {
-    $body = "`n## Приёмка графа (разные ракурсы, слитое дерево)`n`n" +
-            (@($acceptance | Where-Object { $_ }) -join "`n`n---`n`n")
+    $body = "`n## Приёмка графа (разные ракурсы, слитое дерево)`n`n"
+    if ($findAll.Count) {
+        $body += "**Находок: $($findAll.Count)** (P1: $($findP1.Count)). Задачи закрыты по гейтам — эти замечания гейтами не ловятся.`n`n"
+        foreach ($f in ($findAll | Sort-Object severity)) {
+            $where = "$($f.file)$(if ($f.line) { ":$($f.line)" })"
+            $body += "- **[$($f.severity)]** $($f.what) — ``$where```n"
+        }
+        $body += "`n"
+    } elseif ($criticsFailed -ge $criticsRun) {
+        $body += "**Приёмка НЕ ВЫПОЛНЕНА**: ни один критик не ответил ($criticsFailed из $criticsRun). " +
+                 "«Находок нет» здесь означало бы, что смотрели и не нашли, — а не смотрели вовсе. " +
+                 "Причина в журнале прогона; чаще всего это протухший путь к CLI или исчерпанная квота.`n`n"
+    } else {
+        $body += "Находок нет.`n`n"
+    }
+    if ($criticsFailed -and $criticsFailed -lt $criticsRun) {
+        $body += "> Внимание: не ответило критиков — $criticsFailed из $criticsRun. Часть ракурсов не проверена.`n`n"
+    }
+    foreach ($a in @($acceptance | Where-Object { $_ })) { $body += "`n---`n`n$($a.summary)`n" }
     Add-Content -Path $reviewFile -Value $body -Encoding UTF8
 }
 
-Write-GraphLog "итог: PASS $($rep.passed)/$($rep.total), не закрыто $($rep.stuck) (человек: $($rep.needsHuman), каскад: $($rep.gateBlocked))"
-return @{ complete = $rep.complete; passed = $rep.passed; total = $rep.total; stuck = $rep.stuck; waves = $wave }
+# НАХОДКА, ОСТАВШАЯСЯ В ОТЧЁТЕ, — ЭТО НЕ ЗАКРЫТАЯ НАХОДКА.
+#
+# Пять кругов приёмки clinic-scheduler дописали в REVIEW.md 30+ находок, включая P1.
+# Каждый круг заканчивался тем, что ЧЕЛОВЕК читал отчёт и руками заводил задачи — и
+# каждый следующий прогон начинался с чистого REVIEW.md, затирая то, что не успели
+# перенести. Отчёт — это конец жизни находки, а не начало. Дальше P1 уезжают в
+# tasks/.inbox/ готовыми черновиками: перенести их в бэклог — одно движение, а
+# потерять молча уже нельзя.
+#
+# Именно ЧЕРНОВИКИ, а не задачи: очередь берёт только tasks/TASK-*.md, и графу не
+# отдано право самому назначать себе работу. Решение «это в работу» остаётся за
+# человеком; автоматизируется перенос, а не решение.
+if ($findP1.Count -and -not $script:GraphCtx.DryPlan) {
+    $inbox = Join-Path $root 'tasks\.inbox'
+    New-Item -ItemType Directory -Force -Path $inbox | Out-Null
+    $runId = Get-GraphRunId
+    $i = 0
+    $written = @()
+    foreach ($f in $findP1) {
+        $i++
+        $slug = ((([string]$f.what) -replace '[^\p{L}\p{Nd}]+', '-').Trim('-').ToLower())
+        if ($slug.Length -gt 48) { $slug = $slug.Substring(0, 48).Trim('-') }
+        if (-not $slug) { $slug = "p1-$i" }
+        $file = Join-Path $inbox "$runId-$('{0:d2}' -f $i)-$slug.md"
+        $where = "$($f.file)$(if ($f.line) { ":$($f.line)" })"
+        Set-Content -LiteralPath $file -Encoding UTF8 -Value @"
+# Черновик задачи — P1 приёмки $runId
+
+Находка приёмки на слитом дереве. Черновик: перенеси в ``tasks/TASK-<NN>-<slug>.md``,
+допиши «Готовность» и «Проверки», добавь id в ``config/checks.json`` — и только тогда
+очередь возьмёт её в работу.
+
+## Что не так
+
+$($f.what)
+
+## Где
+
+``$where``
+
+## Готовность
+
+1. (дополнить: что должно стать возможным для пользователя)
+2. Тест доказывает исправление и падает при возврате прежнего поведения.
+
+## Проверки
+
+``````
+(дополнить: команда, доказывающая именно это поведение)
+``````
+"@
+        $written += (Split-Path $file -Leaf)
+    }
+    Write-GraphLog "черновики задач по P1: $($written.Count) → tasks/.inbox/"
+    Add-Content -Path $reviewFile -Encoding UTF8 -Value (
+        "`n## P1 переведены в черновики задач`n`n" +
+        "Находки P1 не остались в этом отчёте — они лежат готовыми черновиками в ``tasks/.inbox/``:`n`n" +
+        (($written | ForEach-Object { "- ``tasks/.inbox/$_``" }) -join "`n") + "`n`n" +
+        "Перенеси нужные в ``tasks/TASK-<NN>-<slug>.md`` и добавь их id в ``config/checks.json``.`n")
+}
+
+Write-GraphLog ("итог: PASS $($rep.passed)/$($rep.total), не закрыто $($rep.stuck) (человек: $($rep.needsHuman), каскад: $($rep.gateBlocked))" +
+                $(if ($findAll.Count) { "; приёмка: находок $($findAll.Count), P1 $($findP1.Count)" } else { '' }))
+return @{ complete = $rep.complete; passed = $rep.passed; total = $rep.total; stuck = $rep.stuck; waves = $wave
+          findings = $findAll.Count; findingsP1 = $findP1.Count
+          criticsRun = $criticsRun; criticsFailed = $criticsFailed }
 

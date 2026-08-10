@@ -148,6 +148,52 @@ if ($bannedHits) {
     }
 }
 
+# 2d. Тесты, зависящие от текущего времени (опционально). Включается флагом
+#     hooks-config.json "time_dependent_tests": true.
+#
+#     ЗАЧЕМ. clinic-scheduler, 2026-08-09: набор тестов краснел по воскресеньям. Семь
+#     тестов стабов строили ожидания от системной даты, и один день в неделю доказывали
+#     не то, что задумано. Шесть дней из семи гейт был зелёный, поэтому дефект не считался
+#     дефектом — его просто никто не видел в будни. Недетерминированный тест хуже
+#     отсутствующего: он даёт зелёный сигнал, не соответствующий состоянию кода, и
+#     обесценивает весь набор — красный прогон начинают объяснять «ну оно иногда падает».
+#
+#     Правило точечное: время без пиновки ИМЕННО в тестовом файле И при отсутствии
+#     подмены таймеров. Тест, который сам фиксирует «сейчас», к делу не относится.
+$timeDepEnabled = $false
+if ($HooksCfg -and $HooksCfg.PSObject.Properties['time_dependent_tests']) {
+    $timeDepEnabled = [bool]$HooksCfg.time_dependent_tests
+}
+if ($timeDepEnabled) {
+    $timeHits = @()
+    foreach ($d in $ProductPaths) {
+        $dir = Join-Path $Repo $d
+        if (-not (Test-Path $dir)) { continue }
+        $testFiles = Get-ChildItem -Path $dir -Recurse -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -match '\.(test|spec)\.[jt]sx?$' -or $_.Name -match '_test\.py$' }
+        foreach ($tf in $testFiles) {
+            $c = Get-Content -Raw -LiteralPath $tf.FullName -ErrorAction SilentlyContinue
+            if (-not $c) { continue }
+            # Подменённое время — это ПИНОВКА, а не зависимость: пропускаем.
+            if ($c -match 'useFakeTimers|setSystemTime|MockDate|freeze_time|freezegun') { continue }
+            $m = [regex]::Match($c, 'new\s+Date\s*\(\s*\)|Date\.now\s*\(\s*\)|\btoday\s*\(\s*\)|datetime\.now\s*\(')
+            if ($m.Success) {
+                $line = ($c.Substring(0, $m.Index) -split "`n").Count
+                $timeHits += "$($tf.FullName.Substring($Repo.Length).TrimStart('\','/')):$line  $($m.Value)"
+            }
+        }
+    }
+    if ($timeHits) {
+        $findings += [ordered]@{
+            check       = 'time-dependent-test'
+            severity    = 'error'
+            count       = $timeHits.Count
+            remediation = 'Тест берёт «сейчас» из системных часов и не подменяет время. Результат такого теста зависит от дня прогона: он бывает зелёным в будни и красным в выходные, и тогда зелёный гейт ничего не доказывает. Зафиксируй дату явно (vi.setSystemTime / freeze_time) либо передавай дату параметром.'
+            tail        = ($timeHits | Select-Object -First 15) -join "`n"
+        }
+    }
+}
+
 # ----------------------------------------------------------------------------
 # 3) Структурные тесты (Ryan Lepo «tests-about-source») — если файл существует
 # ----------------------------------------------------------------------------

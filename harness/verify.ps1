@@ -418,8 +418,20 @@ else {
   $diffStat = (git diff --stat HEAD 2>$null | Out-String)
   $diffFull = (git diff HEAD 2>$null | Out-String)
 }
-if ([string]::IsNullOrWhiteSpace($diffFull)) {
-  Log "ПРЕДУПРЕЖДЕНИЕ: diff пуст и против HEAD, и против HEAD~1 — нечего верифицировать."
+# ПУСТОЙ DIFF — ЭТО ПРОВАЛ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
+#
+# Гейты проверяют СОСТОЯНИЕ ДЕРЕВА, а не работу задачи. Если задача не тронула ни строки,
+# её собственные проверки всё равно зелены — они проходили и до неё. Пока это было
+# предупреждением, случалось вот что (прогон g_20260808-120927): четыре задачи подряд не
+# изменили ничего, получили PASS «все гейты зелёные», слились вхолостую, их ветки удалили
+# как отработанные, а бэклог отчитался «PASS 19/19, итог: ок». Дефекты P1, ради которых
+# задачи и заводились, остались в коде — и теперь считались закрытыми.
+#
+# Задача, которой нечего делать, — это решение человека, а не автоматики: он либо закроет
+# её руками, либо перепишет условие. Автоматика обязана сказать «работы нет».
+$emptyDiff = [string]::IsNullOrWhiteSpace($diffFull)
+if ($emptyDiff) {
+  Log "diff ПУСТ и против HEAD, и против HEAD~1 — задача не изменила ни строки в своих файлах."
 }
 $diffLines = $diffFull -split "`n"
 if ($diffLines.Count -gt 1500) {
@@ -757,6 +769,89 @@ foreach ($cmd in $planChecks) {
   Log "Проверка #${ci} завершена → exit $($r.exit)"
 }
 
+# --- Фаза J: сквозные сценарии продукта ---
+#
+# Стоит ОТДЕЛЬНО от checks и раньше визуальной фазы, потому что отвечает на другой вопрос.
+# checks доказывают задачу: «её тест зелёный». Фаза J доказывает продукт: «человек может
+# выполнить работу, ради которой продукт существует». Прогон clinic-scheduler 2026-08-09
+# показал, что первое не влечёт второго: 35 задач закрылись PASS при нуле работающих
+# клиентских путей — каждый экран проверялся против МОКА собственного API, и ни один
+# гейт не поднимал приложение.
+#
+# Гейт БЛОКИРУЮЩИЙ, когда реестр заведён, и МОЛЧАЛИВО-ЧЕСТНЫЙ, когда нет: отсутствие
+# реестра — дефект настройки проекта, а не провал конкретной задачи, и красить им вердикт
+# нечестно. Но и промолчать нельзя — иначе PASS снова будет читаться как «продукт готов».
+# Поэтому факт «сценарии не заведены» уезжает в вердикт текстом.
+$journeyFailed  = $false
+$journeyReport  = ''
+$journeyState   = 'not-configured'
+if ($DryRun) {
+  $journeyReport = '[DryRun] Фаза J (сквозные сценарии) — пропуск.'
+  Log $journeyReport
+} else {
+  $jg = Invoke-Shell "pwsh -NoProfile -File `"$PSScriptRoot\journey-gate.ps1`" -ProjectRoot `"$root`"" 'journeys'
+  switch ($jg.exit) {
+    0 {
+      $journeyState  = 'ok'
+      $journeyReport = "Фаза J: сквозные сценарии продукта — PASS (config/journeys.json).`n$(($jg.output -split "`r?`n" | Select-Object -Last 12) -join "`n")"
+    }
+    3 {
+      $journeyState  = 'not-configured'
+      $journeyReport = "Фаза J: реестр сквозных сценариев НЕ ЗАВЕДЁН либо все пути ещё в статусе planned. " +
+                       "Вердикт PASS доказывает только гейты уровня задачи; утверждать, что продуктом можно " +
+                       "пользоваться, этим прогоном НЕЛЬЗЯ.`n$(($jg.output -split "`r?`n" | Select-Object -Last 10) -join "`n")"
+    }
+    4 {
+      # Частичная доказанность — это НЕ провал задачи: она не обязана доказывать чужие
+      # пути. Но и молчать нельзя, иначе PASS снова прочитают как «продукт работает».
+      $journeyState  = 'partial'
+      $journeyReport = "Фаза J: доказанные пути зелёные, но часть путей ещё объявлена planned — продукт " +
+                       "доказан ЧАСТИЧНО.`n$(($jg.output -split "`r?`n" | Select-Object -Last 12) -join "`n")"
+    }
+    default {
+      $journeyState  = 'fail'
+      # ЗАДАЧА ОТВЕЧАЕТ ЗА СВОЙ ПУТЬ, А НЕ ЗА ЧУЖОЙ ДОЛГ.
+      #
+      # Прямолинейный вариант «любой красный сценарий = FAIL» останавливает очередь на
+      # первой же задаче: пока волна не доехала до конца, часть путей красная по
+      # определению, и задача, которая к ним не имеет отношения, не может их починить.
+      # Ровно эта ошибка уже была допущена в визуальной фазе и лечилась там же (M-16):
+      # чужой предсуществующий долг чинит его владелец, не блокируя всех.
+      #
+      # Владение берётся из данных, а не из догадки: у сценария в config/journeys.json
+      # есть поле task. Задача блокируется, если КРАСЕН СЦЕНАРИЙ, КОТОРЫЙ ОНА ОБЕЩАЛА
+      # ЗАКРЫТЬ. Остальные красные едут в вердикт текстом — их видно, но они не врут
+      # про эту задачу.
+      $ownJourneys = @()
+      try {
+        $jr = Join-Path $root 'config\journeys.json'
+        if (Test-Path -LiteralPath $jr) {
+          $reg = Get-Content -Raw -LiteralPath $jr | ConvertFrom-Json
+          $ownJourneys = @($reg.journeys | Where-Object { $_.id -and $_.task -and ($_.task -match [regex]::Escape($Task)) } |
+                           ForEach-Object { [string]$_.id })
+        }
+      } catch { }
+
+      $ownRed = @()
+      foreach ($jid in $ownJourneys) {
+        $one = Invoke-Shell "pwsh -NoProfile -File `"$PSScriptRoot\journey-gate.ps1`" -ProjectRoot `"$root`" -Only $jid" "journey-$jid"
+        if ($one.exit -ne 0) { $ownRed += $jid }
+      }
+      $journeyFailed = ($ownRed.Count -gt 0)
+      Log "Фаза J: своих сценариев у задачи — $($ownJourneys.Count) ($($ownJourneys -join ', ')); из них красных — $($ownRed.Count)"
+
+      $jt = Get-DetFailTail $jg.output
+      if (-not $jt) { $jt = (($jg.output -split "`r?`n") | Select-Object -Last 25) -join "`n" }
+      $verdictWordJ = if ($journeyFailed) { 'FAIL (свой сценарий красный)' } else { 'ADVISORY (красны только чужие сценарии)' }
+      $journeyReport = "Фаза J: сквозные сценарии продукта — $verdictWordJ." +
+        "`nСвои сценарии задачи (config/journeys.json → task): $(if ($ownJourneys.Count) { $ownJourneys -join ', ' } else { '(нет — задача не обещала закрыть ни один путь)' })" +
+        "$(if ($ownRed.Count) { "`nИз них КРАСНЫЕ: $($ownRed -join ', ')" })" +
+        "`nФАКТ ПРОВАЛА (машинный вывод, инлайн):`n$jt"
+    }
+  }
+  Log "Фаза J завершена → $journeyState (блокирует: $journeyFailed)"
+}
+
 # --- Фаза D: визуальная (детерминированный вижн-сьют + LLM-критик) ---
 $visualReport = "(визуальная Фаза D не запрашивалась планом)"
 $visualFailed = $false   # детерминированный контракт-gate (Фаза D) — hard-floor для PASS
@@ -988,6 +1083,9 @@ $reportsBlock
 ===== ДЕТЕРМИНИРОВАННЫЕ ПРОВЕРКИ =====
 $checksBlock
 
+===== СКВОЗНЫЕ СЦЕНАРИИ ПРОДУКТА (Фаза J) =====
+$journeyReport
+
 ===== ВИЗУАЛЬНАЯ ФАЗА D =====
 $visualReport
 
@@ -1041,10 +1139,16 @@ Log "Судья (совещательно, НЕ авторитет): $judgeVerdi
 # контракт-gate (визуальный, если planVisual). LLM-судья и LLM-тестеры — совещательные, на
 # вердикт НЕ влияют (решение 2026-05-30: обвязка автономна, флаки-LLM не решает).
 $gateFailures = @()
+# ПЕРВЫЙ ГЕЙТ — «РАБОТА ВООБЩЕ БЫЛА». Он стоит раньше остальных не для красоты: все
+# прочие проверки говорят о состоянии дерева, и на нетронутом дереве они зелены по
+# определению. Без этой строки задача, не сделавшая ничего, получает PASS «все гейты
+# зелёные» — и закрывается вместе со своей причиной существования.
+if ($emptyDiff) { $gateFailures += 'пустой diff: задача не изменила ни строки в своих файлах' }
 if ($checksFailed) { $gateFailures += 'checks' }
 if ($missingTesters.Count) { $gateFailures += 'testers-missing:' + ($missingTesters -join '|') }
 if ($lintFailed)   { $gateFailures += 'lint:' + (($lintViolations | ForEach-Object { $_.rule }) -join '|') }
 if ($visualFailed) { $gateFailures += 'visual-contract' }
+if ($journeyFailed) { $gateFailures += 'journeys' }
 if ($gateFailures.Count -eq 0) {
   $verdict = 'PASS'
   Log "ВЕРДИКТ (детерминированный): PASS — все гейты зелёные (checks+lint+contract). Судья совещательно: $judgeVerdict."
@@ -1076,6 +1180,13 @@ if ($lintFailed) {
   if ([string]::IsNullOrWhiteSpace($remediation)) { $remediation = $lintRem }
   else { $remediation = $lintRem + "`n" + $remediation }
 }
+if ($journeyFailed) {
+  $jRem = "- JOURNEY-FAIL: сквозной сценарий продукта красный — человек не может выполнить путь, ради которого продукт существует. " +
+          "Это дороже любого другого гейта: тесты задачи могут остаться зелёными, а продуктом пользоваться нельзя. " +
+          "Прогони `pwsh harness/journey-gate.ps1` и чини конкретный сценарий ДО следующего VERIFY-REQUEST"
+  if ([string]::IsNullOrWhiteSpace($remediation)) { $remediation = $jRem }
+  else { $remediation = $jRem + "`n" + $remediation }
+}
 if ($visualFailed) {
   $visRem = "- VISUAL-CONTRACT-FAIL: контракт дизайна your design reference нарушен (детерминированные DOM/токен/layout-ассерты) — открой .bcf/verify/$Task-vision-contract.out.txt, чини конкретные упавшие проверки ДО следующего VERIFY-REQUEST"
   if ([string]::IsNullOrWhiteSpace($remediation)) { $remediation = $visRem }
@@ -1105,10 +1216,23 @@ plan:
   testers: $($testers -join ', ')
   checks: $checksLine
   visual: $planVisual
+journeys: $journeyState
 testers:
 $testerLines
 notes: |
-  Вердикт ДЕТЕРМИНИРОВАННЫЙ: $verdict — функция гейтов (checks/lint/contract-gate).
+  Вердикт ДЕТЕРМИНИРОВАННЫЙ: $verdict — функция гейтов (checks/lint/contract-gate/journeys).
+  $(if ($journeyState -eq 'not-configured') {
+    'ГРАНИЦА ЭТОГО ВЕРДИКТА: сквозные сценарии продукта не заведены (config/journeys.json).
+  PASS означает «гейты задачи зелёные», а НЕ «продуктом можно пользоваться». Проверено
+  состояние дерева; ни один гейт приложение не запускал.'
+  } elseif ($journeyState -eq 'ok') {
+    'Сквозные сценарии продукта (Фаза J) зелёные: путь пользователя проверен, а не только дерево.'
+  } elseif ($journeyState -eq 'partial') {
+    'ГРАНИЦА ЭТОГО ВЕРДИКТА: доказана только ЧАСТЬ путей продукта, остальные объявлены
+  в config/journeys.json как planned. PASS относится к этой задаче, а не к продукту.'
+  } else {
+    'Сквозные сценарии продукта (Фаза J) КРАСНЫЕ — см. remediation.'
+  })
   LLM-судья judge ($Model) — СОВЕЩАТЕЛЬНЫЙ (мнение: $judgeVerdict), на вердикт не влияет
   (недетерминирован/галлюцинирует). Полный вывод судьи: .bcf/verify/$Task-judge.out.txt
 remediation: |
@@ -1116,8 +1240,18 @@ $remediationBlock
 
 $evidenceMd
 "@
-Set-Content -LiteralPath (Join-Path $verdictDir "$Task.md") -Value $verdictBody -Encoding UTF8
-Log "Вердикт записан: tasks/.verdicts/$Task.md → $verdict"
+$verdictFile = Join-Path $verdictDir "$Task.md"
+New-Item -ItemType Directory -Force -Path $verdictDir | Out-Null
+Set-Content -LiteralPath $verdictFile -Value $verdictBody -Encoding UTF8
+# «Записан» — утверждение о ФАКТЕ, поэтому оно проверяется. При $ErrorActionPreference =
+# 'Continue' неудачная запись не роняет скрипт, и строка «Вердикт записан» печаталась
+# независимо от того, появился файл или нет: цикл потом искал его и не находил, а на
+# экране всё выглядело нормально.
+if (Test-Path $verdictFile) {
+  Log "Вердикт записан: $verdictFile → $verdict"
+} else {
+  Log "ОШИБКА: вердикт НЕ записан ($verdictFile) — цикл не увидит результат верификации и будет считать, что её не было."
+}
 
 # W3: emit verdict-recorded event для harness памяти + state projection.
 $remediationItems = @()

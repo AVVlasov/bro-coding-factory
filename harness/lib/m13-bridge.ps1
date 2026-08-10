@@ -29,12 +29,19 @@ $script:MemDbConfig  = if ($env:BCF_MEM_CONFIG) { $env:BCF_MEM_CONFIG }
                        elseif (Test-Path (Join-Path $script:RepoRoot 'config/memory.config.json')) { Join-Path $script:RepoRoot 'config/memory.config.json' }
                        else { Join-Path $script:HomeRoot 'memory/memory.config.json' }
 
-# Имя контейнера: из memory.config.json (ключ 'container'), иначе дефолт.
+# Имя контейнера и ПОРТ: из memory.config.json, иначе дефолты.
+#
+# Порт читается здесь не для красоты. Compose параметризован переменными окружения
+# (BCF_MEM_CONTAINER, BCF_PG_PORT), и пока мостик их не выставлял, он поднимал контейнер по
+# ДЕФОЛТАМ compose, а клиент шёл по адресу из конфига. На проекте со своей базой это
+# расходилось молча: контейнер есть, память «недоступна».
 $script:MemContainer = 'bcf-agent-memory'
+$script:MemPort      = 5433
 if (Test-Path $script:MemDbConfig) {
     try {
         $__memCfg = Get-Content -Raw -LiteralPath $script:MemDbConfig | ConvertFrom-Json
         if ($__memCfg.container) { $script:MemContainer = "$($__memCfg.container)" }
+        if ($__memCfg.port)      { $script:MemPort = [int]$__memCfg.port }
     } catch { }
 }
 
@@ -146,6 +153,7 @@ function Ensure-LmStudioEmbedding {
 }
 
 . (Join-Path $PSScriptRoot 'docker.ps1')
+. (Join-Path $PSScriptRoot 'memory-port.ps1')
 
 function Get-M13Health {
     # 'healthy'|'starting'|'unhealthy'|'stopped'|'absent'|'no-response'|'no-daemon'|'no-docker'.
@@ -258,11 +266,46 @@ function Ensure-M13Memory {
                 if (-not $img.Ok) {
                     Write-Host "[memory] образа pgvector/pgvector:pg16 нет локально — идёт загрузка (~450 МБ, это минуты)." -ForegroundColor Yellow
                 }
-                Write-Host "[memory] контейнер отсутствует — docker compose up -d ($script:MemCompose)..." -ForegroundColor Yellow
+                # ПОРТ ПРОВЕРЯЕМ ДО ЗАПУСКА, А НЕ РАЗБИРАЕМ ОТКАЗ ПОСЛЕ.
+                #
+                # Дефолт 5433 один на все установки фабрики, поэтому чужой pgvector на нём —
+                # не экзотика, а норма для машины с двумя проектами. Compose в этом случае
+                # падает на «port is already allocated», и совет «повтори вручную» негоден:
+                # повтор упадёт так же. Подбираем свободный порт и пишем его в конфиг
+                # ПРОЕКТА — там же его прочитает клиент памяти.
+                $pr = Resolve-BcfMemoryPort -Wanted $script:MemPort -Container $script:MemContainer `
+                                            -ConfigPath $script:MemDbConfig -ProjectRoot $script:RepoRoot
+                if ($pr.Holder) {
+                    $kind = if ($pr.HolderKind -eq 'container') { 'контейнер' } else { 'процесс' }
+                    Write-Host "[memory] порт $($script:MemPort) занят: $kind '$($pr.Holder)' — это не наша база." -ForegroundColor Yellow
+                }
+                if ($pr.Error) {
+                    Write-Host "[memory] ⚠ порт $($script:MemPort) занят и заменить его не вышло: $($pr.Error)" -ForegroundColor Red
+                    Write-Host "[memory]    останови занявшего или впиши свободный port в $script:MemDbConfig" -ForegroundColor DarkGray
+                    return $false
+                }
+                if ($pr.Changed) {
+                    $script:MemPort = $pr.Port
+                    Write-Host "[memory] беру свободный порт $($pr.Port) и записываю его в $($pr.ConfigPath)" -ForegroundColor Yellow
+                }
+
+                # Compose получает ИМЕННО то, что прочитает клиент. Без этих переменных он
+                # брал свои дефолты, и адрес контейнера расходился с адресом клиента.
+                $env:BCF_MEM_CONTAINER = $script:MemContainer
+                $env:BCF_PG_PORT = "$($script:MemPort)"
+
+                Write-Host "[memory] контейнер отсутствует — docker compose up -d ($script:MemCompose), порт $($script:MemPort)..." -ForegroundColor Yellow
                 $up = Invoke-BcfDockerStreamed -DockerArgs @('compose', '-f', $script:MemCompose, 'up', '-d') -TimeoutSec 900 -Prefix '[memory]'
                 if (-not $up.Ok) {
                     Write-Host "[memory] ⚠ docker compose up не отработал: $(($up.Err).Trim())" -ForegroundColor Red
-                    Write-Host "[memory]    повтори вручную: docker compose -f `"$script:MemCompose`" up -d" -ForegroundColor DarkGray
+                    # НЕ советуем повтор вслепую: если причина — занятый порт, повтор даст то
+                    # же самое. Называем занявшего, а не действие.
+                    $h2 = Get-BcfPortHolder -Port $script:MemPort
+                    if ($h2.Kind -and -not ($h2.Kind -eq 'container' -and $h2.Name -eq $script:MemContainer)) {
+                        Write-Host "[memory]    порт $($script:MemPort) держит $($h2.Kind) '$($h2.Name)' — повтор той же командой упадёт так же." -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "[memory]    повтори вручную: docker compose -f `"$script:MemCompose`" up -d" -ForegroundColor DarkGray
+                    }
                     return $false
                 }
             } else {
@@ -285,7 +328,50 @@ function Ensure-M13Memory {
         Write-Host "[memory] ⚠ pgvector не поднялся за ${TimeoutSec}s (state=$health) — цикл обучения ВЫКЛЮЧЕН. Запусти вручную: docker compose -f `"$script:MemCompose`" up -d" -ForegroundColor Red
         return $false
     }
-    Write-Host "[memory] ✅ pgvector '$($script:MemContainer)' healthy." -ForegroundColor Green
+
+    # ЖИВОЙ КОНТЕЙНЕР — ЕЩЁ НЕ НАШ АДРЕС.
+    #
+    # Наблюдалось: compose не смог привязать 5433 (порт держал чужой pgvector), контейнер
+    # остался созданным, а следующий `docker start` поднял его БЕЗ публикации портов.
+    # Состояние running + healthy, зелёная строка на экране — и клиент, уходящий на
+    # localhost:5433 в чужую базу. Поэтому спрашиваем не «жив ли», а «слушает ли он там,
+    # куда пойдёт клиент», и при расхождении пересоздаём на свободном порту.
+    $pub = @(Get-BcfContainerHostPorts -Name $script:MemContainer)
+    if ($pub -notcontains $script:MemPort) {
+        $where = if ($pub.Count) { "опубликован на $($pub -join ', ')" } else { 'НЕ опубликован наружу вовсе' }
+        Write-Host "[memory] контейнер '$($script:MemContainer)' жив, но $where, а клиент идёт на $($script:MemPort) — пересоздаю." -ForegroundColor Yellow
+
+        $pr2 = Resolve-BcfMemoryPort -Wanted $script:MemPort -Container $script:MemContainer `
+                                     -ConfigPath $script:MemDbConfig -ProjectRoot $script:RepoRoot
+        if ($pr2.Holder) {
+            $kind2 = if ($pr2.HolderKind -eq 'container') { 'контейнер' } else { 'процесс' }
+            Write-Host "[memory] порт $($script:MemPort) занят: $kind2 '$($pr2.Holder)' — это не наша база." -ForegroundColor Yellow
+        }
+        if ($pr2.Changed) {
+            $script:MemPort = $pr2.Port
+            Write-Host "[memory] беру свободный порт $($pr2.Port) и записываю его в $($pr2.ConfigPath)" -ForegroundColor Yellow
+        }
+        # Данные лежат в примонтированном каталоге, а не в контейнере: пересоздание их не
+        # трогает. Удаляем ТОЛЬКО контейнер с нашим именем.
+        $null = Invoke-BcfDocker -DockerArgs @('rm', '-f', $script:MemContainer) -TimeoutSec 60
+        $env:BCF_MEM_CONTAINER = $script:MemContainer
+        $env:BCF_PG_PORT = "$($script:MemPort)"
+        $up2 = Invoke-BcfDockerStreamed -DockerArgs @('compose', '-f', $script:MemCompose, 'up', '-d') -TimeoutSec 900 -Prefix '[memory]'
+        if (-not $up2.Ok) {
+            Write-Host "[memory] ⚠ пересоздать контейнер не вышло: $(($up2.Err).Trim())" -ForegroundColor Red
+            return $false
+        }
+        $deadline2 = (Get-Date).AddSeconds($TimeoutSec)
+        do {
+            Start-Sleep -Seconds 2
+            $health = Get-M13Health
+        } while ($health -ne 'healthy' -and (Get-Date) -lt $deadline2)
+        if ($health -ne 'healthy') {
+            Write-Host "[memory] ⚠ пересозданный контейнер не стал healthy за ${TimeoutSec}s — цикл обучения ВЫКЛЮЧЕН." -ForegroundColor Red
+            return $false
+        }
+    }
+    Write-Host "[memory] ✅ pgvector '$($script:MemContainer)' healthy, порт $($script:MemPort)." -ForegroundColor Green
 
     # Эмбеддинги (LM Studio) — вторая половина готовности памяти. Без неё recall/
     # upsert падают так же, как без pgvector. Оба должны быть живы.
@@ -295,7 +381,24 @@ function Ensure-M13Memory {
         return $false
     }
 
-    Write-Host "[memory] ✅ векторная память готова (pgvector + эмбеддинги) — цикл обучения АКТИВЕН (recall + retrospector + finding-gate)." -ForegroundColor Green
+    # ГОТОВНОСТЬ ПОДТВЕРЖДАЕТСЯ ЗАПРОСОМ, А НЕ СУММОЙ ЗЕЛЁНЫХ ПРИЗНАКОВ.
+    #
+    # Здесь стояло безусловное «✅ векторная память готова». В том же прогоне doctor тут же
+    # печатал «✗ недоступна»: контейнер был healthy, эмбеддинги живы, а клиент до базы не
+    # доходил. Два вердикта на одном экране — это не косметика, это потеря доверия ко
+    # всему выводу. Спрашиваем ровно то, чем пользуется харнесс: клиента.
+    $probe = ''
+    try { $probe = (& python $script:MemClient stats 2>&1 | Out-String).Trim() } catch { $probe = $_.Exception.Message }
+    if ($probe -notmatch '\{') {
+        Write-Host "[memory] ⚠ база и эмбеддинги живы, но КЛИЕНТ до памяти не доходит — цикл обучения ВЫКЛЮЧЕН." -ForegroundColor Red
+        Write-Host "[memory]    адрес: порт $($script:MemPort), конфиг $script:MemDbConfig" -ForegroundColor DarkGray
+        if ($probe) {
+            Write-Host ("[memory]    клиент сказал: " + (($probe -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' ')) -ForegroundColor DarkGray
+        }
+        return $false
+    }
+
+    Write-Host "[memory] ✅ векторная память готова (pgvector + эмбеддинги + клиент) — цикл обучения АКТИВЕН (recall + retrospector + finding-gate)." -ForegroundColor Green
     return $true
 }
 

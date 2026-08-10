@@ -163,6 +163,104 @@ $blob = (& git -C $rw show bcf/task/TASK-77:feature.txt 2>$null | Out-String).Tr
 Check "содержимое восстановимо из ветки" ($blob -eq 'работа агента') "получено: '$blob'"
 Remove-Item -Recurse -Force $rw -ErrorAction SilentlyContinue
 
+# --- Что worktree обязан унести с собой из основного дерева ------------------------------
+#
+# Чистый чекаут не содержит НИЧЕГО из .gitignore, и обе стороны обмена об этом забывают.
+# Цена измерена на прогонах 2026-08-06: без node_modules все три гейта в ветке задачи
+# красные независимо от работы агента; без вердиктов закрытых задач цикл блокирует задачу
+# через секунду после старта («предшественник TASK-01 не имеет verdict: PASS»), хотя тот
+# закрыт и слит, — так волна 2 не поехала целиком.
+
+Section "Worktree уносит зависимости и вердикты"
+
+$rd = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-wt-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $rd | Out-Null
+& git -C $rd init -q -b main 2>&1 | Out-Null
+& git -C $rd config user.email t@t; & git -C $rd config user.name t
+Set-Content -LiteralPath (Join-Path $rd '.gitignore') -Value "node_modules/`ntasks/.verdicts/" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $rd 'src.txt') -Value 'код' -Encoding UTF8
+New-Item -ItemType Directory -Force -Path (Join-Path $rd 'node_modules\.bin') | Out-Null
+Set-Content -LiteralPath (Join-Path $rd 'node_modules\.bin\tsc.cmd') -Value 'echo tsc' -Encoding UTF8
+New-Item -ItemType Directory -Force -Path (Join-Path $rd 'tasks\.verdicts') | Out-Null
+Set-Content -LiteralPath (Join-Path $rd 'tasks\.verdicts\TASK-01.md') -Value "# Verdict — TASK-01`nverdict: PASS" -Encoding UTF8
+& git -C $rd add -A 2>&1 | Out-Null
+& git -C $rd commit -q -m init 2>&1 | Out-Null
+
+$wtd = New-TaskWorktree -Root $rd -Task 'TASK-02'
+Check "worktree создан" ([bool]$wtd -and (Test-Path $wtd)) "путь: $wtd"
+Check "инструменты доступны в ветке задачи" (Test-Path (Join-Path $wtd 'node_modules\.bin\tsc.cmd')) `
+    'без node_modules гейты в ветке красные всегда, независимо от работы агента'
+
+# ИЗОЛЯЦИЯ, А НЕ ССЫЛКА. Общий каталог зависимостей ломает три вещи разом: `npm install`
+# одной задачи вычищает пакеты другой, проверки слитого дерева ловят исчезнувший инструмент
+# посреди чужой установки, а `git worktree remove` идёт по ссылке ВНУТРЬ и вычищает
+# node_modules самого проекта — что и случилось 2026-08-06.
+$nmWt = Get-Item (Join-Path $wtd 'node_modules') -Force
+Check "зависимости задачи — не ссылка на проект" (-not ($nmWt.Attributes -band [IO.FileAttributes]::ReparsePoint)) `
+    'junction/symlink: удаление рабочего дерева вычистит node_modules проекта'
+Set-Content -LiteralPath (Join-Path $wtd 'node_modules\.bin\сор.txt') -Value 'мусор задачи' -Encoding UTF8
+Check "порча зависимостей задачи не видна проекту" (-not (Test-Path (Join-Path $rd 'node_modules\.bin\сор.txt'))) `
+    'каталоги общие — одна задача ломает гейты всем остальным'
+$vcopy = Join-Path $wtd 'tasks\.verdicts\TASK-01.md'
+Check "вердикт предшественника виден задаче" (Test-Path $vcopy) `
+    'без него цикл блокирует задачу: «предшественник не имеет verdict: PASS»'
+if (Test-Path $vcopy) {
+    Check "вердикт перенесён содержимым, а не пустышкой" ((Get-Content -Raw $vcopy) -match 'verdict:\s*PASS')
+}
+Remove-TaskWorktree -Root $rd -Task 'TASK-02'
+Check "удаление дерева задачи не тронуло зависимости проекта" (Test-Path (Join-Path $rd 'node_modules\.bin\tsc.cmd')) `
+    'рекурсивное удаление пошло по ссылке внутрь и вычистило каталог проекта'
+
+# Переиспользованная ветка обязана догонять основную: между прогонами в main попадают и
+# другие задачи, и правки владельца. Задача на старой базе проверяется не тем деревом, в
+# которое её сольют. 2026-08-06 это стоило волны: package.json ветки не знал про
+# объявленный в main typescript, `npm install` в задаче вычистил его из общего
+# node_modules — и гейт tsc упал у всех задач сразу, включая готовые.
+$branchWt = New-TaskWorktree -Root $rd -Task 'TASK-03'
+Set-Content -LiteralPath (Join-Path $branchWt 'branch-work.txt') -Value 'работа задачи' -Encoding UTF8
+& git -C $branchWt add -A 2>&1 | Out-Null
+& git -C $branchWt -c user.name=t -c user.email=t@t commit -q -m 'TASK-03: работа' 2>&1 | Out-Null
+Remove-TaskWorktree -Root $rd -Task 'TASK-03' -KeepBranch
+
+# Основная ветка ушла вперёд.
+Set-Content -LiteralPath (Join-Path $rd 'main-only.txt') -Value 'правка владельца' -Encoding UTF8
+& git -C $rd add -A 2>&1 | Out-Null
+& git -C $rd -c user.name=t -c user.email=t@t commit -q -m 'правка в main' 2>&1 | Out-Null
+
+$again = New-TaskWorktree -Root $rd -Task 'TASK-03'
+Check "работа задачи на месте после переиспользования ветки" (Test-Path (Join-Path $again 'branch-work.txt'))
+Check "ветка догнала основную" (Test-Path (Join-Path $again 'main-only.txt')) `
+    'задача продолжает работать на старой базе — проверки идут не по тому дереву, в которое её сольют'
+Remove-TaskWorktree -Root $rd -Task 'TASK-03'
+
+
+# Каталог, оставшийся от снятого прогона, — ловушка: файл `.git` на месте, а git о дереве
+# уже не знает и ветки нет. 2026-08-08 задача переиспользовала такой каталог вместе с ЧУЖИМ
+# вердиктом внутри (.bcf переживает всё, он вне git), прочитала PASS от прошлого прогона и
+# вышла за семь секунд, не сделав ничего.
+Section "Осиротевший каталог рабочего дерева"
+
+$wtOrphan = New-TaskWorktree -Root $rd -Task 'TASK-42'
+New-Item -ItemType Directory -Force -Path (Join-Path $wtOrphan '.bcf\verdicts') | Out-Null
+Set-Content -LiteralPath (Join-Path $wtOrphan '.bcf\verdicts\чужой.md') -Value 'PASS от прошлого прогона' -Encoding UTF8
+# Прогон сняли: учётную запись убрали, ветку удалили, каталог остался.
+& git -C $rd worktree remove --force $wtOrphan 2>&1 | Out-Null
+New-Item -ItemType Directory -Force -Path $wtOrphan | Out-Null
+Set-Content -LiteralPath (Join-Path $wtOrphan '.git') -Value 'gitdir: /nonexistent' -Encoding UTF8
+New-Item -ItemType Directory -Force -Path (Join-Path $wtOrphan '.bcf\verdicts') | Out-Null
+Set-Content -LiteralPath (Join-Path $wtOrphan '.bcf\verdicts\чужой.md') -Value 'PASS от прошлого прогона' -Encoding UTF8
+
+$again42 = New-TaskWorktree -Root $rd -Task 'TASK-42'
+Check "осиротевший каталог не переиспользован" `
+    ([bool]$again42 -and -not (Test-Path (Join-Path $again42 '.bcf\verdicts\чужой.md'))) `
+    'вернули мусор прошлого прогона: задача прочитает чужой вердикт и закроется, ничего не сделав'
+Check "ветка задачи снова существует" `
+    ([bool]((& git -C $rd branch --list 'bcf/task/TASK-42' 2>$null | Out-String).Trim())) `
+    'без ветки слияние скажет «not something we can merge»'
+Remove-TaskWorktree -Root $rd -Task 'TASK-42'
+
+Remove-Item -Recurse -Force $rd -ErrorAction SilentlyContinue
+
 Write-Host ""
 Write-Host ("ИТОГ: {0} прошло, {1} провалено" -f $script:Pass, $script:Fail) `
     -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

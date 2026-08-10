@@ -249,11 +249,16 @@ if ($Doctor) {
     } else {
         $st = Get-GraphMemoryStats
         if ($st) {
-            $warn = ($st.AntiPatterns -le 1)
+            # Вердикт общий с doctor и `bcf memory status` — Get-BcfLearningVerdict. Три
+            # своих копии этого текста уже разъехались однажды: пустая база объявлялась
+            # сломанной записью на всех трёх экранах сразу.
+            $v = Get-BcfLearningVerdict -Lessons ([int]$st.AntiPatterns) -Project $ProjectRoot
             Write-Host ("  ✓ доступна · уроков {0} · багов {1} · отзывов {2}" -f $st.AntiPatterns, $st.Bugs, $st.Recalls) `
-                -ForegroundColor $(if ($warn) { 'Yellow' } else { 'Green' })
-            if ($warn) {
-                Write-Host "    ⚠ уроков почти нет: чтение работает, запись — нет. После прогона число обязано вырасти." -ForegroundColor Yellow
+                -ForegroundColor $(if ($v.Level -eq 'broken') { 'Yellow' } else { 'Green' })
+            if ($v.Level -eq 'broken') {
+                Write-Host "    ⚠ $($v.Text). После прогона число обязано расти." -ForegroundColor Yellow
+            } elseif ($v.Level -eq 'empty') {
+                Write-Host "    · $($v.Text)" -ForegroundColor DarkGray
             }
         } else {
             Write-Host "  ✓ доступна (счётчики не прочитались)" -ForegroundColor Green
@@ -312,6 +317,17 @@ Write-Host ""
 if (-not $Yes -and -not $DryPlan) {
     # Рой агентов тратит на порядок больше одного агента. Подтверждение здесь —
     # не формальность: это единственная точка, где решение ещё ничего не стоит.
+    #
+    # Но вопрос задают только тому, кто может ответить. Запуск из скрипта, планировщика
+    # или отдельным процессом с перенаправленным выводом ответа не даст никогда, а
+    # Read-Host будет ждать вечно: 2026-08-07 прогон простоял на этой строке 2 ч 20 мин,
+    # не напечатав ни строки и не запустив ни одного агента. Отказ громкий и мгновенный
+    # лучше молчаливого ожидания, которое снаружи выглядит работой.
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) {
+        Write-Host "  подтвердить запуск некому: вывод перенаправлен, вопрос задать негде." -ForegroundColor Red
+        Write-Host "  запускай через `bcf run` (он решает это сам) либо передай -Yes." -ForegroundColor DarkGray
+        exit 130
+    }
     $ans = Read-Host "Запускать? [y/N]"
     if ($ans -notmatch '^(y|yes|д|да)$') { Write-Host "Отменено." -ForegroundColor DarkGray; exit 130 }
 }
@@ -429,6 +445,29 @@ if ($failed) {
     } elseif ((& $has 'ok') -and -not (& $val 'ok')) {
         $verdict = 'ПРОВАЛ'; $vColor = 'Red'; $code = 1
         if (& $has 'reason') { $detail = [string](& $val 'reason') }
+    }
+
+    # ПРИЁМКА ВХОДИТ В ВЕРДИКТ. Задачи могут быть закрыты все до одной — гейты
+    # детерминированы и ловят своё, — а критики при этом найти то, чего гейт не видит.
+    # Прогон g_20260806-195014 напечатал «итог: ок» при восьми семантических конфликтах,
+    # четыре из них P1: «оператор может записать пациента в отсутствие врача». Человек
+    # читает последнюю строку и уходит с ней. Поэтому находки её меняют: слово «ок»
+    # означает «и задачи закрыты, и приёмка чиста», а не «счётчик задач сошёлся».
+    # НЕ ОТВЕТИВШИЙ КРИТИК — НЕ «ЧИСТАЯ ПРИЁМКА». Узел роли возвращает пустоту, когда
+    # агент не дал текста: протух путь к CLI, кончилась квота, оборвался поток. Считать
+    # это отсутствием находок — тот же обман, что и «ок» поверх найденных дефектов.
+    # 2026-08-08: у codex сменился хэш сборки в пути, все три критика упали, отчёт написал
+    # «Находок нет», итог — «ок».
+    if ((& $has 'criticsFailed') -and [int](& $val 'criticsFailed') -gt 0 -and $verdict -eq 'ок') {
+        $cf = [int](& $val 'criticsFailed'); $cr = if (& $has 'criticsRun') { [int](& $val 'criticsRun') } else { 0 }
+        $verdict = 'ПРИЁМКА НЕ ВЫПОЛНЕНА'; $vColor = 'Yellow'; $code = 1
+        $detail = "задачи закрыты, но не ответило критиков — $cf из $cr; смотреть было некому"
+    }
+
+    if ((& $has 'findings') -and [int](& $val 'findings') -gt 0 -and $verdict -eq 'ок') {
+        $p1 = if (& $has 'findingsP1') { [int](& $val 'findingsP1') } else { 0 }
+        $verdict = 'ЗАМЕЧАНИЯ'; $vColor = 'Yellow'; $code = 1
+        $detail = "задачи закрыты все, приёмка нашла $(& $val 'findings')$(if ($p1) { ", из них P1: $p1" }) — .bcf/REVIEW.md"
     }
 }
 

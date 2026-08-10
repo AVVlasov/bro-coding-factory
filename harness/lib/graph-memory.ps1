@@ -252,3 +252,54 @@ function Get-GraphMemoryStats {
     } catch { return $null }
 }
 
+
+# --- ВЕРДИКТ ОБ ОБУЧЕНИИ: ОДИН НА ВСЕ ЭКРАНЫ --------------------------------------------
+#
+# «Уроков почти нет: чтение работает, ЗАПИСЬ — нет» печаталось в трёх местах (граф, doctor,
+# bcf memory status) и БЕЗУСЛОВНО. На свежей базе это неправда: писать было нечему, потому
+# что прогонов ещё не было. Диагноз, выданный без основания, обесценивает ровно тот текст,
+# ради которого написан: в день, когда запись отвалится по-настоящему, его прочитают как
+# обычную жёлтую строку, которая тут всегда.
+#
+# Отличать «пусто, потому что не работали» от «пусто, хотя работали» может только факт
+# прогонов. Считаем их по журналам: каталог прогона без journal.jsonl — это не прогон.
+function Get-BcfLearningVerdict {
+    param([int]$Lessons, [string]$Project = '')
+
+    $root = if ($Project) { $Project } else { Get-BcfProjectRoot }
+    $runs = 0
+    try {
+        $graphDir = Join-Path $root '.bcf\graph'
+        if (Test-Path $graphDir) {
+            foreach ($d in @(Get-ChildItem $graphDir -Directory -ErrorAction SilentlyContinue)) {
+                $j = Join-Path $d.FullName 'journal.jsonl'
+                if (-not (Test-Path $j)) { continue }
+                # ПРОБА doctor — НЕ ПРОГОН, а она тоже заводит каталог и пишет run-start.
+                # Без этой отсечки любая проверка окружения превращалась в «прогон», и
+                # свежая база объявлялась сломанной записью после пяти запусков doctor,
+                # ни один из которых ничего не исполнял. Тот же признак, что и в истории
+                # прогонов (см. Read-BcfRun): флаг doctor или имя 'doctor' в run-start.
+                $isDoctor = $false
+                foreach ($line in (Get-Content -LiteralPath $j -Encoding UTF8 -TotalCount 5 -ErrorAction SilentlyContinue)) {
+                    if (-not $line.Trim()) { continue }
+                    $r = $null
+                    try { $r = $line | ConvertFrom-Json } catch { continue }
+                    if ([string]$r.event -ne 'run-start') { continue }
+                    $isDoctor = ([bool]$r.doctor) -or ([string]$r.name -eq 'doctor')
+                    break
+                }
+                if (-not $isDoctor) { $runs++ }
+            }
+        }
+    } catch { }
+
+    if ($Lessons -gt 1) {
+        return @{ Level = 'ok'; Runs = $runs; Text = '' }
+    }
+    if ($runs -gt 0) {
+        return @{ Level = 'broken'; Runs = $runs
+                  Text = "прогонов было $runs, а уроков $Lessons — чтение работает, ЗАПИСЬ нет" }
+    }
+    return @{ Level = 'empty'; Runs = 0
+              Text = 'база пуста, прогонов ещё не было — расти пока нечему' }
+}

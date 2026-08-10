@@ -131,6 +131,107 @@ function Invoke-BcfDocker {
     }
 }
 
+# --- КТО ДЕРЖИТ ПОРТ --------------------------------------------------------------------
+#
+# Дефект, ради которого это написано: `docker compose up` на занятом порту падает строкой
+# «Bind for 0.0.0.0:5433 failed: port is already allocated», а вызывающий печатал
+# «повтори вручную». Повтор упал бы так же — то есть совет был заведомо негодным, а
+# настоящая причина (ЧУЖОЙ контейнер на нашем порту) не называлась вовсе. Порт по
+# умолчанию один на все установки фабрики, поэтому вторая установка на той же машине
+# гарантированно приезжает в это место.
+#
+# Спрашиваем ДО запуска и отвечаем именем занявшего: имя — единственное, с чем человек
+# может что-то сделать.
+
+function Get-BcfDockerPortMap {
+    # порт (int) → имя контейнера. Один вызов docker на все проверки: перебор портов по
+    # одному вызову на порт превращает подбор свободного в десяток запусков docker.
+    $map = @{}
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return $map }
+    if (-not (Test-BcfDockerDaemon)) { return $map }
+    $r = Invoke-BcfDocker -DockerArgs @('ps', '--format', '{{.Names}}|{{.Ports}}') -TimeoutSec 15
+    if (-not $r.Ok) { return $map }
+    foreach ($line in (($r.Out -split "`r?`n") | Where-Object { $_.Trim() })) {
+        $parts = $line -split '\|', 2
+        if ($parts.Count -lt 2) { continue }
+        $name = $parts[0].Trim()
+        foreach ($m in [regex]::Matches($parts[1], ':(\d+)->')) {
+            $p = [int]$m.Groups[1].Value
+            if (-not $map.ContainsKey($p)) { $map[$p] = $name }
+        }
+    }
+    return $map
+}
+
+function Get-BcfPortHolder {
+    param([Parameter(Mandatory)][int]$Port, [hashtable]$PortMap)
+
+    $map = if ($null -ne $PortMap) { $PortMap } else { Get-BcfDockerPortMap }
+    if ($map.ContainsKey($Port)) {
+        return [pscustomobject]@{ Kind = 'container'; Name = [string]$map[$Port] }
+    }
+    # Порт может держать и обычный процесс — свой postgres, туннель, чужая сборка. Для
+    # человека разница существенная: контейнер останавливают, процесс убивают.
+    try {
+        $conn = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop) | Select-Object -First 1
+        if ($conn) {
+            $name = "pid $($conn.OwningProcess)"
+            try { $name = (Get-Process -Id $conn.OwningProcess -ErrorAction Stop).ProcessName } catch { }
+            return [pscustomobject]@{ Kind = 'process'; Name = $name }
+        }
+    } catch { }
+    return [pscustomobject]@{ Kind = ''; Name = '' }
+}
+
+# НА КАКИЕ ПОРТЫ ХОСТА ОПУБЛИКОВАН КОНТЕЙНЕР.
+#
+# Наблюдалось живьём: compose не смог привязать 0.0.0.0:5433 (порт держал чужой pgvector),
+# контейнер остался СОЗДАННЫМ, а следующий `docker start` поднял его вообще без публикации
+# портов. Снаружи всё зелено — `running`, `healthy`, — а клиент идёт на localhost:5433 и
+# попадает в ЧУЖУЮ базу. Живой контейнер, отвечающий не по тому адресу, хуже упавшего:
+# упавший виден.
+function Get-BcfContainerHostPorts {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $ports = @()
+    $r = Invoke-BcfDocker -DockerArgs @('inspect', '-f', '{{json .NetworkSettings.Ports}}', $Name) -TimeoutSec 15
+    if (-not $r.Ok) { return $ports }
+    try {
+        $j = ([string]$r.Out).Trim() | ConvertFrom-Json
+        foreach ($p in $j.PSObject.Properties) {
+            foreach ($b in @($p.Value)) {
+                if ($b -and $b.HostPort) { $ports += [int]$b.HostPort }
+            }
+        }
+    } catch { }
+    return @($ports | Select-Object -Unique)
+}
+
+function Test-BcfPortFree {
+    param([Parameter(Mandatory)][int]$Port)
+    # Проба привязкой, а не опросом списков: списки отвечают на «кто слушает сейчас», а
+    # нам нужно «сможет ли контейнер встать». Это разные ответы при чужих правах на порт.
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        return $true
+    } catch { return $false } finally {
+        if ($listener) { try { $listener.Stop() } catch { } }
+    }
+}
+
+function Find-BcfFreePort {
+    param([Parameter(Mandatory)][int]$From, [int]$Tries = 40)
+    $map = Get-BcfDockerPortMap
+    for ($p = $From; $p -lt ($From + $Tries); $p++) {
+        if ($p -gt 65535) { break }
+        if ($map.ContainsKey($p)) { continue }
+        if (Test-BcfPortFree -Port $p) { return $p }
+    }
+    return 0
+}
+
 # Долгая операция docker, ход которой ВИДНО. Для compose up и pull: они идут минутами, и
 # потолок времени тут не решение — решение показывать, что происходит. Прогон, молчащий
 # пять минут, неотличим от зависшего, и именно так его и воспринимают.

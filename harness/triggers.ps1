@@ -161,8 +161,20 @@ if ($hits.Count -gt 0) {
     # Уникализируем по file+pattern
     $hits = $hits | Group-Object { "$($_.file):$($_.pattern)" } | ForEach-Object { $_.Group[0] }
 
-    # 1) human-callout.md (живёт в каталоге харнеса .bcf/)
-    $calloutFile = Join-Path $PSScriptRoot 'human-callout.md'
+    # 1) human-callout.md — В ПРОЕКТЕ, А НЕ В ФАБРИКЕ.
+    #
+    # Записка писалась в каталог самой фабрики ($PSScriptRoot), а цикл при этом отправлял
+    # человека в «.bcf/human-callout.md» проекта — файла по этому адресу не существовало.
+    # То есть пауза объявлялась, причина не показывалась, и человек шёл искать её по
+    # логам (наблюдалось живьём 2026-08-08: две задачи встали, причину пришлось
+    # восстанавливать из config/triggers.json). Плюс один файл на всю фабрику затирался
+    # каждой следующей задачей любого проекта.
+    #
+    # Копия на задачу нужна отдельно: волна идёт параллельно, и общий файл перезаписали бы
+    # соседи в ту же секунду.
+    $stateDir = Join-Path $Repo '.bcf'
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    $calloutFile = Join-Path $stateDir 'human-callout.md'
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $body = @()
     $body += "# Human callout — Ralph пауза"
@@ -188,6 +200,11 @@ if ($hits.Count -gt 0) {
     $body += "3. Удали ``.bcf/human-callout.md`` ИЛИ создай ``.bcf/STOP`` для полной остановки."
     $body += "4. Запусти ``harness/start.ps1 <TASK>`` для продолжения."
     Set-Content -LiteralPath $calloutFile -Value ($body -join "`n") -Encoding UTF8
+    if ($TaskId) {
+        $calloutDir = Join-Path $stateDir 'callouts'
+        New-Item -ItemType Directory -Force -Path $calloutDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $calloutDir "$TaskId.md") -Value ($body -join "`n") -Encoding UTF8
+    }
 
     # 2) emit event (если разрешено)
     if (-not $NoEvent) {

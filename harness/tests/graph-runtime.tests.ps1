@@ -193,11 +193,42 @@ $r = ConvertFrom-AgentStream -Lines $clLines -Format 'claude'
 Check "claude: итог из result важнее черновика" ($r.Text -eq 'итоговый ответ') "получено: '$($r.Text)'"
 Check "claude: токены сочтены" ($r.Tokens -eq 15) "получено: $($r.Tokens)"
 
+# Кэш у claude приходит ОТДЕЛЬНЫМИ полями, и input_tokens его не включает. Пока их не
+# складывали, узел с большим системным промптом выглядел одиннадцатитокенным рядом с
+# codex-узлом на 16 тысяч — то есть смета и потолок «до исчерпания» были слепы ровно на
+# том бэкенде, которым чаще всего работают.
+$clCached = @(
+    '{"type":"result","subtype":"success","is_error":false,"result":"ок","usage":{"input_tokens":11,"cache_read_input_tokens":14200,"cache_creation_input_tokens":300,"output_tokens":40}}'
+)
+$r = ConvertFrom-AgentStream -Lines $clCached -Format 'claude'
+Check "claude: кэшированный вход входит в расход" ($r.Tokens -eq 14551) "получено: $($r.Tokens)"
+
 # Ровно тот отказ, который CLI выдал на этой машине: код возврата ненулевой, но
 # событие штатное — без распознавания это выглядело бы как успешный пустой ответ.
 $r = ConvertFrom-AgentStream -Format 'claude' -Lines @(
     '{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}')
 Check "claude: отсутствие авторизации — это отказ, а не пустой ответ" ($r.Failed -match 'Not logged in' -and -not $r.Text)
+
+# --- Протухший путь к CLI ---------------------------------------------------------------
+#
+# CLI, живущая внутри установки приложения, лежит по пути с хэшем сборки. После обновления
+# каталог другой, а в конфиге остаётся старый: 2026-08-08 все три критика упали с «is not
+# recognized as a name of a cmdlet», приёмка не выполнилась, отчёт написал «Находок нет».
+$fakeRoot = Join-Path ([IO.Path]::GetTempPath()) ("bcf-bin-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Force -Path (Join-Path $fakeRoot 'cfac6bda') | Out-Null
+Set-Content -LiteralPath (Join-Path $fakeRoot 'cfac6bda\codex.exe') -Value 'x' -Encoding UTF8
+$stale = "& '$fakeRoot\68de26ad\codex.exe' exec --json -m {model}"
+$fixed = _RepairPinnedBinary $stale 'codex'
+Check "протухший путь заменён на существующий" ($fixed -like "*cfac6bda\codex.exe*") "получено: $fixed"
+Check "остальная команда не тронута" ($fixed -like '*exec --json -m {model}*')
+
+$live = "& '$fakeRoot\cfac6bda\codex.exe' exec -m {model}"
+Check "живой путь не подменяется" ((_RepairPinnedBinary $live 'codex') -eq $live)
+
+$nowhere = "& 'Z:\нет\такого\каталога\codex.exe' exec"
+Check "без замены команда остаётся прежней (падать с понятной ошибкой, а не с чужим бинарём)" `
+    ((_RepairPinnedBinary $nowhere 'codex') -eq $nowhere)
+Remove-Item -Recurse -Force $fakeRoot -ErrorAction SilentlyContinue
 
 # Реальный вывод cursor-agent (снят 2026-07-30, Pro). Расход в camelCase — схема почти
 # совпадает с claude, и скопированный snake_case разборщик молча давал ноль: узлы были

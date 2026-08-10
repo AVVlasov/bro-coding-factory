@@ -14,6 +14,7 @@
     "py_targets": "File extensions treated as Python for py_compile and wrapper checks.",
     "console_check_dirs": "(lint-gate) Repo-relative dirs where console.* is forbidden (e.g. main/IPC/server code that must not pollute stdout). Empty = check disabled.",
     "banned_ui_patterns": "(lint-gate) List of regexes that must NOT appear in product source (e.g. platform-specific UI you forbid). Empty = check disabled.",
+    "time_dependent_tests": "(lint-gate) true = a test file that reads the wall clock (new Date() / Date.now() / today()) without freezing time is a violation. Such a test is green six days a week and red on the seventh, so a green gate stops meaning anything. Off by default because enabling it on an existing suite blocks every task until the suite is pinned — turn it on as its own task.",
     "product_paths": "(non-target-script-detector) Repo-relative dirs treated as product code when scanning UI copy for stray writing systems. Keep it narrow: a detector that scans the whole repo trips on fixtures and gets switched off entirely. Defaults to ['src'].",
     "renderer_dir": "(post-write-check) The UI/renderer directory that must not reach across an architectural boundary (e.g. 'src'). Empty = cross-layer import check disabled.",
     "renderer_forbidden_import": "(post-write-check) Regex matching imports forbidden inside renderer_dir (e.g. \"from 'electron'\" or \"from '\\\\.\\\\./server/\"). Empty = check disabled."
@@ -36,6 +37,7 @@
 
   "console_check_dirs": [],
   "banned_ui_patterns": [],
+  "time_dependent_tests": false,
 
   "product_paths": ["src"],
   "renderer_dir": "",

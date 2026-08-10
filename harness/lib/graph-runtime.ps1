@@ -148,6 +148,36 @@ function Initialize-GraphRun {
 # разъезжаются по разным инструментам: у каждой CLI свой формат событий, своя авторизация
 # и свои флаги доступа к диску. Поэтому роль разрешается в ТРОЙКУ: команда, модель, разборщик.
 
+# ПРИБИТЫЙ ПУТЬ К CLI ПРОТУХАЕТ — ЛЕЧИМ НА МЕСТЕ.
+#
+# Часть агентских CLI живёт не на PATH, а внутри установки приложения, и путь содержит хэш
+# сборки: `…\Codex\bin\68de26ad08be95cd\codex.exe`. После обновления приложения каталог
+# другой, а в конфиге проекта остаётся старый. Наблюдалось живьём 2026-08-08: все три
+# критика упали по три попытки с «is not recognized as a name of a cmdlet», приёмка не
+# выполнилась, а отчёт написал «Находок нет».
+#
+# Чиним ровно ту форму, которая протухает: сосед по каталогу-родителю с тем же именем
+# файла. Ничего не выдумываем: если замены нет, оставляем как было — пусть падает с
+# понятной ошибкой, а не с подменённым бинарём.
+function _RepairPinnedBinary([string]$Command, [string]$BackendName) {
+    if (-not $Command) { return $Command }
+    $m = [regex]::Match($Command, "^\s*&\s*'([^']+)'")
+    if (-not $m.Success) { return $Command }
+    $pinned = $m.Groups[1].Value
+    if (Test-Path -LiteralPath $pinned) { return $Command }
+
+    $leaf   = Split-Path $pinned -Leaf
+    $parent = Split-Path (Split-Path $pinned -Parent) -Parent
+    if (-not $parent -or -not (Test-Path -LiteralPath $parent)) { return $Command }
+
+    $found = Get-ChildItem -Path (Join-Path $parent "*\$leaf") -ErrorAction SilentlyContinue |
+             Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $found) { return $Command }
+
+    Write-Host "  · путь к '$BackendName' протух ($pinned) — беру свежий: $($found.FullName)" -ForegroundColor DarkGray
+    return ($Command -replace [regex]::Escape("'$pinned'"), "'$($found.FullName)'")
+}
+
 function _GraphBackends($cfg) {
     $out = @{}
     $b = $null
@@ -161,7 +191,7 @@ function _GraphBackends($cfg) {
             # «готов ли claude/cursor» нельзя узнать, не назначив им роли в боевом графе,
             # то есть проверка требовала бы сначала сделать прогон зависимым от непроверенного.
             $out[$prop.Name] = @{
-                Command    = [string]$v.command
+                Command    = (_RepairPinnedBinary ([string]$v.command) $prop.Name)
                 Format     = [string]$(if ($v.format) { $v.format } else { 'opencode' })
                 ProbeModel = [string]$v.probeModel
                 # Дешёвая проверка авторизации: не тратит ни одного токена и отвечает
@@ -293,7 +323,18 @@ function ConvertFrom-AgentStream {
                 if ($t -eq 'result') {
                     if ($ev.is_error) { $failed = [string]$ev.result }
                     else { [void]$text.Clear(); [void]$text.AppendLine([string]$ev.result) }
-                    if ($ev.usage) { $tokens += [double]$ev.usage.input_tokens + [double]$ev.usage.output_tokens }
+                    # ВНИМАНИЕ: у claude input_tokens — это ТОЛЬКО некэшированный вход.
+                    # Чтение и запись кэша приходят отдельными полями, и без них узел с
+                    # большим системным промптом выглядел одиннадцатитокенным: живая проба
+                    # ролей давала claude 11 против 16 677 у codex на одной и той же
+                    # задаче. Числа несравнимы между бэкендами — а на них держится и смета,
+                    # и потолок «до исчерпания»: слепой ограничитель не срабатывает никогда.
+                    # У codex input_tokens уже включает кэш (cached_input_tokens — его
+                    # подмножество), поэтому там складывать нечего.
+                    if ($ev.usage) {
+                        $tokens += [double]$ev.usage.input_tokens + [double]$ev.usage.output_tokens +
+                                   [double]$ev.usage.cache_read_input_tokens + [double]$ev.usage.cache_creation_input_tokens
+                    }
                 }
                 elseif ($t -eq 'assistant' -and $text.Length -eq 0) {
                     foreach ($c in @($ev.message.content)) {
