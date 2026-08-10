@@ -41,7 +41,19 @@ param(
   # 600s (10 мин) — щедро для самого долгого fetch/thinking; короче — режет легитимно.
   [int]$SilentTimeoutSec = 600,
   [switch]$DryRun,
-  [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  [string]$ProjectRoot = '',        # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
+  # База дифа для приёмки УЖЕ ПРИЗЕМЛИВШЕЙСЯ работы (ревизия git: sha, тег, HEAD~5).
+  #
+  # По умолчанию verify считает работу задачи как diff её файлов против HEAD, а если пусто —
+  # против HEAD~1: он рассчитан на запуск сразу после итерации кодового агента, когда работа
+  # либо в дереве, либо в последнем коммите. Если задачи закрывали раньше и их работа лежит
+  # в глубине истории, обе базы дают пустоту, и гейт пустого дифа валит вердикт словами
+  # «задача не изменила ни строки» — хотя изменила, просто десять коммитов назад.
+  #
+  # Параметр НЕ ослабляет гейт: диф считается против указанной ревизии, и если файлы задачи
+  # с тех пор не тронуты — гейт падает ровно как раньше. Он лишь даёт человеку сказать,
+  # относительно чего мерить работу.
+  [string]$DiffBase = ''
 )
 
 $ErrorActionPreference = "Continue"
@@ -398,18 +410,42 @@ if ($mFiles.Success) {
   $taskFiles = @($taskFiles | Select-Object -Unique)
 }
 
+# ВНИМАНИЕ: имена переменных в PowerShell НЕЧУВСТВИТЕЛЬНЫ К РЕГИСТРУ — $diffBase и $DiffBase
+# это одна переменная. Параметр забираем в отдельное имя ДО присваивания рабочей базы,
+# иначе строка ниже затирает аргумент: явная база молча становится HEAD, а у обычного
+# прогона навсегда пропадает откат на HEAD~1.
+$explicitBase = $DiffBase
 $diffBase = 'HEAD'
+# База задана человеком — автоподбор не работает: он и нужен затем, чтобы мерить работу,
+# приземлившуюся раньше последнего коммита. Ревизию проверяем сразу: опечатка в sha иначе
+# даст пустой диф и вердикт FAIL «задача ничего не изменила», то есть соврёт про задачу
+# вместо того, чтобы пожаловаться на аргумент.
+if ($explicitBase) {
+  git rev-parse --verify --quiet "$explicitBase^{commit}" *> $null
+  if ($LASTEXITCODE -ne 0) {
+    Log "ОШИБКА: -DiffBase '$explicitBase' не разрешается в коммит этого репозитория."
+    exit 2
+  }
+  $diffBase = $explicitBase
+}
+
 if ($taskFiles.Count -gt 0) {
   Log "Файлы задачи ($($taskFiles.Count)): $($taskFiles -join ', ')"
-  $diffFull = (git diff HEAD -- $taskFiles 2>$null | Out-String)
-  if ([string]::IsNullOrWhiteSpace($diffFull)) {
-    # diff против HEAD пуст — работа уже закоммичена (раннер не коммитит по задачам,
-    # значит весь v5-коммит). Берём базой HEAD~1: покажет, что последний коммит
-    # (+ незакоммиченное) сделал с файлами задачи. Без этого тестеры и судья
-    # верифицируют против пустоты.
-    $diffBase = 'HEAD~1'
-    $diffFull = (git diff HEAD~1 -- $taskFiles 2>$null | Out-String)
-    Log "diff против HEAD пуст (работа закоммичена) — база дифа переключена на HEAD~1."
+  if ($explicitBase) {
+    $diffFull = (git diff $diffBase -- $taskFiles 2>$null | Out-String)
+    Log "База дифа задана явно: $diffBase (приёмка уже приземлившейся работы)."
+  }
+  else {
+    $diffFull = (git diff HEAD -- $taskFiles 2>$null | Out-String)
+    if ([string]::IsNullOrWhiteSpace($diffFull)) {
+      # diff против HEAD пуст — работа уже закоммичена (раннер не коммитит по задачам,
+      # значит весь v5-коммит). Берём базой HEAD~1: покажет, что последний коммит
+      # (+ незакоммиченное) сделал с файлами задачи. Без этого тестеры и судья
+      # верифицируют против пустоты.
+      $diffBase = 'HEAD~1'
+      $diffFull = (git diff HEAD~1 -- $taskFiles 2>$null | Out-String)
+      Log "diff против HEAD пуст (работа закоммичена) — база дифа переключена на HEAD~1."
+    }
   }
   $diffStat = (git diff --stat $diffBase -- $taskFiles 2>$null | Out-String)
 }
@@ -429,9 +465,17 @@ else {
 #
 # Задача, которой нечего делать, — это решение человека, а не автоматики: он либо закроет
 # её руками, либо перепишет условие. Автоматика обязана сказать «работы нет».
+#
+# -DiffBase гейт не отменяет: при явной базе диф считается против неё, и пустота против
+# неё означает ровно то же самое — файлы задачи не тронуты с той точки.
 $emptyDiff = [string]::IsNullOrWhiteSpace($diffFull)
 if ($emptyDiff) {
-  Log "diff ПУСТ и против HEAD, и против HEAD~1 — задача не изменила ни строки в своих файлах."
+  if ($explicitBase) {
+    Log "diff ПУСТ против заданной базы $diffBase — файлы задачи не менялись с этой точки."
+  }
+  else {
+    Log "diff ПУСТ и против HEAD, и против HEAD~1 — задача не изменила ни строки в своих файлах."
+  }
 }
 $diffLines = $diffFull -split "`n"
 if ($diffLines.Count -gt 1500) {
@@ -1211,6 +1255,7 @@ $verdictBody = @"
 verdict: $verdict
 date: $today
 diff_fingerprint: $fp
+diff_base: $diffBase$(if ($explicitBase) { ' (задана человеком: приёмка уже приземлившейся работы)' })
 verified_by: harness/verify.ps1 — Фазы C-E (всё через opencode; кодинг/тестеры/судья — $Model, vision — $VisionModel, судья — $JudgeModel)
 plan:
   testers: $($testers -join ', ')
