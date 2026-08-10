@@ -261,6 +261,43 @@ Remove-TaskWorktree -Root $rd -Task 'TASK-42'
 
 Remove-Item -Recurse -Force $rd -ErrorAction SilentlyContinue
 
+# ---------------------------------------------------------------------------
+Section "Грязь в каталогах владельца НЕ отменяет слияние (регрессия 2026-08-10)"
+# ---------------------------------------------------------------------------
+# Второй случай того же класса, что и с Cargo.lock. Узел ревизии плана работает в
+# ОСНОВНОМ дереве и с правом правки; он зашёл в tasks/ и поменял в закрытой TASK-25
+# «- [x]» на «- [V]». Две строки в файле давно закрытой задачи отменили слияние
+# TASK-48, дошедшей до PASS. tasks/ и config/ принадлежат владельцу, кодовому агенту
+# запрещены и в слиянии продуктового кода не участвуют — значит откат, а не отказ.
+$d = New-Fixture
+New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $d 'config') | Out-Null
+'- [x] сделано' | Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-25.md') -Encoding UTF8
+'{ "a": 1 }'    | Set-Content -LiteralPath (Join-Path $d 'config\checks.json') -Encoding UTF8
+& git -C $d add -A 2>&1 | Out-Null
+& git -C $d commit -q -m "задачи и конфиги" 2>&1 | Out-Null
+
+# Узел пачкает оба каталога владельца — ровно как в инциденте.
+'- [V] сделано' | Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-25.md') -Encoding UTF8
+'{ "a": 2 }'    | Set-Content -LiteralPath (Join-Path $d 'config\checks.json') -Encoding UTF8
+Check "предусловие: дерево грязное по tasks/ и config/" (@(& git -C $d status --porcelain).Count -eq 2)
+
+$r = Merge-TaskWorktree -Root $d -Task 'TASK-99' -GeneratedFiles @('Cargo.lock')
+Check "слияние прошло, а не отменилось" ($r.Ok) "вид=$($r.Kind) сообщение=$($r.Message)"
+Check "работа задачи в основном дереве" `
+    ((Get-Content -Raw -LiteralPath (Join-Path $d 'src.rs')).Trim() -eq 'правка задачи')
+Check "правка узла в tasks/ откачена" `
+    ((Get-Content -Raw -LiteralPath (Join-Path $d 'tasks\TASK-25.md')).Trim() -eq '- [x] сделано')
+Check "правка узла в config/ откачена" `
+    ((Get-Content -Raw -LiteralPath (Join-Path $d 'config\checks.json')).Trim() -eq '{ "a": 1 }')
+
+# Грязь в ПРОДУКТОВОМ коде по-прежнему отменяет слияние: там правку теряют молча только
+# по недосмотру, и это ровно то, от чего проверка и стоит.
+'чужая правка' | Set-Content -LiteralPath (Join-Path $d 'src.rs') -Encoding UTF8
+$r2 = Merge-TaskWorktree -Root $d -Task 'TASK-99' -GeneratedFiles @('Cargo.lock')
+Check "грязь в продуктовом коде отменяет слияние" ((-not $r2.Ok) -and ($r2.Kind -eq 'dirty-tree')) "вид=$($r2.Kind)"
+Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+
 Write-Host ""
 Write-Host ("ИТОГ: {0} прошло, {1} провалено" -f $script:Pass, $script:Fail) `
     -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

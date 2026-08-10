@@ -375,6 +375,34 @@ if (-not (Test-Path $jFile)) {
                 Write-BcfOk "сквозных сценариев доказано: $($requiredJ.Count) из $($js.Count)"
                 Write-BcfNote 'прогнать: pwsh harness/journey-gate.ps1'
             }
+            # ВЛАДЕЛЕЦ ПУТИ ОБЯЗАН БЫТЬ ТЕМ, КТО МОЖЕТ ЕГО ЗАКРЫТЬ.
+            #
+            # Поле task решает, кого Фаза J валит за красный путь. 2026-08-10: у пути
+            # стояло два владельца — серверная задача и клиентская, — и серверная
+            # получила FAIL за путь, который без клиентской зелёным быть не может.
+            # Проверяется дёшево: файл-доказательство обязан быть в разделе «Файлы»
+            # задачи-владельца, иначе она физически не может сделать путь зелёным.
+            $tasksDir = Join-Path $project 'tasks'
+            $ownerBad = @()
+            foreach ($jj in $js) {
+                $owners = @([regex]::Matches([string]$jj.task, '[A-Za-z]+-\d+') | ForEach-Object { $_.Value })
+                if ($owners.Count -gt 1) { $ownerBad += "$($jj.id): владельцев несколько ($($owners -join ', ')) — валить будут всех"; continue }
+                if (-not $owners.Count) { continue }
+                $tf = @(Get-ChildItem -LiteralPath $tasksDir -Filter "$($owners[0])-*.md" -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+                if (-not $tf.Count) { $ownerBad += "$($jj.id): владелец $($owners[0]) — файла задачи нет"; continue }
+                $body = Get-Content -Raw -LiteralPath $tf[0].FullName -ErrorAction SilentlyContinue
+                if ($body -and $jj.proof -and ($body -notmatch [regex]::Escape([string]$jj.proof))) {
+                    $ownerBad += "$($jj.id): владелец $($owners[0]) не заявляет $($jj.proof) в своих файлах"
+                }
+            }
+            if ($ownerBad.Count) {
+                Write-BcfFail "владелец пути не может его закрыть: $($ownerBad.Count)"
+                foreach ($b in $ownerBad) { Write-BcfNote $b }
+                Write-BcfNote 'Фаза J валит по красному пути ИМЕННО владельца — он обязан быть ровно один и тот,'
+                Write-BcfNote 'в чьём разделе «Файлы» лежит файл-доказательство.'
+                $bad++
+            }
+
             if ($plannedJ.Count -and $noProof.Count -eq 0 -and $requiredJ.Count) {
                 Write-BcfWarn "путей объявлено, но ещё не доказано (planned): $($plannedJ.Count)"
                 foreach ($p in $plannedJ) { Write-BcfNote "$($p.id) — $($p.title)" }

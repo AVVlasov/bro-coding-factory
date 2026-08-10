@@ -164,6 +164,11 @@ $timeDepEnabled = $false
 if ($HooksCfg -and $HooksCfg.PSObject.Properties['time_dependent_tests']) {
     $timeDepEnabled = [bool]$HooksCfg.time_dependent_tests
 }
+# Форсирование через окружение. Нужно там, где правило требуется прогнать, а редактировать
+# .claude/ нельзя: во многих проектах обвязка объявлена для кодового агента запретной
+# («его проверяют этим инструментом»). Без этого задача «почини недетерминированные тесты»
+# не может доказать себя, не нарушив правило проекта.
+if ($env:BCF_TIME_DEPENDENT_TESTS -eq '1') { $timeDepEnabled = $true }
 if ($timeDepEnabled) {
     $timeHits = @()
     foreach ($d in $ProductPaths) {
