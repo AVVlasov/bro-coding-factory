@@ -61,6 +61,14 @@ $ErrorActionPreference = "Continue"
 $root = Get-BcfProjectRoot -Explicit $ProjectRoot
 Set-Location $root
 
+# Обязательные проверки (config/checks.json) запускаются В КОРНЕ ПРОЕКТА, а обвязка лежит
+# снаружи него. Проверке, которой нужен гейт харнесса, сослаться было не на что: путь
+# harness/... в проекте не существует, а абсолютный — машинно-зависим. Отдаём корень
+# обвязки и корень проекта через окружение: Start-Process наследует переменные процесса.
+# Без этого проверка TASK-46 падала не по делу — pwsh печатал usage-баннер вместо запуска.
+$env:BCF_HARNESS_ROOT = Get-BcfHarnessRoot
+if (-not $env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT = $root }
+
 # --- Harness config (config/harness.json + config/agents.json) — источник специфики. ---
 $Cfg = $null; $AgentsCfg = $null
 $cfgF = Join-Path $root 'config\harness.json'
