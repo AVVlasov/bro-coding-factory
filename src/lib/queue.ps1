@@ -52,6 +52,15 @@ function Get-BcfQueue {
                 Preds = @(Get-TaskPredecessors -TaskId $id -Root $Project -Prefix $prefix)
                 Pass  = ((Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet))
                 Ready = $false
+                # ДВА РАЗНЫХ УСЛОВИЯ, КОТОРЫЕ НЕЛЬЗЯ СКЛЕИВАТЬ В ОДНО СЛОВО.
+                #
+                # Ready — «предшественники закрыты». Admitted — «владение объявлено», без
+                # него граф задачу в волну не берёт. Пока состояние считалось одним только
+                # Ready, `bcf tasks` печатал «готова» и советовал `bcf run queue` о задаче,
+                # которую тот же самый разбор строкой ниже называл недопущенной, а мастер
+                # на шаге 4 — «не допущено: 1». Три экрана об одной задаче говорили разное.
+                Admitted = $false
+                Runnable = $false
             }
         }
     }
@@ -59,7 +68,9 @@ function Get-BcfQueue {
     $passSet = @{}
     foreach ($t in $tasks) { if ($t.Pass) { $passSet[$t.Id] = $true } }
     foreach ($t in $tasks) {
-        $t.Ready = -not $t.Pass -and (@($t.Preds | Where-Object { -not $passSet.ContainsKey($_) }).Count -eq 0)
+        $t.Ready    = -not $t.Pass -and (@($t.Preds | Where-Object { -not $passSet.ContainsKey($_) }).Count -eq 0)
+        $t.Admitted = -not $t.Pass -and [bool]$t.Files.Count
+        $t.Runnable = $t.Ready -and $t.Admitted
     }
 
     # Владение файлами — та самая мина, которую граф ловит ДО запуска. Считается здесь тем
@@ -102,7 +113,11 @@ function Get-BcfQueue {
         Total       = @($tasks).Count
         Closed      = @($tasks | Where-Object { $_.Pass }).Count
         Open        = @($tasks | Where-Object { -not $_.Pass }).Count
-        Ready       = @($tasks | Where-Object { $_.Ready }).Count
+        # «Готово к работе» = поедет прямо сейчас. Задача с закрытыми предшественниками, но
+        # без объявленных файлов сюда НЕ попадает: она не поедет, и считать её готовой
+        # значит обещать прогон, которого не будет.
+        Ready       = @($tasks | Where-Object { $_.Runnable }).Count
+        NotAdmitted = @($tasks | Where-Object { $_.Ready -and -not $_.Admitted } | ForEach-Object { $_.Id })
         Admitted    = @($tasks | Where-Object { -not $_.Pass -and $_.Files.Count }).Count
         Collisions  = @($collisions)
         Undeclared  = @($undeclared)

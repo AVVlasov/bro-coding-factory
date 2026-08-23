@@ -167,11 +167,21 @@ switch ($sub) {
 
     $ap = [int]$st.anti_patterns
     $week = $st.anti_patterns_last_7d
-    if ($ap -le 1) {
-        Write-BcfWarn 'уроков почти нет: чтение работает, ЗАПИСЬ — нет'
+    # Вердикт общий с графом и doctor: пустая база и сломанная запись — РАЗНЫЕ состояния, и
+    # выдавать первое за второе значит приучить не читать эту строку.
+    . (Join-Path (Get-BcfHarness) 'lib\graph-memory.ps1')
+    $verdict = Get-BcfLearningVerdict -Lessons $ap -Project $project
+    if ($verdict.Level -eq 'broken') {
+        Write-BcfWarn $verdict.Text
         Write-BcfNote 'после боевого прогона это число обязано вырасти. Если не растёт — уроки пишет'
         Write-BcfNote 'только ретроспектор после вердикта, а до вердикта доходят единицы задач.'
         exit 1
+    }
+    if ($verdict.Level -eq 'empty') {
+        Write-BcfDim $verdict.Text
+        Write-BcfNote 'это нормальное состояние свежей базы, а не поломка: первый же прогон её наполнит.'
+        Write-Host ''
+        exit 0
     }
     if ($null -ne $week) {
         if ([int]$week -gt 0) { Write-BcfOk "за последние 7 дней прибавилось уроков: $week — обучение живое" }
@@ -219,20 +229,34 @@ switch ($sub) {
     $ours = $mcfg.Container
     Write-BcfDim "конфиг: $($mcfg.Path)"
     Write-BcfDim "цель: контейнер $ours, порт $port"
-    $holder = ''
-    try {
-        foreach ($line in (& docker ps --format '{{.Names}}|{{.Ports}}' 2>$null)) {
-            $parts = $line -split '\|'
-            if ($parts.Count -lt 2) { continue }
-            if ($parts[1] -match ":$port->") { $holder = $parts[0]; break }
-        }
-    } catch { }
-    if ($holder -and $holder -ne $ours) {
-        Write-BcfFail "порт $port уже занят другим контейнером: $holder"
-        Write-BcfNote 'это не просто «занято»: клиент подключится к ЧУЖОЙ базе, получит отказ'
-        Write-BcfNote 'авторизации, и выглядеть это будет как поломка нашей памяти.'
-        Write-BcfNote "поправь port в $($mcfg.Path) и BCF_PG_PORT в окружении на свободный, затем повтори."
+    # ЗАНЯТО — ЗНАЧИТ ПОДБИРАЕМ, А НЕ ОТПРАВЛЯЕМ ПРАВИТЬ КОНФИГ РУКАМИ.
+    #
+    # Раньше здесь стоял exit 2 с советом «поправь port и повтори». Совет верный по сути и
+    # негодный по форме: порт 5433 записан дефолтом во ВСЕ установки фабрики, поэтому
+    # столкновение — обычное состояние машины с двумя проектами, а не редкость, ради
+    # которой стоит будить человека. Подбираем свободный, пишем в конфиг проекта и
+    # говорим, что сделали.
+    . (Join-Path (Get-BcfHarness) 'lib\memory-port.ps1')
+    $pr = Resolve-BcfMemoryPort -Wanted $port -Container $ours -ConfigPath $mcfg.Path -ProjectRoot $project
+    if ($pr.Holder) {
+        $kind = if ($pr.HolderKind -eq 'container') { 'контейнером' } else { 'процессом' }
+        Write-BcfWarn "порт $port занят $kind '$($pr.Holder)' — это не наша база"
+        Write-BcfNote 'оставить как есть нельзя: клиент подключился бы к ЧУЖОЙ базе, получил отказ'
+        Write-BcfNote 'авторизации, и выглядело бы это как поломка нашей памяти.'
+    }
+    if ($pr.Error) {
+        Write-BcfFail "порт $port занят, заменить не вышло: $($pr.Error)"
+        Write-BcfNote "останови занявшего или впиши свободный port в $($mcfg.Path) и повтори."
         exit 2
+    }
+    if ($pr.Changed) {
+        $port = $pr.Port
+        Write-BcfOk "беру свободный порт $port — записан в $($pr.ConfigPath)"
+        Write-BcfNote 'проектный конфиг перекрывает фабричный: клиент памяти прочитает тот же порт.'
+        # Дальше всё считаем по НОВОМУ конфигу: имя контейнера, данные и адрес клиента
+        # должны сойтись, иначе мы починили порт и разошлись в остальном.
+        $mcfg = Get-BcfMemoryConfig -Project $project
+        $ours = $mcfg.Container
     }
 
     # Compose параметризован переменными окружения (см. docker-compose.yml). Передаём ему

@@ -416,12 +416,29 @@ function Get-DefaultRoles {
     if (-not $critic) { $critic = $frame }
     if ($names -contains 'codex' -and $critic -eq 'codex') { $critic = 'codex-ro' }
 
-    return [ordered]@{
+    $roles = [ordered]@{
         planner = @{ backend = $frame;  model = $(if ($TIERS[$frame]) { $TIERS[$frame].frame } else { '' }); tier = 'рамочный' }
         arbiter = @{ backend = $frame;  model = $(if ($TIERS[$frame]) { $TIERS[$frame].frame } else { '' }); tier = 'рамочный' }
         critic  = @{ backend = $critic; model = ''; tier = 'рамочный' }
         worker  = @{ backend = $exec;   model = $(if ($TIERS[$exec]) { $TIERS[$exec].exec } else { '' }); tier = 'исполнение' }
     }
+
+    # ЧЕГО НЕ ЗНАЕТ ЯРУС — СПРАШИВАЕМ У САМОГО БЭКЕНДА, А НЕ У ЧЕЛОВЕКА.
+    #
+    # Ярусы («рамочный»/«исполнение») заданы только для claude: у остальных CLI имя модели
+    # решает подписка, и выдумывать его нельзя. Но оно и не выдумывается — оно записано в
+    # настройках самого CLI. Пока мы туда не смотрели, init оставлял модель пустой и сам же
+    # объявлял это стопором прогона, а человек вписывал руками то, что лежало у него на
+    # диске.
+    foreach ($k in @($roles.Keys)) {
+        if ($roles[$k].model) { continue }
+        $d = Get-BcfBackendDefaultModel -Name $roles[$k].backend
+        if ($d.Model) {
+            $roles[$k].model = $d.Model
+            $roles[$k].modelSource = $d.Source
+        }
+    }
+    return $roles
 }
 
 function Show-Step5 {
@@ -446,6 +463,18 @@ function Show-Step5 {
         Write-Host ''
         Write-BcfNote 'рамочных решений мало и они дорогие; исполнения много и оно дешёвое. одна'
         Write-BcfNote 'модель на всё = планировочная цена за каждый токен исполнения.'
+
+        # ИСТОЧНИК КАЖДОЙ ПОДСТАВЛЕННОЙ МОДЕЛИ НАЗЫВАЕТСЯ ВСЛУХ. Модель, взятая из истории
+        # сессий, — догадка о намерении, а не настройка: человек обязан увидеть, что её
+        # выбрали за него, иначе он узнает об этом по счёту за прогон.
+        $found = @($keys | Where-Object { $Roles[$_].modelSource })
+        if ($found.Count) {
+            Write-Host ''
+            foreach ($k in $found) {
+                Write-BcfField $k "$($Roles[$k].model)   ← $($Roles[$k].modelSource)" 'проверено' 12
+            }
+            Write-BcfNote 'это НЕ спрашивалось: значения лежат в настройках самих CLI. заменить — enter на строке.'
+        }
 
         # ЗАПАСНАЯ — шаг необязательный, но цена отказа называется здесь, а не после того,
         # как волна встала ночью. Сразу говорим и то, на что запасная НЕ помогает: иначе

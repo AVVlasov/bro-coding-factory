@@ -10,11 +10,29 @@
 # Молча заменить их своими догадками значит сломать рабочую конфигурацию мастером,
 # который человек запустил «просто посмотреть».
 
+# СУЩЕСТВОВАЛ ЛИ КОНФИГ ДО НАС — вопрос не бухгалтерский.
+#
+# `bcf install` создаёт config/harness.json из шаблона, и шаблон приходит НЕ пустым:
+# agent.command, productPaths и прочее в нём уже заполнены. Правило «не переписываем
+# заполненное» сравнивало значения с пустотой — и на ПЕРВОЙ же инициализации объявляло
+# шаблонные значения выбором владельца: экран отчитывался «оставлено как было:
+# agent.command, productPaths» о файле, которого пять секунд назад не существовало.
+# Соврать так — хуже, чем упасть: человек читает это как «мои настройки не тронуты» и не
+# идёт проверять то, что на самом деле осталось шаблоном.
+$cfgPath = Join-Path $root 'config\harness.json'
+$cfgExisted = Test-Path $cfgPath
+
 if ($dry) {
     Write-Host ('  ' + (Ink 'БЫЛО БЫ ЗАПИСАНО' 'White'))
     $out = & pwsh -NoProfile -File (Join-Path $BcfRoot 'bin\bcf.ps1') install --dry --project $root 2>&1 | Out-String
-    foreach ($line in ($out -split "`r?`n")) { if ($line -match '^\s+A\s+') { Write-BcfLine $line 'Green' } }
-    Write-BcfLine '    M  config/harness.json' 'Cyan'
+    foreach ($line in ($out -split "`r?`n")) {
+        if ($line -match '^\s+A\s+') {
+            if ($line -match 'harness\.json') { continue }   # о нём отчитываемся строкой ниже
+            Write-BcfLine $line 'Green'
+        }
+    }
+    if ($cfgExisted) { Write-BcfLine '    M  config/harness.json' 'Cyan' }
+    else             { Write-BcfLine '    A  config/harness.json' 'Green' }
     return
 }
 
@@ -23,7 +41,6 @@ if ($dry) {
 $installOut = & pwsh -NoProfile -File (Join-Path $BcfRoot 'bin\bcf.ps1') install --project $root 2>&1 | Out-String
 
 # 2. Конфиг: дописываем выясненное разбором и опросом.
-$cfgPath = Join-Path $root 'config\harness.json'
 $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
 
 # Конфиг проекта бывает СТАРШЕ фабрики: в нём может не быть секций, появившихся позже.
@@ -54,7 +71,9 @@ _EnsureKey $gr 'roles'    ([pscustomobject]@{})
 function _SetIfEmpty([string]$Name, $Current, [scriptblock]$Apply) {
     $isEmpty = ($null -eq $Current) -or ($Current -is [string] -and -not $Current) -or
                ($Current -is [array] -and -not @($Current).Count)
-    if ($isEmpty -or $reconfigure) { & $Apply; return }
+    # Файла до нас не было — значит всё в нём написали мы сами полминуты назад из шаблона.
+    # Беречь такие значения не от кого, а называть их «заполненными» — врать.
+    if ($isEmpty -or $reconfigure -or -not $cfgExisted) { & $Apply; return }
     $script:kept += $Name
 }
 
@@ -73,7 +92,7 @@ foreach ($bk in $surveyed.Keys) {
 
 foreach ($k in $roles.Keys) {
     $cur = $cfg.graph.roles.PSObject.Properties[$k]
-    if ($cur -and $cur.Value.backend -and -not $reconfigure) { $kept += "graph.roles.$k"; continue }
+    if ($cur -and $cur.Value.backend -and -not $reconfigure -and $cfgExisted) { $kept += "graph.roles.$k"; continue }
     $entry = [ordered]@{ backend = $roles[$k].backend; model = $roles[$k].model }
     # Пишем ОБЪЕКТОМ: движок читает fallback.backend/fallback.model. Строка тоже
     # понимается (человек пишет её руками), но своё мы пишем в полной форме — чтобы в
@@ -105,7 +124,10 @@ if ($criticModel) {
 }
 
 ($cfg | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgPath -Encoding UTF8
-$writtenFiles += 'config/harness.json'
+# МЕТКА — ПО ФАКТУ, А НЕ ПО ПРИВЫЧКЕ. Раньше всё записанное этим шагом печаталось как «M»,
+# и созданные файлы отчитывались изменёнными: config/harness.json попадал в отчёт дважды —
+# «A» от install и «M» от нас, — а tasks/index.md выглядел правкой того, чего не было.
+$writtenFiles += @{ path = 'config/harness.json'; action = $(if ($cfgExisted) { 'M' } else { 'A' }) }
 
 # 3. Каркас бэклога.
 $tasksDir = Join-Path $root 'tasks'
@@ -123,7 +145,7 @@ if (-not (Test-Path $indexPath)) {
 |----|-----|-----------------|------|
 |    |     |                 |      |
 "@
-    $writtenFiles += 'tasks/index.md'
+    $writtenFiles += @{ path = 'tasks/index.md'; action = 'A' }
 }
 $existingTasks = @(Get-ChildItem $tasksDir -Filter "$prefix-*.md" -File -ErrorAction SilentlyContinue)
 $samplePath = Join-Path $tasksDir "$prefix-01-example.md"
@@ -131,7 +153,7 @@ if (-not $existingTasks.Count -and -not (Test-Path $samplePath)) {
     $tpl = Get-Content -Raw -LiteralPath (Join-Path $templates 'project\task.md')
     $tpl = $tpl -replace '\{\{TASK_ID\}\}', "$prefix-01" -replace '\{\{TASK_TITLE\}\}', 'первая задача (шаблон — переписать)'
     Set-Content -LiteralPath $samplePath -Value $tpl -Encoding UTF8
-    $writtenFiles += "tasks/$prefix-01-example.md"
+    $writtenFiles += @{ path = "tasks/$prefix-01-example.md"; action = 'A' }
 }
 
 # 4. Карточка проекта.
@@ -148,9 +170,16 @@ Save-BcfProjectCard -Project $root -Card $card
 Write-Host ('  ' + (Ink 'ЗАПИСАНО НА ДИСК' 'White'))
 Write-Host ''
 foreach ($line in ($installOut -split "`r?`n")) {
-    if ($line -match '^\s+A\s+') { Write-BcfLine $line 'Green' }
+    if ($line -match '^\s+A\s+') {
+        if ($line -match 'harness\.json') { continue }   # его метку ставим мы: install только создал файл, значения дописали здесь
+        Write-BcfLine $line 'Green'
+    }
 }
-foreach ($w in $writtenFiles) { Write-BcfLine "    M  $w" 'Cyan' }
+foreach ($w in $writtenFiles) {
+    $act = if ($w -is [string]) { 'M' } else { [string]$w.action }
+    $pth = if ($w -is [string]) { $w } else { [string]$w.path }
+    Write-BcfLine "    $act  $pth" $(if ($act -eq 'A') { 'Green' } else { 'Cyan' })
+}
 Write-BcfLine '    A  .bcf/  (прогоны, заявки на файлы, журналы — в git не попадает)' 'Green'
 
 if ($kept.Count) {

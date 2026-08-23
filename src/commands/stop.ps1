@@ -17,6 +17,7 @@
 #             заявку. Это аварийный тормоз, а не «побыстрее».
 
 . (Join-Path $BcfRoot 'src\lib\journal.ps1')
+. (Join-Path $BcfRoot 'src\lib\tui.ps1')   # Test-BcfInteractive: спрашивать ли подтверждение
 
 $project = $script:BcfProject
 $now   = $script:BcfArgs -contains '--now'
@@ -120,6 +121,20 @@ foreach ($p in ($procs | Select-Object -First 10)) {
 
 if (-not (Get-BcfAssumeYes)) {
     Write-Host ''
+    # ВОПРОС, КОТОРЫЙ НЕКОМУ УСЛЫШАТЬ, — НЕ ОТКАЗ ЧЕЛОВЕКА.
+    #
+    # Из скрипта, планировщика или чужого агента подтверждения не будет никогда: запрос
+    # уходит в никуда и команда печатает «отменено», как будто владелец передумал.
+    # Снаружи это выглядит как сработавшая остановка — а прогон продолжает писать в
+    # дерево. Аварийная команда обязана называть НАСТОЯЩУЮ причину бездействия и то,
+    # чем её обойти; авто-подтверждать снятие процессов за человека она не вправе.
+    if (-not (Test-BcfInteractive)) {
+        Write-BcfFail 'подтвердить снятие некому: команда запущена не из терминала'
+        Write-BcfNote 'ничего не снято, прогон продолжает работать.'
+        Write-BcfNote 'из скрипта: bcf stop --now --yes   ·   мягко, между задачами: bcf stop'
+        Write-Host ''
+        exit 130
+    }
     if (-not (Read-BcfConfirm "снять $($procs.Count) процессов?" $false)) {
         Write-BcfDim 'отменено — ничего не снято'
         Write-Host ''

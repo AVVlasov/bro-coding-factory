@@ -27,30 +27,53 @@ function Get-BcfConsoleWidth {
 # Один кадр = список строк. Перерисовка возвращает курсор на начало кадра и переписывает
 # строки, добивая пробелами до ширины: без добивки от прошлого кадра остаются хвосты,
 # и экран выглядит как мусор поверх мусора.
+#
+# ВОЗВРАТ — ОТНОСИТЕЛЬНЫЙ, А НЕ ПО ЗАПОМНЕННОЙ КООРДИНАТЕ.
+#
+# Раньше начало кадра запоминалось абсолютной позицией курсора при создании. Это работает
+# ровно до первой прокрутки: когда кадр рисуется у нижнего края окна, вывод его последних
+# строк сдвигает буфер вверх, и запомненный Y перестаёт указывать на начало кадра. Курсор
+# встаёт ниже, чем нужно, кадр дорисовывается вместо перерисовки — экран задваивается и
+# уползает вниз. Именно так карточка запуска выглядела при выборе стрелками.
+#
+# Прокрутке нельзя противостоять запоминанием: единственная надёжная точка отсчёта — текущее
+# положение курсора, которое после отрисовки всегда стоит ровно под кадром. Поэтому храним
+# не координату, а ВЫСОТУ прошлого кадра и поднимаемся на неё.
 function New-BcfFrame {
-    $pos = $null
-    try { $pos = $Host.UI.RawUI.CursorPosition } catch { }
-    return [pscustomobject]@{ Start = $pos; Lines = 0 }
+    return [pscustomobject]@{ Lines = 0 }
 }
 
 function Write-BcfFrame {
     param([Parameter(Mandatory)]$Frame, [Parameter(Mandatory)][object[]]$Lines)
 
     $w = Get-BcfConsoleWidth
-    if ($Frame.Start) {
-        try { $Host.UI.RawUI.CursorPosition = $Frame.Start } catch { }
+
+    if ($Frame.Lines -gt 0) {
+        try {
+            $top = [Console]::CursorTop - $Frame.Lines
+            # Кадр выше верха буфера бывает, если окно уменьшили между кадрами: рисуем от
+            # нуля. Это разъедется один раз, а не будет копиться, как при старом способе.
+            if ($top -lt 0) { $top = 0 }
+            [Console]::SetCursorPosition(0, $top)
+        } catch { }
     }
+
+    $emitted = 0
     foreach ($l in $Lines) {
         $text = if ($l -is [string]) { $l } else { [string]$l.t }
         $color = if ($l -is [string]) { '' } else { [string]$l.c }
         if ($text.Length -gt ($w - 1)) { $text = $text.Substring(0, $w - 2) + '…' }
         $padded = $text.PadRight([math]::Max(0, $w - 1))
         if ($color) { Write-Host $padded -ForegroundColor $color } else { Write-Host $padded }
+        $emitted++
     }
     # Кадр может стать короче предыдущего — хвост надо затереть, иначе на экране
     # останутся строки, которых уже нет в состоянии.
-    for ($i = $Lines.Count; $i -lt $Frame.Lines; $i++) { Write-Host (' ' * ($w - 1)) }
-    $Frame.Lines = [math]::Max($Lines.Count, $Frame.Lines)
+    for ($i = $Lines.Count; $i -lt $Frame.Lines; $i++) { Write-Host (' ' * ($w - 1)); $emitted++ }
+
+    # Высота — это СКОЛЬКО СТРОК ВЫВЕДЕНО, включая затирающие: ровно на столько курсор
+    # ушёл вниз от начала кадра, и ровно на столько надо подняться в следующий раз.
+    $Frame.Lines = $emitted
 }
 
 function Read-BcfKey {

@@ -120,6 +120,105 @@ $script:BcfBackends = [ordered]@{
 
 function Get-BcfKnownBackends { return $script:BcfBackends }
 
+# --- КАКОЙ МОДЕЛЬЮ ЭТОТ CLI РАБОТАЕТ УЖЕ СЕЙЧАС -----------------------------------------
+#
+# Мастер оставлял graph.roles.<роль>.model пустым и тут же объявлял это стопором: «узел без
+# модели падает на старте». То есть init сам создавал себе блокирующую проблему и
+# спрашивал человека о том, что лежит у него на диске: у codex выбранная модель записана в
+# ~/.codex/config.toml, у opencode — в конфиге либо в истории его собственных сессий.
+#
+# Спрашивать очевидное — не вежливость, а перекладывание работы. Поэтому: сначала смотрим
+# сами, спрашиваем только то, чего не нашли, и ВСЕГДА называем источник — из настройки,
+# из окружения или из истории. Источник важен: «взяли из истории» человек может отменить
+# осознанно, а «взяли неизвестно откуда» он вынужден перепроверять целиком.
+
+function _BcfCodexConfiguredModel {
+    $cfg = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex\config.toml'
+    if (-not (Test-Path $cfg)) { return '' }
+    try {
+        foreach ($line in (Get-Content -LiteralPath $cfg -ErrorAction Stop)) {
+            # Только верхний уровень: `model = "..."` внутри [profiles.*] относится к
+            # профилю, а не к тому, чем codex поедет без флагов.
+            if ($line -match '^\s*\[') { break }
+            if ($line -match '^\s*model\s*=\s*"([^"]+)"') { return $Matches[1] }
+        }
+    } catch { }
+    return ''
+}
+
+function _BcfOpencodeConfiguredModel {
+    foreach ($p in @(
+        (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config\opencode\opencode.jsonc'),
+        (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config\opencode\opencode.json'),
+        (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.opencode.json')
+    )) {
+        if (-not (Test-Path $p)) { continue }
+        try {
+            $raw = Get-Content -Raw -LiteralPath $p
+            $raw = [regex]::Replace($raw, '(?m)^\s*//.*$', '')   # jsonc: строчные комментарии
+            $j = $raw | ConvertFrom-Json
+            if ($j.model) { return [string]$j.model }
+        } catch { }
+    }
+    return ''
+}
+
+# Последняя модель, которой человек РЕАЛЬНО работал в opencode. Лежит в его sqlite-базе
+# сессий; читаем строго на чтение и только если есть python — своей зависимости ради
+# одной подсказки заводить не станем.
+function _BcfOpencodeLastUsedModel {
+    $db = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.local\share\opencode\opencode.db'
+    if (-not (Test-Path $db)) { return '' }
+    if (-not (Get-Command python -ErrorAction SilentlyContinue)) { return '' }
+    $py = @'
+import json, sqlite3, sys, collections
+db = sys.argv[1]
+for uri in ("file:%s?mode=ro" % db.replace("?", "%3f"), "file:%s?mode=ro&immutable=1" % db.replace("?", "%3f")):
+    try:
+        c = sqlite3.connect(uri, uri=True, timeout=2)
+        seen = collections.Counter()
+        for (d,) in c.execute("select data from message order by rowid desc limit 60"):
+            try: j = json.loads(d)
+            except Exception: continue
+            p, m = j.get("providerID"), j.get("modelID")
+            if p and m: seen["%s/%s" % (p, m)] += 1
+        if seen:
+            print(seen.most_common(1)[0][0])
+        break
+    except Exception:
+        continue
+'@
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("bcf-oc-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.py')
+    try {
+        Set-Content -LiteralPath $tmp -Value $py -Encoding UTF8
+        $out = (& python $tmp $db 2>$null | Out-String).Trim()
+        if ($out -match '^[\w.\-]+/[\w.\-]+$') { return $out }
+    } catch { } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    return ''
+}
+
+function Get-BcfBackendDefaultModel {
+    param([Parameter(Mandatory)][string]$Name)
+
+    $b = $script:BcfBackends[$Name]
+    $key = if ($b -and $b.aliasOf) { $b.aliasOf } else { $Name }
+
+    switch ($key) {
+        'codex' {
+            $m = _BcfCodexConfiguredModel
+            if ($m) { return [pscustomobject]@{ Model = $m; Source = 'настройка codex' } }
+        }
+        'opencode' {
+            if ($env:OPENCODE_MODEL) { return [pscustomobject]@{ Model = $env:OPENCODE_MODEL; Source = 'окружение' } }
+            $m = _BcfOpencodeConfiguredModel
+            if ($m) { return [pscustomobject]@{ Model = $m; Source = 'настройка opencode' } }
+            $m = _BcfOpencodeLastUsedModel
+            if ($m) { return [pscustomobject]@{ Model = $m; Source = 'история opencode' } }
+        }
+    }
+    return [pscustomobject]@{ Model = ''; Source = '' }
+}
+
 function Resolve-BcfBackendBinary {
     param([Parameter(Mandatory)][string]$Name)
 

@@ -31,11 +31,17 @@ if ($asJson) {
 }
 
 $closed  = @($items | Where-Object { $_.Pass })
-$ready   = @($items | Where-Object { $_.Ready })
-$waiting = @($items | Where-Object { -not $_.Pass -and -not $_.Ready })
+# «Готова» — обещание, что задача поедет. Без объявленных файлов она не поедет: граф не
+# допускает её в волну. Поэтому такие задачи вынесены в отдельное состояние, а не покрашены
+# зелёным вместе с остальными.
+$ready     = @($items | Where-Object { $_.Runnable })
+$noFiles   = @($items | Where-Object { $_.Ready -and -not $_.Admitted })
+$waiting   = @($items | Where-Object { -not $_.Pass -and -not $_.Ready })
 
 Write-BcfTitle "БЭКЛОГ  $(Split-Path $project -Leaf)" `
-               "всего $($items.Count) · закрыто $($closed.Count) · готово к работе $($ready.Count) · ждёт $($waiting.Count)"
+               ("всего $($items.Count) · закрыто $($closed.Count) · готово к работе $($ready.Count)" +
+                $(if ($noFiles.Count) { " · не допущено $($noFiles.Count)" } else { '' }) +
+                " · ждёт $($waiting.Count)")
 
 if (-not $items.Count) {
     Write-BcfDim "задач нет: нарежь их в tasks/ по шаблону $prefix-01-example.md или командой /feature в кодовом агенте"
@@ -57,6 +63,9 @@ function _cells($t, $state) {
 $rows = New-BcfRows
 $colors = @()
 foreach ($t in $ready)   { Add-BcfRow $rows (_cells $t 'готова');  $colors += 'Green' }
+# Метка держится в ширине колонки (18): длиннее — и таблица разъезжается, а причина всё
+# равно печатается ниже отдельным предупреждением со списком id.
+foreach ($t in $noFiles) { Add-BcfRow $rows (_cells $t 'НЕ ДОПУЩЕНА'); $colors += 'Yellow' }
 foreach ($t in $waiting) { Add-BcfRow $rows (_cells $t "ждёт $($t.Preds -join ',')"); $colors += 'DarkGray' }
 foreach ($t in $closed)  { Add-BcfRow $rows (_cells $t 'PASS');    $colors += 'DarkCyan' }
 

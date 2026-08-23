@@ -11,6 +11,13 @@
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
+# Выключатели цвета снимаем на весь прогон: цвет и маскот здесь ПРЕДМЕТ проверки, а
+# NO_COLOR стоит по умолчанию в агентских и CI-окружениях. Суита, красная в зависимости от
+# того, из какой оболочки её запустили, перестаёт быть сигналом — её начинают игнорировать.
+# Тест самого выключателя ставит переменную сам и возвращает как было.
+$env:NO_COLOR = ''
+$env:BCF_NO_COLOR = ''
+
 $root = Split-Path $PSScriptRoot -Parent
 $bcf = Join-Path $root 'bin\bcf.ps1'
 $sandboxRoot = Join-Path ([IO.Path]::GetTempPath()) ("bcf-tests-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -44,7 +51,20 @@ function Assert-NoMatch {
 }
 
 function Bcf {
-    param([string[]]$CliArgs)
+    param([string[]]$CliArgs, [switch]$Ansi)
+
+    # ЦВЕТ ПРОВЕРЯЕТСЯ ТОЛЬКО С -Ansi, И ЭТО НЕ КАПРИЗ ТЕСТА.
+    #
+    # PowerShell 7 при перенаправлении вывода вырезает управляющие последовательности сам
+    # ($PSStyle.OutputRendering = PlainText). Тестовая обвязка ВСЕГДА перенаправляет —
+    # значит проверка «в выводе есть ANSI» без этого ключа проверяла бы не фабрику, а
+    # поведение оболочки, и была красной всегда. Просим потомка сохранить разметку.
+    if ($Ansi) {
+        $quoted = ($CliArgs | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' '
+        $cmd = "`$PSStyle.OutputRendering='Ansi'; & '$($bcf -replace "'", "''")' $quoted"
+        $out = & pwsh -NoProfile -Command $cmd 2>&1 | Out-String
+        return [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
+    }
     $all = @('-NoProfile', '-File', $bcf) + $CliArgs
     $out = & pwsh @all 2>&1 | Out-String
     return [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
@@ -295,7 +315,7 @@ It 'шаг 1 показывает маскот и недавние проект�
 
 It 'вывод несёт ANSI-цвет, а не только текст' {
     $p = New-Sandbox 'init-color'
-    $r = Bcf @('init', '--yes', '--project', $p)
+    $r = Bcf @('init', '--yes', '--project', $p) -Ansi
     Assert-Match $r.Out "`e\[" 'в выводе нет ни одной ANSI-последовательности'
 }
 
@@ -310,6 +330,394 @@ It 'BCF_NO_COLOR полностью выключает цвет' {
         Assert-NoMatch $r.Out "`e\[" 'при BCF_NO_COLOR в выводе остались ANSI-коды'
         Assert-Match $r.Out 'шаг 1 / 8' 'текст пропал вместе с цветом'
     } finally { $env:BCF_NO_COLOR = $old }
+}
+
+# --- Отчёт мастера не выдаёт шаблон за выбор владельца ----------------------------------
+#
+# `bcf install` создаёт config/harness.json из ЗАПОЛНЕННОГО шаблона, а init потом дописывает
+# в него разбор. Пока «уже заполнено» проверялось сравнением с пустотой, первая же
+# инициализация отчитывалась «ОСТАВЛЕНО КАК БЫЛО: agent.command, productPaths» — о файле,
+# которого до этой команды не существовало. Класс дефекта тот же, что и всюду здесь: отчёт,
+# который врёт, хуже отсутствующего, потому что человек по нему НЕ идёт проверять.
+
+It 'первая инициализация не выдаёт шаблонные значения за настройки владельца' {
+    $p = New-Sandbox 'init-fresh-report'
+    $r = Bcf @('init', '--yes', '--project', $p)
+    Assert-NoMatch $r.Out 'ОСТАВЛЕНО КАК БЫЛО' 'на пустом проекте беречь нечего'
+    Assert-Match   $r.Out 'A\s+config/harness\.json' 'созданный конфиг обязан быть помечен как A'
+    Assert-NoMatch $r.Out 'M\s+config/harness\.json' 'тот же файл не может быть и создан, и изменён'
+}
+
+It 'повторная инициализация бережёт заполненное и говорит об этом' {
+    $p = New-Sandbox 'init-second-report'
+    $null = Bcf @('init', '--yes', '--project', $p)
+    # Ставим значение, которого init угадать не может: подпись владельца на конфиге.
+    $cfgFile = Join-Path $p 'config\harness.json'
+    $c = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+    $c.graph.roles.worker.backend = 'my-own-cli'
+    ($c | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgFile -Encoding UTF8
+
+    $r = Bcf @('init', '--yes', '--project', $p)
+    Assert-Match $r.Out 'ОСТАВЛЕНО КАК БЫЛО' 'второй проход обязан сказать, что не тронул'
+    $after = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+    Assert-True ($after.graph.roles.worker.backend -eq 'my-own-cli') 'чужой бэкенд перезаписан мастером'
+    Assert-Match $r.Out 'M\s+config/harness\.json' 'существовавший конфиг обязан быть помечен как M'
+}
+
+# --- Модель роли берётся из настроек самого CLI -----------------------------------------
+#
+# init оставлял model пустым и сам же объявлял это стопором прогона, отправляя человека
+# вписывать руками то, что записано в настройках его же CLI. Проверяем инвариант, который
+# не зависит от машины: read-only-псевдоним обязан отвечать тем же, что и его оригинал —
+# иначе критик поедет на модели, которой у codex нет.
+
+It 'песочный псевдоним бэкенда знает ту же модель, что и оригинал' {
+    . (Join-Path $root 'src\lib\backends.ps1')
+    $a = Get-BcfBackendDefaultModel -Name 'codex'
+    $b = Get-BcfBackendDefaultModel -Name 'codex-ro'
+    Assert-True ($a.Model -eq $b.Model) "codex='$($a.Model)', codex-ro='$($b.Model)' — псевдоним разошёлся с оригиналом"
+    $c = Get-BcfBackendDefaultModel -Name 'нет-такого-cli'
+    Assert-True ($c.Model -eq '') 'неизвестный бэкенд обязан отвечать пустотой, а не выдумкой'
+}
+
+# --- Занятый порт памяти ----------------------------------------------------------------
+#
+# Порт 5433 записан дефолтом во все установки фабрики, поэтому вторая установка на машине
+# садится на чужой контейнер. Compose падает на «port is already allocated», а мостик
+# советовал «повтори вручную» — совет, который заведомо не работает. Проверяем то, чем это
+# заменено: занявший НАЗЫВАЕТСЯ, свободный порт ПОДБИРАЕТСЯ, исправление ложится в конфиг
+# ПРОЕКТА, а не фабрики.
+
+It 'занятый порт виден, а свободный подбирается' {
+    . (Join-Path $root 'harness\lib\docker.ps1')
+
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $busy = ([System.Net.IPEndPoint]$listener.Server.LocalEndPoint).Port
+    try {
+        Assert-True (-not (Test-BcfPortFree -Port $busy)) "порт $busy занят слушателем, а проверка считает его свободным"
+        $free = Find-BcfFreePort -From $busy
+        Assert-True ($free -ne 0) 'свободного порта не нашлось вовсе'
+        Assert-True ($free -ne $busy) 'подбор вернул занятый порт'
+        Assert-True (Test-BcfPortFree -Port $free) "подобранный порт $free на самом деле занят"
+    } finally { try { $listener.Stop() } catch { } }
+}
+
+It 'порт памяти чинится в конфиге проекта, а не фабрики' {
+    . (Join-Path $root 'harness\lib\docker.ps1')
+    . (Join-Path $root 'harness\lib\memory-port.ps1')
+
+    $p = New-Sandbox 'memory-port'
+    $factoryCfg = Join-Path $p 'factory-memory.config.json'
+    Set-Content -LiteralPath $factoryCfg -Encoding UTF8 -Value (@{
+        host = 'localhost'; port = 5433; database = 'bcf_agent_memory'; user = 'bcf'
+        embedding_dim = 1024; embedding_model = 'text-embedding-bge-m3'
+    } | ConvertTo-Json)
+
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $busy = ([System.Net.IPEndPoint]$listener.Server.LocalEndPoint).Port
+    try {
+        $r = Resolve-BcfMemoryPort -Wanted $busy -Container 'bcf-agent-memory' -ConfigPath $factoryCfg -ProjectRoot $p
+        Assert-True ($r.Changed) 'занятый порт остался прежним'
+        Assert-True (-not $r.Error) "подбор отказал: $($r.Error)"
+        Assert-True ($r.Port -ne $busy) 'подставлен тот же занятый порт'
+
+        $projCfg = Join-Path $p 'config\memory.config.json'
+        Assert-True (Test-Path $projCfg) 'исправление не записано в конфиг проекта'
+        $j = Get-Content -Raw -LiteralPath $projCfg | ConvertFrom-Json
+        Assert-True ([int]$j.port -eq $r.Port) 'в конфиге проекта не тот порт, что вернула функция'
+        # Остальные ключи обязаны доехать: иначе починили порт и потеряли модель эмбеддингов.
+        Assert-True ($j.embedding_dim -eq 1024) 'конфиг проекта потерял размерность эмбеддингов'
+        # Фабричный образец не трогаем: он общий для всех проектов машины.
+        $f = Get-Content -Raw -LiteralPath $factoryCfg | ConvertFrom-Json
+        Assert-True ([int]$f.port -eq 5433) 'фабричный конфиг переписан — сломано всем остальным проектам'
+    } finally { try { $listener.Stop() } catch { } }
+}
+
+It 'свободный порт не переписывает конфиги' {
+    . (Join-Path $root 'harness\lib\docker.ps1')
+    . (Join-Path $root 'harness\lib\memory-port.ps1')
+
+    $p = New-Sandbox 'memory-port-free'
+    $free = Find-BcfFreePort -From 5600
+    $r = Resolve-BcfMemoryPort -Wanted $free -Container 'bcf-agent-memory' -ConfigPath '' -ProjectRoot $p
+    Assert-True (-not $r.Changed) 'порт был свободен, а функция всё равно его сменила'
+    Assert-True ($r.Port -eq $free) 'свободный порт подменён'
+    Assert-True (-not (Test-Path (Join-Path $p 'config\memory.config.json'))) 'конфиг создан там, где чинить было нечего'
+}
+
+# --- Пустая память ≠ сломанная запись ---------------------------------------------------
+#
+# «Уроков почти нет: чтение работает, ЗАПИСЬ — нет» печаталось безусловно и в трёх местах
+# сразу (граф, doctor, memory status). На свежей базе это неправда — писать было нечему.
+# Диагноз без основания обесценивает ровно тот текст, ради которого написан: когда запись
+# отвалится по-настоящему, строку прочитают как жёлтый фон, который тут всегда.
+
+It 'пустая база памяти не объявляется сломанной записью' {
+    . (Join-Path $root 'harness\lib\graph-memory.ps1')
+    $p = New-Sandbox 'memory-verdict'
+
+    $v = Get-BcfLearningVerdict -Lessons 0 -Project $p
+    Assert-True ($v.Level -eq 'empty') "прогонов не было, а вердикт '$($v.Level)'"
+    Assert-NoMatch $v.Text 'ЗАПИСЬ' 'о сломанной записи сказано там, где не было ни одного прогона'
+
+    # Появился прогон с журналом — и та же пустая база становится настоящим диагнозом.
+    $runDir = Join-Path $p '.bcf\graph\g_test'
+    New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $runDir 'journal.jsonl') -Value '{"event":"run-start"}' -Encoding UTF8
+    $v2 = Get-BcfLearningVerdict -Lessons 0 -Project $p
+    Assert-True ($v2.Level -eq 'broken') "после прогона пустая база обязана быть диагнозом, получено '$($v2.Level)'"
+    Assert-Match $v2.Text 'ЗАПИСЬ'
+
+    $v3 = Get-BcfLearningVerdict -Lessons 7 -Project $p
+    Assert-True ($v3.Level -eq 'ok') "уроки есть, а вердикт '$($v3.Level)'"
+}
+
+# Проба окружения — не прогон. Пока это не различалось, пять запусков `bcf doctor` подряд
+# давали «прогонов было 5, а уроков 0 — запись не работает» на базе, в которую ни один узел
+# не писал: проверка окружения сама себе фабриковала диагноз.
+It 'проба doctor не считается прогоном в вердикте об обучении' {
+    . (Join-Path $root 'harness\lib\graph-memory.ps1')
+    $p = New-Sandbox 'memory-verdict-doctor'
+
+    foreach ($n in @('g_doc1', 'g_doc2')) {
+        $d = Join-Path $p ".bcf\graph\$n"
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'journal.jsonl') -Encoding UTF8 `
+            -Value '{"event":"run-start","name":"doctor","doctor":true}'
+    }
+    $v = Get-BcfLearningVerdict -Lessons 0 -Project $p
+    Assert-True ($v.Level -eq 'empty') "пробы doctor сосчитаны прогонами: вердикт '$($v.Level)', прогонов $($v.Runs)"
+    Assert-True ($v.Runs -eq 0) "прогонов насчитано $($v.Runs), а был только doctor"
+}
+
+# --- Расщеплённый прогон: цикл и верификация обязаны работать в ОДНОМ дереве ------------
+#
+# Цена этого дефекта измерена: 2026-08-06, прогон g_20260806-132023. Цикл работал в
+# worktree задачи, а verify.ps1 звался без корня — и брал его из $env:BCF_PROJECT_ROOT,
+# который указывает на ОСНОВНОЙ проект. Итог: проверки исполнились на дереве без работы
+# агента (и потому были красными), вердикт лёг в основное дерево, цикл искал его у себя,
+# не находил и рапортовал агенту «verify не дал вердикта» — то есть требовал от него
+# починить дефект обвязки. Агент сделал задачу правильно, задача умерла по loop-detection,
+# следом каскадом не поехали остальные восемь.
+#
+# Проверка статическая: вызов verify.ps1 в цикле обязан нести -ProjectRoot. Живьём это
+# ловится только сорокаминутным прогоном, то есть на практике не ловится.
+
+It 'цикл зовёт верификацию с явным корнем проекта' {
+    $loop = Get-Content -Raw (Join-Path $root 'harness\loop.ps1')
+
+    $m = [regex]::Match($loop, '(?s)\$vArgs\s*=\s*@\((.*?)\)')
+    Assert-True $m.Success 'не нашёл сборку аргументов verify.ps1 в loop.ps1'
+    Assert-Match $m.Groups[1].Value '-ProjectRoot' 'verify.ps1 зовётся без -ProjectRoot: верификация уйдёт в дерево из окружения'
+
+    # Окружение подменяется тоже: тестеры и судья — отдельные процессы, они читают корень
+    # из него, а не из нашего параметра.
+    Assert-Match $loop '\$env:BCF_PROJECT_ROOT\s*=\s*\$root' 'перед verify не выставляется BCF_PROJECT_ROOT на корень цикла'
+}
+
+# --- Вердикт переживает worktree ---------------------------------------------------------
+#
+# Вердикт пишется в дерево задачи (только там проверки честные), а каталог вердиктов лежит
+# в .gitignore — слиянием он не переносится и умирает вместе с worktree. По нему же
+# считается готовность СЛЕДУЮЩЕЙ волны и состояние бэклога. Прогон g_20260806-141305:
+# TASK-01 слита за семь минут, восемь задач так и остались «ждёт», отчёт назвал это
+# «не закрыто» — работа сделана, а бухгалтерия её не увидела.
+
+It 'граф переносит вердикт задачи в основное дерево до удаления worktree' {
+    $g = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+
+    Assert-Match $g 'Copy-Item[^\r\n]*\$vf' 'вердикт из worktree не копируется в основное дерево'
+
+    # Копия снимается ПОСЛЕ чтения вердикта и ДО удаления рабочего дерева, иначе копировать
+    # будет нечего. Считаем от места чтения — Remove-TaskWorktree встречается и раньше.
+    $iRead = $g.IndexOf('$vf = Join-Path $wt')
+    Assert-True ($iRead -ge 0) 'не нашёл чтение вердикта из worktree'
+    $tail = $g.Substring($iRead)
+    $iCopy = [regex]::Match($tail, 'Copy-Item[^\r\n]*\$vf').Index
+    $iDrop = [regex]::Match($tail, 'Remove-TaskWorktree').Index
+    Assert-True ($iCopy -gt 0 -and $iCopy -lt $iDrop) 'копия вердикта снимается после удаления worktree — копировать будет нечего'
+
+    # ЗАКРЫТИЕ — ЭТО «СЛИТО», А НЕ «В СВОЕЙ ВЕТКЕ ЗЕЛЕНО».
+    #
+    # Пока PASS переносился до интеграции, задача с провалившимся слиянием объявлялась
+    # закрытой: 2026-08-06 TASK-02 и TASK-03 получили PASS в основном дереве, код туда не
+    # попал, и следующая волна честно взялась строить TASK-04 поверх несуществующих стабов.
+    Assert-Match $tail '(?s)-not \$isPass.*?Copy-Item[^\r\n]*\$vf' `
+        'вердикт до слияния копируется без проверки исхода — PASS закроет несведённую задачу'
+    Assert-Match $tail '(?s)\$outcome\.Ok -and \(Test-Path \$vf\).*?Copy-Item[^\r\n]*\$vf' `
+        'после удачного слияния PASS-вердикт не переносится — следующая волна не увидит закрытую задачу'
+}
+
+# --- Гейт, который нечем выполнить -------------------------------------------------------
+#
+# Проверка без инструмента — не строгий гейт, а красный свет по причине, не связанной с
+# работой. npm вдобавок маскирует причину: на отсутствующий локальный бинарь он подставляет
+# одноимённый пакет из реестра, и `npx tsc` отвечает «This is not the tsc command you are
+# looking for» — в логе это выглядит поломкой компилятора. 2026-08-06 незаявленный
+# typescript уронил слияние двух готовых задач волны.
+
+It 'doctor называет проверку, для которой нет инструмента' {
+    $p = New-Sandbox 'doctor-missing-bin'
+    Bcf @('install', '--project', $p) | Out-Null
+
+    $cfgFile = Join-Path $p 'config\harness.json'
+    $c = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+    $c.backpressure.typecheck = @('npx --no-install tsc --noEmit')
+    ($c | ConvertTo-Json -Depth 12) | Set-Content -LiteralPath $cfgFile -Encoding UTF8
+
+    $r = Bcf @('doctor', '--no-probe', '--project', $p)
+    Assert-Match $r.Out 'гейт нечем выполнить' 'отсутствующий инструмент проверки не назван'
+    Assert-Match $r.Out 'tsc' 'не назван сам инструмент'
+
+    # А когда бинарь на месте — молчим: ложная тревога на каждом прогоне обесценивает строку.
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'node_modules\.bin') | Out-Null
+    Set-Content -LiteralPath (Join-Path $p 'node_modules\.bin\tsc.cmd') -Value 'echo tsc' -Encoding UTF8
+    $r2 = Bcf @('doctor', '--no-probe', '--project', $p)
+    Assert-NoMatch $r2.Out 'гейт нечем выполнить' 'инструмент на месте, а doctor всё равно жалуется'
+}
+
+# --- Закрытые задачи не тянут за собой планировщика ---------------------------------------
+#
+# Планировщик — рамочная роль на дорогой модели, и зовут его ТОЛЬКО при коллизии владения.
+# Пока в анализ попадали закрытые задачи, каждый повторный прогон по бэклогу с
+# исправлениями звал его ради «разведения» новой задачи с той, что закрыта и не поедет:
+# 2026-08-06 «строго последовательно: TASK-06 → TASK-11» — сериализация, не меняющая ничего.
+
+It 'коллизии владения считаются без закрытых задач' {
+    $g = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+
+    $m = [regex]::Match($g, '(?s)\$owner = @\{\}.*?\$undeclared = @\([^\r\n]*')
+    Assert-True $m.Success 'не нашёл расчёт коллизий владения в графе очереди'
+    Assert-Match $m.Value 'if \(\$t\.Pass\) \{ continue \}' 'закрытые задачи участвуют в анализе коллизий'
+    Assert-Match $m.Value '-not \$_\.Pass -and -not \$_\.Files\.Count' 'закрытая задача без объявленных файлов тянет ревизию плана'
+}
+
+# --- Находки приёмки входят в вердикт прогона ---------------------------------------------
+#
+# Гейты задач детерминированы и ловят своё; критики ловят то, чего гейт не видит. Пока их
+# работа не входила в итог, прогон g_20260806-195014 напечатал «итог: ок» и вернул ноль,
+# имея восемь семантических конфликтов, четыре из них P1 — включая «оператор может
+# записать пациента в отсутствие врача». Человек читает последнюю строку и уходит с ней.
+
+It 'прогон с находками приёмки не называется «ок»' {
+    $g = Get-Content -Raw (Join-Path $root 'harness\graph.ps1')
+    Assert-Match $g "has 'findings'\) -and \[int\]" 'итог не смотрит на находки приёмки'
+    Assert-Match $g "ЗАМЕЧАНИЯ" 'нет отдельного вердикта для «задачи закрыты, но приёмка нашла»'
+
+    $q = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+    Assert-Match $q 'Schema \$criticSchema' 'критик отвечает свободным текстом — находки нечем сосчитать'
+    Assert-Match $q 'findings = \$findAll\.Count' 'граф не возвращает число находок наверх'
+    Assert-Match $q "severity -eq 'P1'" 'находки не разделены по тяжести — вердикт не отличит опечатку от потери данных'
+}
+
+# --- Вопрос, который некому услышать, не задаётся ------------------------------------------
+#
+# graph.ps1 спрашивает подтверждение перед роем агентов — это правильно и стоит дёшево
+# ровно один раз. Но CLI добавлял `-Yes` только в интерактивном запуске, и запуск из
+# скрипта упирался в Read-Host на stdin, которого никто не видит: 2026-08-07 прогон
+# простоял 2 ч 20 мин, не напечатав ни строки и не запустив ни одного агента. Молчаливое
+# ожидание неотличимо от работы — это худший вид отказа.
+
+It 'запуск графа не упирается в вопрос без адресата' {
+    $r = Get-Content -Raw (Join-Path $root 'src\commands\run.ps1')
+    Assert-NoMatch $r "if \(\$live -or \(Get-BcfAssumeYes\)\) \{ \$a \+= '-Yes' \}" `
+        'подтверждение пробрасывается только в интерактивном запуске'
+    Assert-Match $r "(?m)^\s*\`$a \+= '-Yes'" 'CLI не передаёт движку принятое решение'
+
+    # Движок обязан отказать, а не ждать, когда отвечать некому.
+    $g = Get-Content -Raw (Join-Path $root 'harness\graph.ps1')
+    Assert-Match $g 'IsInputRedirected -or \[Console\]::IsOutputRedirected' `
+        'движок задаёт вопрос, не проверив, есть ли кому отвечать'
+    $iCheck = $g.IndexOf('IsInputRedirected')
+    $iAsk   = $g.IndexOf('Read-Host "Запускать?')
+    Assert-True ($iCheck -gt 0 -and $iCheck -lt $iAsk) 'проверка стоит после вопроса — ждать всё равно будет'
+}
+
+# --- Задача, не сделавшая ничего, не может быть закрыта -----------------------------------
+#
+# Гейты проверяют СОСТОЯНИЕ ДЕРЕВА, а не работу задачи: на нетронутом дереве они зелены по
+# определению — они проходили и до неё. Прогон g_20260808-120927: четыре задачи подряд не
+# изменили ни строки, получили PASS «все гейты зелёные», слились вхолостую, их ветки
+# удалили как отработанные, а итог отчитался «PASS 19/19, ок». Дефекты P1, ради которых
+# задачи заводились, остались в коде и стали считаться закрытыми.
+
+It 'пустой diff задачи — провал, а не предупреждение' {
+    $v = Get-Content -Raw (Join-Path $root 'harness\verify.ps1')
+
+    Assert-Match $v '\$emptyDiff = \[string\]::IsNullOrWhiteSpace\(\$diffFull\)' `
+        'пустой diff не вычисляется как признак'
+    Assert-Match $v 'if \(\$emptyDiff\) \{ \$gateFailures \+=' `
+        'пустой diff не попадает в список проваленных гейтов'
+
+    # Проверка обязана стоять ДО остальных гейтов: они говорят о дереве, а не о работе.
+    $iEmpty  = $v.IndexOf('if ($emptyDiff) { $gateFailures +=')
+    $iChecks = $v.IndexOf('if ($checksFailed) { $gateFailures +=')
+    Assert-True ($iEmpty -gt 0 -and $iEmpty -lt $iChecks) 'гейт «работа была» стоит после проверок дерева'
+
+    # И это больше не «предупреждение»: слово меняет то, как строку читают.
+    Assert-NoMatch $v 'ПРЕДУПРЕЖДЕНИЕ: diff пуст' 'пустой diff всё ещё подаётся как предупреждение'
+}
+
+# --- Позвали человека — покажи, зачем ------------------------------------------------------
+#
+# Цикл встаёт на friction-триггере (зависимости, CI, авторизация, крупное удаление) и пишет
+# записку с причиной. Записка писалась в каталог САМОЙ ФАБРИКИ, а сообщение отправляло
+# человека в `.bcf/human-callout.md` проекта — файла по этому адресу не было. Плюс один файл
+# на всю фабрику затирался каждой следующей задачей любого проекта. 2026-08-08 две готовые
+# задачи встали, и причину пришлось восстанавливать из config/triggers.json вручную.
+
+It 'записка человеку пишется в проект и переживает worktree' {
+    $t = Get-Content -Raw (Join-Path $root 'harness\triggers.ps1')
+    Assert-Match $t '\$stateDir = Join-Path \$Repo ' 'записка по-прежнему пишется мимо проекта'
+    Assert-NoMatch $t "calloutFile = Join-Path \`$PSScriptRoot 'human-callout\.md'" `
+        'записка всё ещё уходит в каталог фабрики'
+    Assert-Match $t "callouts\b" 'нет копии на задачу — соседи по волне затрут общий файл'
+
+    $g = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+    Assert-Match $g 'callouts\\\$task\.md' 'граф не переносит записку из worktree в проект'
+    Assert-Match $g 'требует ревью человека' 'причина остановки не названа в отчёте'
+}
+
+# --- Не ответивший критик ≠ чистая приёмка -------------------------------------------------
+#
+# Узел роли возвращает пустоту, когда агент не дал текста: протух путь к CLI, кончилась
+# квота, оборвался поток. 2026-08-08 у codex сменился хэш сборки в пути — все три критика
+# упали по три попытки, отчёт написал «Находок нет», а итог «ок». Смотреть было некому, и
+# именно это обязано быть написано.
+
+It 'приёмка без ответа критиков не выдаётся за чистую' {
+    $q = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+    Assert-Match $q '\$criticsFailed = @\(\$acceptance \| Where-Object \{' 'граф не считает не ответивших критиков'
+    Assert-Match $q 'Приёмка НЕ ВЫПОЛНЕНА' 'отчёт не отличает «не нашли» от «не смотрели»'
+    Assert-Match $q 'criticsFailed = \$criticsFailed' 'число не поднимается наверх, в вердикт прогона'
+
+    $g = Get-Content -Raw (Join-Path $root 'harness\graph.ps1')
+    Assert-Match $g "has 'criticsFailed'\) -and \[int\]" 'итог не смотрит на несработавшую приёмку'
+    Assert-Match $g 'ПРИЁМКА НЕ ВЫПОЛНЕНА' 'нет отдельного вердикта для несработавшей приёмки'
+
+    # Ответ прозой = схема не доехала = валидации не было. Такой ответ не находки.
+    Assert-Match $q '\$_ -is \[string\]' 'строковый ответ критика считается структурой'
+}
+
+# --- Ветка барьера видит только общее состояние графа --------------------------------------
+#
+# Invoke-Barrier пересоздаёт ветку ИЗ ТЕКСТА в другом runspace: обычные переменные скрипта
+# там не существуют. `-Schema $criticSchema` превращался в `-Schema $null` — узел молча
+# возвращал прозу вместо структуры, а блок фактов уходил пустым. 2026-08-08: журнал писал
+# «критик: находок 1», отчёт — «Находок нет», итог — «ок»; в промпте не было ни схемы, ни
+# фактов, и никто этого не заметил, потому что всё выглядело зелёным.
+
+It 'критики получают схему и факты через состояние графа, а не через переменные' {
+    $q = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+
+    Assert-Match $q 'Set-GraphVar criticSchema' 'схема не положена в общее состояние'
+    Assert-Match $q 'Set-GraphVar criticFacts'  'факты проверок не положены в общее состояние'
+    Assert-Match $q '-Schema \(Get-GraphVar criticSchema\)' 'критик по-прежнему берёт схему из переменной скрипта'
+    Assert-NoMatch $q 'Invoke-Node -Role critic[^
+]*-Schema \$criticSchema' 'остался вызов со схемой из переменной — в runspace она пуста'
+    Assert-NoMatch $q '\$gateFacts\$criticTail' 'факты подставляются переменной, которой в ветке нет'
 }
 
 It 'мастер сохраняет и убирает состояние .bcf/init.json' {
@@ -561,6 +969,32 @@ It 'пустой бэклог не роняет таблицу' {
     $r = Bcf @('tasks', '--project', $p)
     Assert-Match $r.Out 'БЭКЛОГ'
     Assert-NoMatch $r.Out 'Exception|не удалось привязать|Cannot bind'
+}
+
+# Регрессия того же класса, что «одиннадцать задач готова при пяти заблокированных»:
+# состояние считалось ОДНИМ условием (предшественники закрыты), а допуск в волну — двумя
+# (ещё и владение объявлено). Поэтому `bcf tasks` печатал «готова» и советовал запуск о
+# задаче, про которую тот же экран строкой ниже писал «файлы не объявлены», а мастер на
+# шаге 4 — «не допущено: 1». Три экрана об одной задаче говорили разное.
+
+It 'задача без объявленных файлов не называется готовой' {
+    $p = New-Sandbox 'tasks-undeclared'
+    Bcf @('install', '--project', $p) | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'tasks\TASK-01-nofiles.md') -Value @"
+# TASK-01 — без владения
+
+## Готовность
+- что-то работает
+"@
+    $r = Bcf @('tasks', '--project', $p)
+    Assert-Match   $r.Out 'НЕ ДОПУЩЕНА' 'недопущенная задача обязана называться недопущенной'
+    Assert-Match   $r.Out 'готово к работе 0' 'недопущенная задача сосчитана готовой'
+    Assert-NoMatch $r.Out 'запустить готовые' 'совет запускать даётся при нулевой очереди'
+
+    $j = (Bcf @('tasks', '--project', $p, '--json')).Out | ConvertFrom-Json
+    $t = @($j)[0]
+    Assert-True ($t.Ready -and -not $t.Admitted -and -not $t.Runnable) `
+        "Ready=$($t.Ready) Admitted=$($t.Admitted) Runnable=$($t.Runnable) — допуск и готовность склеились"
 }
 
 It 'коллизия владения названа последствием' {
@@ -1218,6 +1652,103 @@ It 'update --check не трогает рабочее дерево' {
 
 # Регрессия того же класса, что BEL в verify.ps1: управляющий байт в скрипте делает путь
 # невозможным, ветка молча пропускается, и проверка выдаёт PASS, ничего не проверив.
+
+# --- Учёт высоты кадра ------------------------------------------------------------------
+#
+# Перерисовка «на месте» возвращается к началу кадра ОТНОСИТЕЛЬНО текущего курсора: подняться
+# надо ровно на столько строк, сколько было выведено в прошлый раз. Абсолютную координату
+# запоминать нельзя — у нижнего края окна вывод кадра прокручивает буфер, запомненный Y
+# перестаёт указывать на начало, и кадр дорисовывается вместо перерисовки. Именно так
+# карточка `bcf` задваивалась при выборе стрелками (проверено на живой консоли: старая
+# реализация оставляла на экране 2 заголовка вместо одного).
+#
+# Сам рисунок headless не проверить — он про позиционирование курсора. Проверяем то, на чём
+# он держится: Frame.Lines обязан равняться числу ВЫВЕДЕННЫХ строк, включая затирающие.
+# Разъедется этот счёт — разъедется и возврат.
+
+It 'кадр помнит, на сколько строк ушёл курсор' {
+    . (Join-Path $root 'src\lib\ui.ps1')
+    . (Join-Path $root 'src\lib\tui.ps1')
+
+    $f = New-BcfFrame
+    Assert-True ($f.Lines -eq 0) 'новый кадр — нулевой высоты'
+
+    $null = Write-BcfFrame -Frame $f -Lines @('a', 'b', 'c') 6>$null
+    Assert-True ($f.Lines -eq 3) "после 3 строк ожидалось 3, получено $($f.Lines)"
+
+    # Кадр стал короче: две строки содержимого + одна затирающая = курсор всё равно ушёл на 3.
+    $null = Write-BcfFrame -Frame $f -Lines @('a', 'b') 6>$null
+    Assert-True ($f.Lines -eq 3) "короткий кадр обязан досчитать затирающие: ожидалось 3, получено $($f.Lines)"
+
+    # Кадр вырос: высота обязана вырасти вместе с ним, иначе подъём окажется коротким
+    # и верх прошлого кадра останется на экране.
+    $null = Write-BcfFrame -Frame $f -Lines @('a', 'b', 'c', 'd', 'e') 6>$null
+    Assert-True ($f.Lines -eq 5) "выросший кадр: ожидалось 5, получено $($f.Lines)"
+}
+
+# --- Достижимость функций из команд ---------------------------------------------------
+#
+# bcf.ps1 подключает только paths.ps1 и ui.ps1; остальные библиотеки каждая команда берёт
+# сама. Забыть подключение легко, а ошибка вылезает лишь на той ветке, где функция реально
+# зовётся, — то есть у человека и обычно в самый неудобный момент. Так `bcf run` упал на
+# Test-BcfInteractive уже ПОСЛЕ карточки и выбора задач: снаружи это выглядело как «прогон
+# начался и умер», хотя не начинался.
+#
+# Проверка статическая: разбираем, кто что подключает, и ищем вызовы функций, до которых
+# команда не дотягивается. Учитываем и src/lib, и harness/lib, и файлы, подключённые в
+# чужой контекст (init-write.ps1 живёт внутри init.ps1 и видит его загрузки) — без этого
+# проверка даёт ложные срабатывания и её перестают читать.
+
+It 'каждая команда дотягивается до функций, которые зовёт' {
+    $libDirs = @((Join-Path $root 'src\lib'), (Join-Path $root 'harness\lib'))
+    $defs = @{}
+    foreach ($d in $libDirs) {
+        foreach ($f in (Get-ChildItem "$d\*.ps1" -ErrorAction SilentlyContinue)) {
+            foreach ($m in [regex]::Matches((Get-Content -Raw $f.FullName), '(?m)^\s*function\s+([\w-]+)')) {
+                $defs[$m.Groups[1].Value] = $f.Name
+            }
+        }
+    }
+
+    $cmdDir = Join-Path $root 'src\commands'
+    $bodies = @{}
+    foreach ($c in (Get-ChildItem "$cmdDir\*.ps1")) { $bodies[$c.Name] = Get-Content -Raw $c.FullName }
+
+    # Кто кого подключает: команда, дот-сорснутая в другую, наследует её загрузки.
+    $parents = @{}
+    foreach ($name in $bodies.Keys) {
+        foreach ($m in [regex]::Matches($bodies[$name], 'src\\commands\\([\w.-]+\.ps1)')) {
+            $child = $m.Groups[1].Value
+            if (-not $parents.ContainsKey($child)) { $parents[$child] = @() }
+            $parents[$child] += $name
+        }
+    }
+
+    function Get-Loaded([string]$name, $bodies, $parents, [hashtable]$seen) {
+        if ($seen.ContainsKey($name)) { return @() }
+        $seen[$name] = $true
+        # Путь к библиотеке не всегда литерал: `Join-Path (Get-BcfHarness) 'lib\docker.ps1'`
+        # собирает корень вызовом функции, и префикса `harness\` в тексте нет вовсе.
+        # Поэтому цепляемся за общий хвост `lib\<файл>.ps1` — он есть во всех вариантах.
+        $own = @([regex]::Matches($bodies[$name], 'lib\\([\w.-]+\.ps1)') | ForEach-Object { $_.Groups[1].Value })
+        foreach ($p in @($parents[$name])) { if ($p) { $own += Get-Loaded $p $bodies $parents $seen } }
+        return $own
+    }
+
+    $problems = @()
+    foreach ($name in ($bodies.Keys | Sort-Object)) {
+        $body = $bodies[$name]
+        $loaded = @('paths.ps1', 'ui.ps1') + (Get-Loaded $name $bodies $parents @{})
+        $local = @([regex]::Matches($body, '(?m)^\s*function\s+([\w-]+)') | ForEach-Object { $_.Groups[1].Value })
+        foreach ($m in [regex]::Matches($body, '(?<![\w-])[A-Z][a-z]+-Bcf[\w-]*')) {
+            $fn = $m.Value
+            if ($local -contains $fn) { continue }
+            if (-not $defs.ContainsKey($fn)) { continue }   # определена не в библиотеке — не наше дело
+            if ($loaded -notcontains $defs[$fn]) { $problems += "$name зовёт $fn, но не подключает $($defs[$fn])" }
+        }
+    }
+    Assert-True (-not $problems.Count) ("недостижимые вызовы:`n      " + (($problems | Select-Object -Unique) -join "`n      "))
+}
 
 # --- Итог ----------------------------------------------------------------------------
 Write-Host ''

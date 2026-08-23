@@ -69,7 +69,7 @@ if (-not $screenOnly -and (-not (Test-BcfInteractive) -or (Get-BcfAssumeYes))) {
 
 $queueTasks = @($status.Tasks | Where-Object { -not $_.Pass })
 $marked = @{}
-foreach ($t in $queueTasks) { $marked[$t.Id] = $t.Ready }   # по умолчанию — то, что готово
+foreach ($t in $queueTasks) { $marked[$t.Id] = $t.Runnable }   # по умолчанию — то, что реально поедет
 
 $modeIdx  = 0     # какой режим запустится по enter
 $cursor   = 0     # 0..MODES-1 — режимы, дальше — задачи
@@ -116,7 +116,11 @@ function Build-Screen {
             $row = $MODES.Count + $j
             $mark = if ($cursor -eq $row) { Sym 'cursor' } else { ' ' }
             $box  = if ($marked[$t.Id]) { '[' + (Sym 'boxOn') + ']' } else { '[ ]' }
-            $state = if ($t.Ready) { 'готова' }
+            # «Готова» здесь — не украшение, а обещание: этой отметкой задача уходит в
+            # прогон. Без объявленных файлов граф её не допустит, поэтому и называется она
+            # иначе, и по умолчанию не отмечается (см. $marked ниже).
+            $state = if ($t.Runnable) { 'готова' }
+                     elseif ($t.Ready) { 'НЕ ДОПУЩЕНА' }
                      elseif ($t.Preds.Count -gt 2) { "ждёт $($t.Preds.Count) задач" }
                      else { "ждёт $((($t.Preds | ForEach-Object { $_ -replace '^.*-', '' }) -join ','))" }
             $files = if ($t.Files.Count) { $t.Files[0] } else { 'ФАЙЛЫ НЕ ОБЪЯВЛЕНЫ' }
@@ -192,7 +196,7 @@ while (-not $quit -and -not $run) {
             $estimate = Update-Estimate
         }
         'D' {
-            foreach ($t in $queueTasks) { $marked[$t.Id] = $t.Ready }
+            foreach ($t in $queueTasks) { $marked[$t.Id] = $t.Runnable }
             $estimate = Update-Estimate
         }
         'Enter'  { $run = $MODES[$modeIdx].key }
