@@ -154,24 +154,3 @@ function Compute-State {
     }
     return $state
 }
-
-function Get-LastVerdict {
-    param([string]$TaskId)
-    $events = Get-Events -EventType 'verdict-recorded' -TaskId $TaskId
-    if (-not $events) { return $null }
-    return ($events | Select-Object -Last 1).payload.verdict
-}
-
-function Count-ConsecutiveFails {
-    param([string]$TaskId, [string]$Criterion = '')
-    # Сколько подряд FAIL/NEEDS-MORE-EVIDENCE без PASS между ними (для throw-out N=2).
-    $events = Get-Events -EventType 'verdict-recorded' -TaskId $TaskId
-    $count = 0
-    foreach ($e in ($events | Sort-Object { $_.ts } -Descending)) {
-        $v = $e.payload.verdict
-        if ($v -eq 'PASS') { break }
-        if ($Criterion -and $e.payload.failing_criterion -and $e.payload.failing_criterion -ne $Criterion) { continue }
-        $count++
-    }
-    return $count
-}

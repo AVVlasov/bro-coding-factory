@@ -1750,6 +1750,94 @@ It 'каждая команда дотягивается до функций, к
     Assert-True (-not $problems.Count) ("недостижимые вызовы:`n      " + (($problems | Select-Object -Unique) -join "`n      "))
 }
 
+# --- Флаг со значением в конце строки --------------------------------------------------
+#
+# Индекс за границей массива в PowerShell не ошибка: `--budget` последним аргументом
+# давал [double]$null = 0, а ноль у бюджета означает «без лимита». Предохранитель денег
+# отключался молча — худший способ отключаться.
+
+It 'флаг без значения отказывает вслух, а не теряется молча' {
+    $p = New-Sandbox 'run-flag-value'
+    Bcf @('init', '--yes', '--project', $p) | Out-Null
+    $r = Bcf @('run', 'night', '--project', $p, '--budget')
+    Assert-True ($r.Code -eq 2) "ожидался exit 2, получен $($r.Code)"
+    Assert-Match $r.Out 'без значения' 'причина отказа не названа'
+}
+
+It 'не число в числовом флаге — отказ с текстом, а не стек' {
+    $p = New-Sandbox 'run-flag-nan'
+    Bcf @('init', '--yes', '--project', $p) | Out-Null
+    $r = Bcf @('run', 'night', '--max-iterations', 'дважды', '--project', $p)
+    Assert-True ($r.Code -eq 2) "ожидался exit 2, получен $($r.Code)"
+    Assert-Match $r.Out 'не число'
+}
+
+# --- Тариф бьётся по самой длинной модели ----------------------------------------------
+#
+# Поиск тарифа подстрокой брал ПЕРВЫЙ совпавший ключ: «gpt-4o-mini» содержит «gpt-4o»,
+# и при неудачном порядке ключей mini считался по цене старшей модели. Разница в разы,
+# молча, в отчёте о деньгах.
+
+It 'модель mini бьётся о тариф mini, а не старшей модели' {
+    . (Join-Path $root 'src\lib\pricing.ps1')
+    $models = [pscustomobject]@{
+        'gpt-4o'      = [pscustomobject]@{ blended = 10 }
+        'gpt-4o-mini' = [pscustomobject]@{ blended = 1 }
+    }
+    $pricing = [pscustomobject]@{ Models = $models; Rate = 1.0 }
+    $cost = Get-BcfNodeCost -Pricing $pricing -Model 'gpt-4o-mini' -Tokens 1000000
+    Assert-True ($null -ne $cost) 'тариф не нашёлся вовсе'
+    Assert-True ([math]::Abs($cost - 1.0) -lt 0.001) "mini посчитан по чужой ставке: $cost вместо 1"
+}
+
+# --- Проба авторизации имеет потолок времени -------------------------------------------
+#
+# Зависший CLI висел doctor навсегда: зависание потока здесь ШТАТНЫЙ случай, о нём
+# пишет документация init и run, а проба ждала вечно.
+
+It 'зависшая проба авторизации убивается по таймауту и зовётся ошибкой' {
+    . (Join-Path $root 'src\lib\backends.ps1')
+    $script:BcfBackends['test-hang'] = @{ env = @(); authCheck = 'Start-Sleep 30'; authOkPattern = '' }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $env:BCF_AUTH_TIMEOUT_SEC = '3'
+    try { $r = Test-BcfBackendAuth -Name 'test-hang' } finally { Remove-Item Env:BCF_AUTH_TIMEOUT_SEC }
+    $sw.Stop()
+    Assert-True ($sw.ElapsedMilliseconds -lt 15000) "проба заняла $($sw.ElapsedMilliseconds)мс — таймаут не работает"
+    Assert-True (-not $r.Ok) 'зависший CLI признан авторизованным'
+    Assert-Match $r.Detail 'таймаут'
+}
+
+It 'здоровая проба авторизации отвечает и матчится по шаблону' {
+    . (Join-Path $root 'src\lib\backends.ps1')
+    $script:BcfBackends['test-ok'] = @{ env = @(); authCheck = "'auth-ok'"; authOkPattern = 'auth-ok' }
+    $r = Test-BcfBackendAuth -Name 'test-ok'
+    Assert-True $r.Ok 'живой CLI не признан авторизованным'
+}
+
+# --- Гард конкуренции verify читает живой журнал ---------------------------------------
+#
+# Проблема была в адресе: гард смотрел harness\events.jsonl фабрики, а шина пишет в
+# <проект>\.bcf\events.jsonl. Оба адреса обязаны совпадать буквально — иначе правка
+# одного из них снова разойдётся.
+
+It 'гард verify берёт журнал из того же каталога состояния, что и шина' {
+    $v = Get-Content -Raw (Join-Path $root 'harness\verify.ps1')
+    Assert-NoMatch $v "Join-Path \\\$PSScriptRoot 'events\.jsonl'" 'гард снова читает журнал из каталога фабрики'
+    Assert-Match $v 'Get-BcfStateDir \$root\) .events\.jsonl.' 'журнал гарда не привязан к состоянию проекта'
+}
+
+# --- Триггеры читают конфиг проекта ----------------------------------------------------
+#
+# У фабрики нет каталога config/ вовсе: список friction-триггеров молча пуст во всех
+# проектах, human-callout на миграции/auth не срабатывал ни разу. templates/config/
+# кладёт triggers.json в проект — читать надо оттуда.
+
+It 'triggers.ps1 грузит список из проекта, где его реально кладёт install' {
+    $t = Get-Content -Raw (Join-Path $root 'harness\triggers.ps1')
+    Assert-Match $t 'Join-Path \(Join-Path \$Repo ''config''\) ''triggers\.json''' 'конфиг триггеров не читается из проекта'
+    Assert-NoMatch $t '\$repoRoot' 'адрес всё ещё собирается от корня фабрики'
+}
+
 # --- Итог ----------------------------------------------------------------------------
 Write-Host ''
 if ($script:fail) {

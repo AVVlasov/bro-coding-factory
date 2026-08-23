@@ -278,25 +278,6 @@ $script:BcfAssumeYes = $false
 function Set-BcfAssumeYes { param([bool]$Value) $script:BcfAssumeYes = $Value }
 function Get-BcfAssumeYes { return $script:BcfAssumeYes }
 
-function Read-BcfChoice {
-    param([string]$Question, [string[]]$Options, [int]$Default = 0)
-    if ($script:BcfAssumeYes) {
-        Write-BcfDim "$Question → $($Options[$Default]) (по умолчанию, режим без вопросов)"
-        return $Default
-    }
-    Write-Host ''
-    Write-BcfLine "  $Question" 'White'
-    for ($i = 0; $i -lt $Options.Count; $i++) {
-        $mark = if ($i -eq $Default) { '▸' } else { ' ' }
-        Write-Host ("    $mark [{0}] {1}" -f ($i + 1), $Options[$i])
-    }
-    $ans = Read-Host "  выбор [1-$($Options.Count)], enter = $($Default + 1)"
-    if (-not $ans) { return $Default }
-    $n = 0
-    if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le $Options.Count) { return $n - 1 }
-    return $Default
-}
-
 function Read-BcfConfirm {
     param([string]$Question, [bool]$Default = $true)
     if ($script:BcfAssumeYes) { return $Default }
@@ -304,13 +285,4 @@ function Read-BcfConfirm {
     $ans = Read-Host "  $Question $hint"
     if (-not $ans) { return $Default }
     return ($ans -match '^(y|yes|д|да)$')
-}
-
-function Read-BcfText {
-    param([string]$Question, [string]$Default = '')
-    if ($script:BcfAssumeYes) { return $Default }
-    $suffix = if ($Default) { " [$Default]" } else { '' }
-    $ans = Read-Host "  $Question$suffix"
-    if (-not $ans) { return $Default }
-    return $ans.Trim()
 }

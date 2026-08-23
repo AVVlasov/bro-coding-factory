@@ -7,7 +7,7 @@
 #   - auth/permissions/roles;
 #   - удаление более N строк в одном файле.
 # Сам список путей и порог удаления НЕ хардкодятся — они грузятся из
-# config/triggers.json (bigDeletionThreshold + pathTriggers[]). Адаптируй под проект там.
+# config/triggers.json ПРОЕКТА (bigDeletionThreshold + pathTriggers[]). Адаптируй под проект там.
 #
 # Database migration зависит от locks/data size in production — human judgment call.
 # Ralph не должен делать irreversible вещи без человека.
@@ -55,11 +55,14 @@ Assert-HarnessCaller -ScriptName 'triggers.ps1'
 # Структура: { bigDeletionThreshold: int, pathTriggers: [ {pattern, reason, severity} ] }.
 # Если файл отсутствует/битый — безопасные дефолты (пустой список, порог 50):
 # триггеров нет, цикл не блокируется на ровном месте.
+#
+# Файл читается ИЗ ПРОЕКТА (templates/config/triggers.json кладёт его install).
+# Прежде адресом был корень фабрики, где каталога config нет вовсе: список
+# молча пуст у всех проектов, и human-callout на миграции/auth не срабатывал ни разу.
 # ----------------------------------------------------------------------------
-$repoRoot = Split-Path $PSScriptRoot -Parent
 $pathTriggers = @()
 $bigDeletionThreshold = 50  # удаление > N строк в одном файле — отдельный триггер
-$triggersCfgFile = Join-Path $repoRoot 'config\triggers.json'
+$triggersCfgFile = Join-Path (Join-Path $Repo 'config') 'triggers.json'
 if (Test-Path $triggersCfgFile) {
     try {
         $triggersCfg = Get-Content -Raw -LiteralPath $triggersCfgFile | ConvertFrom-Json

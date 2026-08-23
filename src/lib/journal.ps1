@@ -29,11 +29,6 @@ function ConvertTo-BcfLocalTime {
     return $dt
 }
 
-function Get-BcfGraphRoot {
-    param([Parameter(Mandatory)][string]$Project)
-    return (Join-Path $Project '.bcf\graph')
-}
-
 # Каталоги, где могут лежать журналы прогонов.
 #
 # Второй адрес — НАСЛЕДИЕ, и он здесь не из вежливости. Проекты, которые водили харнесс

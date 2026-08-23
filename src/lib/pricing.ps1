@@ -39,9 +39,15 @@ function Get-BcfNodeCost {
     if (-not $Pricing -or -not $Pricing.Models -or -not $Model -or $Tokens -le 0) { return $null }
     $m = $Pricing.Models.PSObject.Properties[$Model]
     if (-not $m) {
-        # Ищем по префиксу: в конфиге модель часто записана с провайдером
-        # (provider/Model-Name), а в журнале — как её вернул бэкенд.
-        $m = $Pricing.Models.PSObject.Properties | Where-Object { $Model -like "*$($_.Name)*" } | Select-Object -First 1
+        # Ищем по вхождению: в конфиге модель часто записана с провайдером
+        # (provider/Model-Name), а в журнале — как её вернул бэкенд. Из нескольких
+        # совпавших ключей берём САМЫЙ ДЛИННЫЙ: «gpt-4o-mini» содержит и «gpt-4o»,
+        # и первый по порядку мог бы посчитать mini по тарифу старшей модели —
+        # разница в разы, молча.
+        $m = $Pricing.Models.PSObject.Properties |
+             Where-Object { $Model -like "*$($_.Name)*" } |
+             Sort-Object { $_.Name.Length } -Descending |
+             Select-Object -First 1
     }
     if (-not $m) { return $null }
 

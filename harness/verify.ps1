@@ -311,7 +311,11 @@ if (-not $tf) { Log "ОШИБКА: task-файл $Task не найден в task
 # verify считает её «своей» (это его loop-родитель), а конкурент — любой ДРУГОЙ session_id.
 $myBus = Get-EventBusSession
 $parentSession = if ($env:RALPH_PARENT_SESSION_ID) { [string]$env:RALPH_PARENT_SESSION_ID } else { '' }
-$eventsFile = Join-Path $PSScriptRoot 'events.jsonl'
+# Тот же адрес, куда пишет шина (Initialize-EventBus выше получает тот же корень).
+# Прежде гард читал harness\events.jsonl из каталога фабрики — файл, который шина
+# не писала годами: конкуренция становилась невидимой, и два verify по одной задаче
+# расходились, оба считая себя единственными.
+$eventsFile = Join-Path (Get-BcfStateDir $root) 'events.jsonl'
 if (Test-Path $eventsFile) {
   $cutoff = (Get-Date).ToUniversalTime().AddSeconds(-90)
   $concurrentSession = $null
@@ -574,37 +578,6 @@ function Invoke-Opencode($promptText, $label) {
   }
   if (Test-Path $of) { return (Get-Content -Raw -LiteralPath $of) }
   return "[${label}: пустой вывод opencode]"
-}
-
-# --- Опциональный альтернативный бэкенд: изолированный `claude -p` прогон (судья / критик). ---
-# Не используется по умолчанию (дефолтный транспорт — Invoke-Opencode). Оставлен как пример
-# подключения другого CLI-агента. Доп. флаги — через $env:BCF_CLAUDE_EXTRA_ARGS.
-function Invoke-ClaudeCode($promptText, $label) {
-  $pf = Join-Path $workDir "$Task-$label.prompt.txt"
-  $of = Join-Path $workDir "$Task-$label.out.txt"
-  $ef = Join-Path $workDir "$Task-$label.err.txt"
-  Set-Content -LiteralPath $pf -Value $promptText -Encoding UTF8
-  # Промпт — через stdin (claude -p принимает stdin).
-  $extraArgs = [string]$env:BCF_CLAUDE_EXTRA_ARGS
-  $modelArg  = if ($JudgeModel) { "--model '$JudgeModel'" } else { '' }
-  $inner = "Get-Content -Raw -LiteralPath '$pf' | & claude -p $modelArg $extraArgs --permission-mode acceptEdits --allowedTools 'Read,Grep,Glob,Bash'"
-  try {
-    $proc = Start-Process -FilePath 'pwsh' `
-      -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $inner) `
-      -WorkingDirectory $root -NoNewWindow -PassThru `
-      -RedirectStandardOutput $of -RedirectStandardError $ef
-    if (-not $proc.WaitForExit($StepTimeoutSec * 1000)) {
-      Log "${label}: claude -p TIMEOUT ${StepTimeoutSec}s — принудительный kill."
-      try { $proc.Kill($true) } catch { }
-      $proc.WaitForExit(5000) | Out-Null
-      return "[${label}: TIMEOUT после ${StepTimeoutSec}s — результат неполный]"
-    }
-  } catch {
-    Log "${label}: не удалось запустить claude — $($_.Exception.Message)"
-    return "[${label}: запуск claude провален — $($_.Exception.Message)]"
-  }
-  if (Test-Path $of) { return (Get-Content -Raw -LiteralPath $of) }
-  return "[${label}: пустой вывод claude]"
 }
 
 # --- Хелпер: детерминированная команда (npm run ...), возврат — @{exit; output} ---

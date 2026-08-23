@@ -59,7 +59,19 @@ if ($dirty.Count -and -not $check) {
 
 # --- Что нового ------------------------------------------------------------------------
 Write-BcfDim 'смотрю удалённый репозиторий…'
-$fetch = _git @('fetch', '--quiet', '--all', '--tags')
+$fetchFailed = $false
+& git -C $home_ fetch --quiet --all --tags 2>$null
+if ($LASTEXITCODE -ne 0) { $fetchFailed = $true }
+# Офлайн сравнение с устаревшим upstream печатало «новее нет» — уверенное враньё,
+# ради которого эту команду и открывают. Явный --to от сети не зависит: ref задан рукой.
+if ($fetchFailed -and -not $toRef) {
+    Write-Host ''
+    Write-BcfFail 'fetch не удался: свежесть проверить нельзя, сравнение было бы с устаревшим upstream'
+    Write-BcfNote 'проверь сеть и доступность удалённого репозитория, затем повтори.'
+    Write-BcfNote 'известный ref можно обновиться и офлайн: bcf update --to <ref>'
+    Write-Host ''
+    exit 2
+}
 $upstream = _git @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
 if ($upstream -match 'no upstream|fatal') {
     Write-Host ''

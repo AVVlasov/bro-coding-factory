@@ -37,6 +37,33 @@ $conc = 0
 $resume = ''
 $maxIter = 0
 
+# Флаг со значением в конце строки теряется молча: индекс за границей массива в
+# PowerShell не ошибка, а $null. Для --budget это тихое отключение потолка расходов —
+# прогон уходит без предохранителя, и человек узнаёт об этом по счёту.
+function Get-BcfFlagValue {
+    param([string]$Flag, [int]$Index)
+    if ($Index -ge $script:BcfArgs.Count -or [string]::IsNullOrWhiteSpace([string]$script:BcfArgs[$Index])) {
+        Write-BcfFail "$($Flag) указан без значения"
+        Write-Host ''
+        exit 2
+    }
+    return [string]$script:BcfArgs[$Index]
+}
+function Get-BcfFlagNumber {
+    param([string]$Flag, [int]$Index, [type]$T)
+    # Приведение через -as, а не TryParse: каст в PowerShell идёт по инвариантной
+    # культуре, TryParse — по текущей, и «12.5» на русской локали отвалился бы.
+    # Отказ молчаливому нулю здесь и был дефект: 0 у бюджета означает «без лимита».
+    $raw = Get-BcfFlagValue -Flag $Flag -Index $Index
+    $n = $raw -as $T
+    if ($null -eq $n) {
+        Write-BcfFail "$($Flag): «$raw» не число"
+        Write-Host ''
+        exit 2
+    }
+    return $n
+}
+
 for ($i = 0; $i -lt $script:BcfArgs.Count; $i++) {
     $a = [string]$script:BcfArgs[$i]
     # break обязателен в каждой ветке: PowerShell-switch без него проверяет ОСТАЛЬНЫЕ
@@ -44,10 +71,10 @@ for ($i = 0; $i -lt $script:BcfArgs.Count; $i++) {
     # аргументы харнесса как неизвестный флаг.
     switch -Regex ($a) {
         '^--dry-plan$'       { $dryPlan = $true; break }
-        '^--budget$'         { $i++; $budget = [double]$script:BcfArgs[$i]; break }
-        '^--concurrency$'    { $i++; $conc = [int]$script:BcfArgs[$i]; break }
-        '^--resume$'         { $i++; $resume = [string]$script:BcfArgs[$i]; break }
-        '^--max-iterations$' { $i++; $maxIter = [int]$script:BcfArgs[$i]; break }
+        '^--budget$'         { $budget = Get-BcfFlagNumber -Flag '--budget' -Index ($i + 1) -T ([double]); break }
+        '^--concurrency$'    { $conc = Get-BcfFlagNumber -Flag '--concurrency' -Index ($i + 1) -T ([int]); break }
+        '^--resume$'         { $resume = Get-BcfFlagValue -Flag '--resume' -Index ($i + 1); break }
+        '^--max-iterations$' { $maxIter = Get-BcfFlagNumber -Flag '--max-iterations' -Index ($i + 1) -T ([int]); break }
         '^-'                 { $passthru += $a; break }
         default {
             if (-not $mode) { $mode = $a } elseif (-not $task) { $task = $a } else { $passthru += $a }

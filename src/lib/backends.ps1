@@ -255,20 +255,39 @@ function Get-BcfBackendVersion {
 function Test-BcfBackendAuth {
     param([Parameter(Mandatory)][string]$Name)
 
+    # Проба без потолка вешала doctor навсегда на зависшем CLI — при том, что зависание
+    # потока бэкенда здесь ШТАТНЫЙ случай, о нём пишет документация init и run.
+    $authTimeoutSec = if ($env:BCF_AUTH_TIMEOUT_SEC) { [int]$env:BCF_AUTH_TIMEOUT_SEC } else { 20 }
+
     $b = $script:BcfBackends[$Name]
     if (-not $b -or -not $b.authCheck) { return [pscustomobject]@{ Known = $false; Ok = $true; Detail = '' } }
 
     $pre = ''
     foreach ($n in @($b.env)) {
-        if (-not $n) { continue }
+        if ($null -eq $n -or $n -eq '') { continue }
         $v = [Environment]::GetEnvironmentVariable($n)
         if (-not $v) { $v = [Environment]::GetEnvironmentVariable($n, 'User') }
         if (-not $v) { $v = [Environment]::GetEnvironmentVariable($n, 'Machine') }
         if ($v) { $pre += "`$env:$n='$($v -replace "'", "''")';" }
     }
+    # Через задание: WaitForExit у Start-Process требует ручной сборки вывода и квотирования
+    # аргументов, а Stop-Job гасит дочернее pwsh вместе с его зависшим CLI.
+    $job = Start-Job -ScriptBlock {
+        param($Pre, $Check)
+        & pwsh -NoProfile -NonInteractive -Command "$Pre $Check" 2>&1 | Out-String
+    } -ArgumentList $pre, $b.authCheck
+
     $out = ''
-    try { $out = (& pwsh -NoProfile -NonInteractive -Command "$pre $($b.authCheck)" 2>&1 | Out-String) } catch { $out = $_.Exception.Message }
-    $ok = (-not $b.authOkPattern) -or ($out -match $b.authOkPattern)
+    $timedOut = -not (Wait-Job $job -Timeout $authTimeoutSec)
+    if ($timedOut) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        $out = "проба не ответила за ${authTimeoutSec}s — CLI убит по таймауту"
+    } else {
+        $out = Receive-Job $job
+    }
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+
+    $ok = (-not $timedOut) -and ((-not $b.authOkPattern) -or ($out -match $b.authOkPattern))
     $detail = (($out -replace '\s+', ' ')).Trim()
     if ($detail.Length -gt 140) { $detail = $detail.Substring(0, 140) + '…' }
     return [pscustomobject]@{ Known = $true; Ok = $ok; Detail = $detail }

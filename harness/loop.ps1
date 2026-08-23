@@ -853,33 +853,55 @@ $culprit
   if ($launchErr -ne "") {
     $bp += "ЗАПУСК opencode ПРОВАЛЕН: $launchErr"
   }
-  $tscOut = & npx --no-install tsc --noEmit 2>&1
-  $tscExit = $LASTEXITCODE
-  if ($tscExit -ne 0) {
-    $bp += "tsc --noEmit FAILED (exit $tscExit):`n" + (($tscOut | Select-Object -Last 12) -join "`n")
-    Append-Event -EventType 'tsc-failed' -TaskId $focus -Phase 'B' -Iteration $i `
-      -Payload @{ exit_code = $tscExit; tail = (($tscOut | Select-Object -Last 5) -join "`n") }
+  # TSC-GATE: три состояния вместо молчаливого протухшего кода выхода.
+  # Раньше при недоступном npx в $tscExit попадал $LASTEXITCODE от ПРЕДЫДУЩЕЙ команды
+  # (обычно git), и проверка типов «проходила», не выполнившись ни разу. Теперь:
+  # нет package.json — проверять нечего, пропуск с событием; package.json есть, а npx
+  # недоступен — БЛОК: проект объявил JS, и уезжать на verify без проверки типов нельзя.
+  $tscRan = $true
+  if (-not (Test-Path (Join-Path $root 'package.json'))) {
+    $tscRan = $false
+    Append-Event -EventType 'tsc-gate-skipped' -TaskId $focus -Phase 'B' -Iteration $i `
+      -Payload @{ reason = 'no package.json' }
+  } elseif (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
+    $tscRan = $false
+    $bp += "TSC-GATE BLOCKED: в проекте есть package.json, а npx недоступен — типы не проверялись. Установи Node.js/npx или запусти задачу без tsc-gate."
+    Append-Event -EventType 'tsc-gate-unavailable' -TaskId $focus -Phase 'B' -Iteration $i `
+      -Payload @{ reason = 'npx not found' }
   }
-
-  # M-09 E: tsc-clean → tsc-broken = регрессия. Откатываем правки итерации к pre-iter snapshot.
-  # Default on (M-09 E, опт-аут через -NoAutoRollback). Стэш-объект из stash create
-  # содержит diff working-tree + index; checkout его дерева вернёт файлы в pre-iter состояние.
-  # SAFETY: откатываемся ТОЛЬКО к свежему snapshot'у (stash-create объект),
-  # который отличается от HEAD. Если stash create дал пусто и preIterTreeRef
-  # свалился в fallback `rev-parse HEAD`, checkout вернул бы дерево к старому
-  # HEAD и уничтожил все uncommitted-правки (дни работы). Тогда — не откатываем.
-  $headSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
-  if ((-not $NoAutoRollback) -and $tscExit -ne 0 -and $lastTscExit -eq 0 -and $preIterTreeRef -and ($preIterTreeRef -ne $headSha)) {
-    Log "REGRESSION: tsc был чист на iter $($i-1), сломан на iter $i. Откат до $preIterTreeRef."
-    $regrDiff = (& git diff $preIterTreeRef HEAD --stat 2>$null | Out-String).Trim()
-    # checkout всех файлов из snapshot обратно в working-tree
-    & git checkout $preIterTreeRef -- . 2>&1 | Out-Null
-    Append-Event -EventType 'iter-rolled-back' -TaskId $focus -Phase 'B' -Iteration $i `
-      -Payload @{ reason = 'tsc-regression'; pre_iter_ref = $preIterTreeRef; rolled_diff_stat = $regrDiff }
-    $bp += "AUTO-ROLLBACK: твои правки сломали tsc (был exit=0, стал exit=$tscExit). Раннер откатил working-tree до состояния начала этой итерации. Diff отката:`n$regrDiff`nДействия: НЕ повторяй те же правки. Сначала reproduce проблему минимальным шагом, потом точечный фикс."
-    # после отката пересчитываем tsc — для $lastTscExit на следующую итерацию
+  if ($tscRan) {
     $tscOut = & npx --no-install tsc --noEmit 2>&1
     $tscExit = $LASTEXITCODE
+    if ($tscExit -ne 0) {
+      $bp += "tsc --noEmit FAILED (exit $tscExit):`n" + (($tscOut | Select-Object -Last 12) -join "`n")
+      Append-Event -EventType 'tsc-failed' -TaskId $focus -Phase 'B' -Iteration $i `
+        -Payload @{ exit_code = $tscExit; tail = (($tscOut | Select-Object -Last 5) -join "`n") }
+    }
+
+    # M-09 E: tsc-clean → tsc-broken = регрессия. Откатываем правки итерации к pre-iter snapshot.
+    # Default on (M-09 E, опт-аут через -NoAutoRollback). Стэш-объект из stash create
+    # содержит diff working-tree + index; checkout его дерева вернёт файлы в pre-iter состояние.
+    # SAFETY: откатываемся ТОЛЬКО к свежему snapshot'у (stash-create объект),
+    # который отличается от HEAD. Если stash create дал пусто и preIterTreeRef
+    # свалился в fallback `rev-parse HEAD`, checkout вернул бы дерево к старому
+    # HEAD и уничтожил все uncommitted-правки (дни работы). Тогда — не откатываем.
+    $headSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+    if ((-not $NoAutoRollback) -and $tscExit -ne 0 -and $lastTscExit -eq 0 -and $preIterTreeRef -and ($preIterTreeRef -ne $headSha)) {
+      Log "REGRESSION: tsc был чист на iter $($i-1), сломан на iter $i. Откат до $preIterTreeRef."
+      $regrDiff = (& git diff $preIterTreeRef HEAD --stat 2>$null | Out-String).Trim()
+      # checkout всех файлов из snapshot обратно в working-tree
+      & git checkout $preIterTreeRef -- . 2>&1 | Out-Null
+      Append-Event -EventType 'iter-rolled-back' -TaskId $focus -Phase 'B' -Iteration $i `
+        -Payload @{ reason = 'tsc-regression'; pre_iter_ref = $preIterTreeRef; rolled_diff_stat = $regrDiff }
+      $bp += "AUTO-ROLLBACK: твои правки сломали tsc (был exit=0, стал exit=$tscExit). Раннер откатил working-tree до состояния начала этой итерации. Diff отката:`n$regrDiff`nДействия: НЕ повторяй те же правки. Сначала reproduce проблему минимальным шагом, потом точечный фикс."
+      # после отката пересчитываем tsc — для $lastTscExit на следующую итерацию
+      $tscOut = & npx --no-install tsc --noEmit 2>&1
+      $tscExit = $LASTEXITCODE
+    }
+  } else {
+    # Гейт не выполнялся: нейтральный ноль, чтобы не зажечь регрессионную логику
+    # фиктивной парой «был 0 / стал не-0» на следующих итерациях.
+    $tscExit = 0
   }
   $lastTscExit = $tscExit
   if ($hasBash) {
@@ -894,9 +916,18 @@ $culprit
   # W4: lint-gate (Ryan Lepo + Armin Ronacher — mechanical enforcement через lint).
   $lintOut = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'lint-gate.ps1') -Repo $root 2>&1 | Out-String
   if ($LASTEXITCODE -eq 1) {
-    $bp += "LINT-GATE FAIL — исправь до VERIFY-REQUEST:`n" + (($lintOut -split "`n" | Select-Object -First 40) -join "`n")
-    Append-Event -EventType 'lint-violation' -TaskId $focus -Phase 'B' -Iteration $i `
-      -Payload @{ tail = ($lintOut.Substring(0, [Math]::Min(500, $lintOut.Length))) }
+    if ($lintOut -notmatch 'LINT-GATE:') {
+      # exit 1 бывает и у упавшего гейта: парс-ошибка скрипта неотличима от нарушений
+      # по коду. Нарушения всегда печатают заголовок «LINT-GATE: FAIL» — его отсутствие
+      # значит, что сам гейт не выполнился, и блокировать надо с ЧЕСТНОЙ причиной.
+      $bp += "LINT-GATE CRASHED — сам гейт не выполнился (exit 1 без отчёта), нарушений он не называл:`n" + (($lintOut -split "`n" | Select-Object -First 12) -join "`n")
+      Append-Event -EventType 'lint-gate-crashed' -TaskId $focus -Phase 'B' -Iteration $i `
+        -Payload @{ tail = ($lintOut.Substring(0, [Math]::Min(300, $lintOut.Length))) }
+    } else {
+      $bp += "LINT-GATE FAIL — исправь до VERIFY-REQUEST:`n" + (($lintOut -split "`n" | Select-Object -First 40) -join "`n")
+      Append-Event -EventType 'lint-violation' -TaskId $focus -Phase 'B' -Iteration $i `
+        -Payload @{ tail = ($lintOut.Substring(0, [Math]::Min(500, $lintOut.Length))) }
+    }
   }
 
   # M-13 C (2026-05-27): subagent-finding-gate. Берёт remediation из ПРЕДЫДУЩЕГО
@@ -910,7 +941,16 @@ $culprit
       Append-Event -EventType 'finding-gate-blocked' -TaskId $focus -Phase 'B' -Iteration $i `
         -Payload @{ exit_code = $gateCode }
     }
-  } catch { Log "M-13 finding-gate failed (non-fatal): $($_.Exception.Message)" }
+  } catch {
+    # Не-fatal по решению M-13: падение самого гейта не должно замуровать цикл.
+    # Но и невидимым оно остаться не может — иначе приёмка едет дальше так,
+    # будто непокрытая ремедиация проверена. Агент видит предупреждение, журнал
+    # получает событие, ретроспектор доберётся до причины.
+    Log "M-13 finding-gate failed (non-fatal): $($_.Exception.Message)"
+    $bp += "M-13 finding-gate НЕ ВЫПОЛНИЛСЯ (ошибка самого гейта): непокрытость прошлой ремедиации в этом diff НЕИЗВЕСТНА, а не чиста. Причина: $($_.Exception.Message)"
+    Append-Event -EventType 'finding-gate-error' -TaskId $focus -Phase 'B' -Iteration $i `
+      -Payload @{ error = $_.Exception.Message }
+  }
 
   # M-09 (2026-05-25, фикс A+B): если backpressure не чист — не зовём человека и
   # не запускаем верификацию на заведомо плохом коде. Сначала агент чинит tsc/lint/done-gate,
