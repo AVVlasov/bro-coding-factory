@@ -45,6 +45,7 @@ function Invoke-ParallelQueue {
     $running  = [System.Collections.ArrayList]::new()
     $passed   = @()
     $stuck    = @()
+    $skipped  = @()   # задачи с исполнителем-человеком: не наши, но и не затык
     $doneSet  = [System.Collections.Generic.HashSet[string]]::new()
     $plan     = @()   # для -DryPlan: решения планировщика без запуска
 
@@ -64,6 +65,20 @@ function Invoke-ParallelQueue {
             if (-not (Test-FleetCapacity -MaxAgents $MaxAgents)) {
                 & $log "потолок агентов ($MaxAgents) — жду освобождения."
                 break
+            }
+
+            # 0. Задача человека. Проверяется ЗДЕСЬ, а не только в run-all: планировщик
+            # зовут и другие входы (граф очереди, свои обвязки), и они передают список
+            # задач напрямую. Пропуск не есть затык: задача не попадает ни в stuck, ни
+            # в passed, иначе отчёт назовёт её либо сломанной, либо сделанной.
+            $exec = Get-TaskExecutor -TaskId $task -Root $Root
+            if ($exec -and -not (Test-BcfExecutorIsFactory $exec)) {
+                & $log "$task — пропущена: исполнитель $exec."
+                $plan += [pscustomobject]@{ task = $task; admitted = $false; reason = "исполнитель $exec" }
+                $skipped += [pscustomobject]@{ Task = $task; Executor = $exec }
+                $pending.Remove($task)
+                [void]$doneSet.Add($task)
+                continue
             }
 
             # 1. Гейты зависимостей.
@@ -267,5 +282,5 @@ function Invoke-ParallelQueue {
         }
     }
 
-    return @{ Passed = $passed; Stuck = $stuck; Plan = $plan }
+    return @{ Passed = $passed; Stuck = $stuck; Plan = $plan; Skipped = $skipped }
 }

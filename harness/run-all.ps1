@@ -283,7 +283,27 @@ $queue = Get-ChildItem (Join-Path $root "tasks") -Filter "$taskIdPrefix-*.md" -E
   Where-Object { $_.Num -ne 0 } |
   Sort-Object Num -Unique
 
-if (-not $queue -or $queue.Count -eq 0) { Log "Очередь пуста — нет задач $taskIdPrefix-NN в tasks/."; exit 1 }
+# --- Задачи человека из очереди вон ---
+#
+# Строка «Исполнитель: <имя>» в файле задачи — не пометка для глаз, а решение: фабрика
+# на эту задачу агента не запускает. Раньше того же добивались сентинелом
+# «**Gate-вход:** TASK-00», и задача попадала в отчёт как заблокированная — то есть
+# как сломанная. Здесь она просто не входит в очередь, и в журнале сказано почему.
+$humanHeld = @()
+$queue = @($queue | Where-Object {
+  $ex = Get-TaskExecutor -TaskId $_.Task -Root $root
+  if ($ex -and -not (Test-BcfExecutorIsFactory $ex)) {
+    $humanHeld += [pscustomobject]@{ Task = $_.Task; Executor = $ex }
+    $false
+  } else { $true }
+})
+foreach ($h in $humanHeld) { Log "$($h.Task) — пропущена: исполнитель $($h.Executor)." }
+
+if (-not $queue -or $queue.Count -eq 0) {
+  $tail = if ($humanHeld.Count) { " Задач у людей: $($humanHeld.Count) ($(($humanHeld | ForEach-Object { $_.Task }) -join ', '))." } else { '' }
+  Log "Очередь пуста — нет задач $taskIdPrefix-NN в tasks/, которые ведёт фабрика.$tail"
+  exit 1
+}
 
 Log "=== ОВЕРНАЙТ run-all старт. Задач в очереди: $($queue.Count) (PerTaskMax=$PerTaskMax, model=$modelLabel). ==="
 Log "Очередь: $((($queue | ForEach-Object { $_.Task }) -join ', '))"
