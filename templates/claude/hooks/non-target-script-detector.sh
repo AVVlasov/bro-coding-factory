@@ -47,8 +47,11 @@ fi
 python - "${paths[@]}" <<'PY'
 import fnmatch, os, re, sys
 
-# Только эти расширения — продуктовый код, где UI-копи живут.
-SCAN_EXT = {'.ts', '.tsx', '.js', '.jsx', '.css', '.scss', '.vue', '.svelte', '.html'}
+# Только эти расширения — продуктовый код, где UI-копи живут. В серверном Java-проекте
+# строки интерфейса лежат в .java и в ресурсах (messages*.properties, application*.yml),
+# и артефакт декодирования модели пройдёт мимо детектора, если их не сканировать.
+SCAN_EXT = {'.ts', '.tsx', '.js', '.jsx', '.css', '.scss', '.vue', '.svelte', '.html',
+            '.java', '.properties', '.yml', '.yaml'}
 # Только эти каталоги — продуктовая зона. docs/, scripts/, tests/, .claude/ — пропуск.
 # Список задаётся проектом: hooks-config.json → product_paths. Дефолт узкий намеренно —
 # гейт, который сканирует весь репозиторий, ловит чужие данные и его выключают целиком.
@@ -93,6 +96,17 @@ for p in sys.argv[1:]:
             lines = f.read().splitlines()
     except (UnicodeDecodeError, OSError):
         continue
+    # В .properties не-ASCII традиционно хранится экранированием \uXXXX (native2ascii),
+    # и иероглиф в такой записи — это последовательность из шести ASCII-символов, мимо
+    # которой регулярное выражение пройдёт молча. Разэкранируем перед проверкой.
+    if os.path.splitext(p)[1].lower() == '.properties':
+        decoded = []
+        for ln in lines:
+            try:
+                decoded.append(re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), ln))
+            except ValueError:
+                decoded.append(ln)
+        lines = decoded
     for i, ln in enumerate(lines, start=1):
         m = RX.search(ln)
         if m:

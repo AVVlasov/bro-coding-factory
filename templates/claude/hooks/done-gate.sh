@@ -11,6 +11,7 @@
 # Universal checks (always on):
 #   0. Verdict gate  — a task claiming a passed final gate needs a fresh PASS verdict file.
 #   1. TypeScript    — tsc --noEmit when TS files changed and tsconfig.json exists.
+#   1b. Java         — mvn test-compile when .java files changed and pom.xml exists.
 #   2. Python        — py_compile on touched .py files.
 #   5. Wrapper       — no NEW API-key env reference introduced outside allowed locations.
 #
@@ -151,6 +152,10 @@ fi
 # Build extension filters from config (ts/py targets).
 ts_targets="$(cfg ts_targets)"; [ -z "$ts_targets" ] && ts_targets=$'.ts\n.tsx'
 py_targets="$(cfg py_targets)"; [ -z "$py_targets" ] && py_targets=$'.py'
+java_targets="$(cfg java_targets)"; [ -z "$java_targets" ] && java_targets=$'.java'
+# Config/resource files carry API keys just as code does: a Spring application.yml with a
+# provider key in it leaks the same secret as a hard-coded constant.
+config_targets="$(cfg config_targets)"
 # Regex alternation from a newline list of extensions, e.g. ".ts\n.tsx" -> "\.ts$|\.tsx$"
 ext_regex() {
   local out=""
@@ -163,9 +168,12 @@ ext_regex() {
 }
 ts_re="$(ext_regex "$ts_targets")"
 py_re="$(ext_regex "$py_targets")"
+java_re="$(ext_regex "$java_targets")"
+cfg_re="$(ext_regex "$config_targets")"
 
 # Filter to files that matter (skip generated/vendored + the harness's own agent definitions).
-match_re="$ts_re|$py_re"
+match_re="$ts_re|$py_re|$java_re"
+[ -n "$cfg_re" ] && match_re="$match_re|$cfg_re"
 [ -n "$migration_dir" ] && match_re="$match_re|^$migration_dir/"
 relevant=$(echo "$changed_files" | grep -E "$match_re" | grep -vE '^(node_modules|dist[^/]*|target|build|out|\.bcf|\.claude/(skills|agents|hooks|commands)/)' || true)
 
@@ -176,6 +184,9 @@ fi
 # Categorize touched layers
 ts_files=$(echo "$relevant" | grep -E "$ts_re" || true)
 py_files=$(echo "$relevant" | grep -E "$py_re" || true)
+java_files=$(echo "$relevant" | grep -E "$java_re" || true)
+cfg_files=""
+[ -n "$cfg_re" ] && cfg_files=$(echo "$relevant" | grep -E "$cfg_re" || true)
 
 # IPC files: only when ipc_dirs configured. Match any configured dir prefix, plus the
 # explicit preload/types files.
@@ -194,7 +205,11 @@ fi
 # Migration files: only when migration_dir configured.
 migration_files=""
 if [ -n "$migration_dir" ]; then
-  migration_files=$(echo "$relevant" | grep -E "^${migration_dir}/[0-9]+_.*\.(ts|tsx|sql|py)$" || true)
+  # Liquibase keeps changesets as .xml/.yaml/.yml alongside plain .sql, so the extension
+  # list is wider than the TypeScript-era one, and they usually live in a subdirectory of
+  # the changelog root. The numeric prefix stays: it is what makes the order of application
+  # readable, and it keeps the master changelog itself out of the list of migrations.
+  migration_files=$(echo "$relevant" | grep -E "^${migration_dir}/([^/]+/)*[0-9]+[-_].*\.(ts|tsx|sql|py|xml|yaml|yml)$" || true)
 fi
 
 failures=()
@@ -206,6 +221,29 @@ if [ -n "$ts_files" ] && [ -f tsconfig.json ] && command -v npx >/dev/null 2>&1;
   if [ "$tsc_exit" != "0" ] && [ "$tsc_exit" != "124" ]; then
     first=$(echo "$tsc_out" | head -8)
     failures+=("tsc --noEmit failed (exit $tsc_exit). First errors:|$first")
+  fi
+fi
+
+# --- 1b. Java: compile main AND test sources (Maven) ---
+# test-compile, not compile: the compile phase skips src/test/java, so a broken test
+# source would sail past this gate and burn a whole verification round instead.
+# No -o (offline): on a cold local repository offline mode fails for a reason that has
+# nothing to do with the agent's work, and a gate that is red for its own reasons gets
+# switched off. The offline flag belongs in backpressure.typecheck, after the cache is warm.
+if [ -n "$java_files" ] && [ -f pom.xml ]; then
+  mvn_cmd=""
+  if [ -f ./mvnw ]; then mvn_cmd="./mvnw"
+  elif [ -f ./mvnw.cmd ]; then mvn_cmd="./mvnw.cmd"
+  elif command -v mvn >/dev/null 2>&1; then mvn_cmd="mvn"
+  fi
+  if [ -n "$mvn_cmd" ]; then
+    mvn_out=$(timeout 300 "$mvn_cmd" -B -q -DskipTests test-compile 2>&1)
+    mvn_exit=$?
+    if [ "$mvn_exit" != "0" ] && [ "$mvn_exit" != "124" ]; then
+      first=$(echo "$mvn_out" | grep -E '\[ERROR\]|error:' | head -8)
+      [ -z "$first" ] && first=$(echo "$mvn_out" | tail -8)
+      failures+=("$mvn_cmd -DskipTests test-compile failed (exit $mvn_exit). First errors:|$first")
+    fi
   fi
 fi
 
@@ -258,11 +296,32 @@ if [ -n "$ipc_files" ] && [ -n "$ipc_preload_file" ] && [ -n "$ipc_types_file" ]
 fi
 
 # --- 4. Migration registration (project-specific; no-op unless migration_index_file set) ---
+#         A Liquibase master changelog registers changesets with <include file="..."/> or
+#         <includeAll path="..."/>; a file mentioned nowhere simply never runs, and the
+#         schema quietly stays behind while every gate is green.
 if [ -n "$migration_files" ] && [ -n "$migration_index_file" ] && [ -f "$migration_index_file" ]; then
+  is_changelog=0
+  grep -qiE 'databaseChangeLog|includeAll|<include' "$migration_index_file" 2>/dev/null && is_changelog=1
   for mig in $migration_files; do
     base=$(basename "$mig"); base="${base%.*}"
     if echo "$untracked" | grep -qx "$mig" 2>/dev/null; then
-      if ! grep -q "$base" "$migration_index_file"; then
+      if [ "$is_changelog" = "1" ]; then
+        # Registered = an include naming this file, or an includeAll over its directory.
+        mig_dir=$(dirname "$mig")
+        registered=0
+        grep -qE "include[^>]*[\"'][^\"']*$(basename "$mig")[\"']" "$migration_index_file" 2>/dev/null && registered=1
+        if [ "$registered" = "0" ]; then
+          while IFS= read -r inc_path; do
+            [ -z "$inc_path" ] && continue
+            inc_path="${inc_path%/}"
+            case "$mig_dir" in "$inc_path"|"$inc_path"/*) registered=1 ;; esac
+            case "$mig" in *"$inc_path"/*) registered=1 ;; esac
+          done <<< "$(grep -oE "includeAll[^>]*path=[\"'][^\"']+[\"']" "$migration_index_file" 2>/dev/null | grep -oE "path=[\"'][^\"']+" | sed -E "s/path=[\"']//")"
+        fi
+        if [ "$registered" = "0" ]; then
+          failures+=("New Liquibase changeset $mig is not reached from $migration_index_file (no <include file=...> and no <includeAll path=...>)|it will never run: the schema stays behind while the gate is green")
+        fi
+      elif ! grep -q "$base" "$migration_index_file"; then
         failures+=("New migration $mig not registered in $migration_index_file|will not apply")
       fi
     fi
@@ -312,7 +371,7 @@ fi
 
 # --- 5. Wrapper-principle: API-key reference INTRODUCED in this session ---
 # (legacy violations are not blocked — those are pre-existing debt the user knows about)
-if [ -n "$ts_files" ] || [ -n "$py_files" ]; then
+if [ -n "$ts_files" ] || [ -n "$py_files" ] || [ -n "$java_files" ] || [ -n "$cfg_files" ]; then
   introduced_keys=""
   for f in $relevant; do
     [ -f "$f" ] || continue

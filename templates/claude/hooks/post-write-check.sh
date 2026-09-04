@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs fast validation after writing TypeScript or Python files.
+# Runs fast validation after writing TypeScript, Java or Python files.
 # Receives JSON via stdin: {"tool_name":"Write|Edit","tool_input":{"file_path":"..."},"tool_result":...}
 
 set -euo pipefail
@@ -51,6 +51,43 @@ if [[ "$ext" == "ts" || "$ext" == "tsx" ]]; then
   # Check for string interpolation in SQL
   if grep -qnE '`\s*(SELECT|INSERT|UPDATE|DELETE).*\$\{' "$file_path" 2>/dev/null; then
     violations="${violations}\n- SQL string interpolation detected — use parametrized queries only"
+  fi
+
+  if [ -n "$violations" ]; then
+    echo "{\"continue\": true, \"systemMessage\": \"⚠️ Code quality issues in $(basename $file_path):$(echo -e "$violations")\"}"
+  fi
+fi
+
+# --- Java: check for forbidden patterns ---
+if [[ "$ext" == "java" ]]; then
+  violations=""
+
+  # Печать в стандартный поток вместо логгера: в сервисе такой вывод не попадает
+  # ни в один журнал и теряется вместе с окном.
+  if grep -qn "System\.out\.print" "$file_path" 2>/dev/null; then
+    violations="${violations}\n- System.out.print* found — use the project logger (SLF4J), not stdout"
+  fi
+
+  # Проглоченное исключение: стек уходит в консоль, вызывающий получает «всё хорошо».
+  if grep -qn "printStackTrace()" "$file_path" 2>/dev/null; then
+    violations="${violations}\n- e.printStackTrace() found — log with context or rethrow"
+  fi
+  if grep -qnE 'catch\s*\([^)]*\)\s*\{\s*\}' "$file_path" 2>/dev/null; then
+    violations="${violations}\n- empty catch block — a swallowed exception is a silent failure"
+  fi
+
+  # Конкатенация переменной в SQL/JPQL — то же самое, что f-строка в Python.
+  if grep -qnE '"\s*(SELECT|INSERT|UPDATE|DELETE|FROM)[^"]*"\s*\+' "$file_path" 2>/dev/null; then
+    violations="${violations}\n- SQL/JPQL built by string concatenation — use bound parameters only"
+  fi
+
+  # Тот же архитектурный запрет, что и для UI-слоя: граница описана в конфиге.
+  rdir=$(hooks_cfg renderer_dir)
+  rimp=$(hooks_cfg renderer_forbidden_import)
+  if [ -n "$rdir" ] && [ -n "$rimp" ] \
+     && echo "$normalized" | grep -q "/${rdir%/}/" \
+     && grep -qnE "$rimp" "$file_path" 2>/dev/null; then
+    violations="${violations}\n- forbidden import in ${rdir} (matches ${rimp}) — go through the declared boundary instead"
   fi
 
   if [ -n "$violations" ]; then

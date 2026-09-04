@@ -33,6 +33,23 @@ if command -v git &>/dev/null; then
   fi
 fi
 
+# --- Check for stdout printing / swallowed exceptions in modified Java files ---
+if command -v git &>/dev/null; then
+  # Наличие, а не счёт: под `set -o pipefail` конструкция `... | wc -l || echo 0`
+  # печатает ДВА нуля (grep без совпадений роняет весь конвейер, и запасной echo
+  # срабатывает поверх честного нуля от wc), после чего сравнение чисел падает
+  # с «integer expression expected».
+  changed_java=$(git -C "$project_dir" diff --name-only 2>/dev/null | grep -E '\.java$' || true)
+  if [ -n "$changed_java" ]; then
+    if printf '%s\n' "$changed_java" | xargs grep -lE 'System\.out\.print' 2>/dev/null | grep -q . ; then
+      summary="${summary}\n- System.out.print* in modified Java files — use the project logger"
+    fi
+    if printf '%s\n' "$changed_java" | xargs grep -lE 'printStackTrace\(\)' 2>/dev/null | grep -q . ; then
+      summary="${summary}\n- printStackTrace() in modified Java files — log with context or rethrow"
+    fi
+  fi
+fi
+
 # --- Check for print() in modified Python files ---
 if command -v git &>/dev/null; then
   print_count=$(git -C "$project_dir" diff --name-only 2>/dev/null | \
