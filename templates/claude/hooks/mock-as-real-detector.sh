@@ -32,10 +32,13 @@ except Exception:
     raise SystemExit(0)
 v = cfg.get(os.environ['CFG_KEY']) or []
 print('\n'.join(str(x) for x in v))
-" 2>/dev/null && return
+" 2>/dev/null | tr -d '\r' && return
   done
   echo ""
 }
+# tr -d '\r' обязателен: на Windows python печатает \r\n, и первый элемент списка
+# приезжает как "src/main/java\r". Каталога с таким именем нет, проверка -d молча ложна,
+# и детектор обходит продуктовый код стороной, оставаясь зелёным.
 
 prod_paths=()
 while IFS= read -r d; do

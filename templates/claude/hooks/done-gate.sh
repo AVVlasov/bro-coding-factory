@@ -29,11 +29,15 @@ config_file="${BCF_HOOKS_CONFIG:-$script_dir/hooks-config.json}"
 
 # Read a config value via python. $1=jq-style dotted/bracket path handled in python; we keep
 # it simple: $1 is a top-level key. Lists are returned newline-joined.
+# Хвостовой \r отрезается намеренно. На Windows python печатает перевод строки как
+# \r\n, и в списке из двух и более значений первое приезжало как ".ts\r". Дальше из него
+# собирается регулярное выражение "\.ts\r$", которое не совпадает ни с одним файлом:
+# гейт не ошибался, он просто не видел .ts-файлы вовсе и выходил нулём.
 cfg() {
   local key="$1"
   [ -f "$config_file" ] || return 0
   command -v python >/dev/null 2>&1 || return 0
-  python - "$config_file" "$key" <<'PY' 2>/dev/null || true
+  python - "$config_file" "$key" <<'PY' 2>/dev/null | tr -d '\r' || true
 import json, sys
 try:
     cfg = json.load(open(sys.argv[1], encoding='utf-8'))

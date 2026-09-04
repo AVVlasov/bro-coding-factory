@@ -20,7 +20,9 @@ ext="${file_path##*.}"
 hooks_cfg() {
   for cand in .claude/hooks/hooks-config.json hooks-config.json; do
     [ -f "$cand" ] || continue
-    python -c "import json,sys; print(json.load(open('$cand',encoding='utf-8')).get('$1','') or '')" 2>/dev/null && return
+    # tr -d '\r': на Windows python печатает \r\n, и значение приезжает с хвостовым
+    # возвратом каретки — сравнение и подстановка в регулярное выражение молча ломаются.
+    python -c "import json,sys; print(json.load(open('$cand',encoding='utf-8')).get('$1','') or '')" 2>/dev/null | tr -d '\r' && return
   done
   echo ""
 }
