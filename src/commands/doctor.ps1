@@ -329,6 +329,62 @@ foreach ($bin in ($missingBins.Keys | Sort-Object)) {
     $bad++
 }
 
+# --- Maven: обёртка, JDK, Docker ------------------------------------------------------
+#
+# Тот же класс, что и npx выше, только грабли другие. Обёртка mvnw.cmd лежит в проекте,
+# а не в PATH: её отсутствие превращает каждый гейт в «команда не найдена». JDK Maven
+# берёт из JAVA_HOME, и версия здесь не косметика — Spring Boot 4 не соберётся на 17.
+# Testcontainers поднимают контейнеры: без запущенного Docker падают ВСЕ интеграционные
+# тесты разом, и выглядит это как сломанная фича, а не как выключенный демон.
+$mavenCmds = @($allCmds | Where-Object { $_ -and ([string]$_) -match '(^|\s)(\.[\\/])?mvnw(\.cmd)?(\s|$)|(^|\s)mvn(\s|$)' })
+$hasPom = Test-Path (Join-Path $project 'pom.xml')
+if ($mavenCmds.Count -or $hasPom) {
+    $wrapper = @('mvnw.cmd', 'mvnw') | Where-Object { Test-Path (Join-Path $project $_) } | Select-Object -First 1
+    $mvnOnPath = [bool](Get-Command mvn -ErrorAction SilentlyContinue)
+    if ($wrapper) {
+        Write-BcfOk "обёртка Maven: $wrapper"
+    } elseif ($mvnOnPath) {
+        Write-BcfWarn 'обёртки mvnw.cmd в проекте нет — гейты пойдут через mvn из PATH'
+        Write-BcfNote 'версия Maven тогда не закреплена проектом: у агента и у CI она может отличаться'
+        $warn++
+    } else {
+        Write-BcfFail 'гейт нечем выполнить: ни mvnw.cmd в проекте, ни mvn в PATH'
+        Write-BcfNote ('команды: ' + (($mavenCmds | Select-Object -First 2) -join ' ; '))
+        $bad++
+    }
+
+    # JAVA_HOME окружения проекта важнее глобального: у Maven именно он решает, каким JDK
+    # собирать, и запуск «из PATH» может оказаться совсем другой версией.
+    $javaHome = if ($env:JAVA_HOME -and (Test-Path $env:JAVA_HOME)) { $env:JAVA_HOME } else { '' }
+    $javaExe = if ($javaHome) { Join-Path $javaHome 'bin\java.exe' } else { 'java' }
+    if ($javaHome -and -not (Test-Path $javaExe)) { $javaExe = 'java' }
+    $javaOut = ''
+    try { $javaOut = (& $javaExe -version 2>&1 | Out-String) } catch { $javaOut = '' }
+    if ($javaOut -match '(?m)version "?(\d+)') {
+        $where = if ($javaHome -and $javaExe -ne 'java') { "JAVA_HOME=$javaHome" } else { 'из PATH' }
+        Write-BcfOk "JDK $($Matches[1])   ($where)"
+    } else {
+        Write-BcfFail 'JDK не отвечает: java -version ничего не вернул'
+        Write-BcfNote 'Maven возьмёт JDK из JAVA_HOME; без него не соберётся ни один гейт'
+        $bad++
+    }
+
+    # Docker спрашиваем только тогда, когда проект действительно объявил Testcontainers.
+    # Иначе это ругань на то, что проекту не нужно, — а такую ругань перестают читать.
+    $pomRaw = if ($hasPom) { Get-Content -Raw -LiteralPath (Join-Path $project 'pom.xml') -ErrorAction SilentlyContinue } else { '' }
+    if ($pomRaw -match 'testcontainers') {
+        $dockerOut = ''
+        try { $dockerOut = (& docker info --format '{{.ServerVersion}}' 2>&1 | Out-String) } catch { $dockerOut = '' }
+        if ($LASTEXITCODE -eq 0 -and $dockerOut.Trim()) {
+            Write-BcfOk "Docker для Testcontainers: сервер $($dockerOut.Trim())"
+        } else {
+            Write-BcfFail 'Docker не отвечает, а проект объявил Testcontainers'
+            Write-BcfNote 'все интеграционные тесты упадут разом, и это будет выглядеть поломкой фичи'
+            $bad++
+        }
+    }
+}
+
 # --- ЧТО ДОКАЗЫВАЕТ ЗЕЛЁНЫЙ ПРОГОН ------------------------------------------------------
 #
 # Разбор clinic-scheduler (2026-08-09): прогон закрыл 35 задач из 35 и напечатал COMPLETE,
