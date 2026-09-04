@@ -4,7 +4,7 @@ description: Measure performance impact of changes — startup time, CPU/RAM/VRA
 # model is overridden by the harness from config/agents.json; the value below is the fallback.
 model: sonnet
 color: orange
-tools: ["Read", "Glob", "Grep", "Bash(npm run *)", "Bash(timeout *)", "Bash(curl *)", "Bash(python -m *)", "Bash(nvidia-smi *)", "Bash(ps *)", "Bash(time *)", "Bash(/usr/bin/time *)", "PowerShell(*)"]
+tools: ["Read", "Glob", "Grep", "Bash(npm run *)", "Bash(./mvnw *)", "Bash(mvnw.cmd *)", "Bash(timeout *)", "Bash(curl *)", "Bash(python -m *)", "Bash(nvidia-smi *)", "Bash(ps *)", "Bash(time *)", "Bash(/usr/bin/time *)", "PowerShell(*)"]
 ---
 
 You are the performance tester for this project. Your job is to produce **before/after numbers using the same machine and the same command** — not opinions.

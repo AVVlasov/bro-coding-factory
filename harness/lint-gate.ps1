@@ -5,7 +5,7 @@
 # правила (console в определённых директориях, запрещённые UI-паттерны, non-target-script
 # детектор) настраиваются в hooks/hooks-config.json — по умолчанию выключены (no-op).
 #
-# Этот скрипт — gate: запускается из loop.ps1 как часть backpressure после tsc/done-gate.
+# Этот скрипт — gate: запускается из loop.ps1 после быстрой проверки и done-gate.
 # Падение правил → агент должен это исправить ДО создания VERIFY-REQUEST.
 #
 # Exit codes:
@@ -104,14 +104,26 @@ if ($consoleHits) {
     }
 }
 
-# 2b. bare catch — pattern `catch (e?: any) { ... }` или `catch { }`.
+# 2b. bare catch — `catch (e) { }` в TypeScript и `catch (Exception e) { }` в Java.
+#     Java здесь не «ещё один язык»: пустой catch — ровно та ошибка, ради которой
+#     правило заведено, и в Java она пишется чаще всего, потому что компилятор требует
+#     обработать проверяемое исключение, а пустой блок это требование формально закрывает.
+#     Расширения задаются проектом (hooks-config.json → bare_catch_targets).
+$bareCatchExts = @('.ts', '.java')
+if ($HooksCfg -and $HooksCfg.bare_catch_targets) { $bareCatchExts = @($HooksCfg.bare_catch_targets) }
 $bareCatchHits = @()
-$tsFiles = Get-ChildItem -LiteralPath $Repo -Filter '*.ts' -Recurse -ErrorAction SilentlyContinue |
-           Where-Object { $_.FullName -notmatch '\\node_modules\\|\\dist\\|\\dist-electron\\|\\.venv\\|\\harness\\.venv\\' }
-foreach ($f in $tsFiles | Select-Object -First 200) {  # сэмплируем для скорости
+$catchFiles = @()
+foreach ($ext in $bareCatchExts) {
+    $mask = '*' + ($ext -replace '^\*', '')
+    $catchFiles += Get-ChildItem -LiteralPath $Repo -Filter $mask -Recurse -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -notmatch '\\node_modules\\|\\dist\\|\\dist-electron\\|\\target\\|\\.venv\\|\\harness\\.venv\\' }
+}
+foreach ($f in $catchFiles | Select-Object -First 200) {  # сэмплируем для скорости
     $content = Get-Content -Raw -LiteralPath $f.FullName -ErrorAction SilentlyContinue
-    if ($content -match 'catch\s*\(\s*[A-Za-z_]\w*\s*\)\s*\{\s*\}' -or
-        $content -match 'catch\s*\(\s*[A-Za-z_]\w*\s*:\s*any\s*\)\s*\{\s*[^}]{0,20}\}' -or
+    if (-not $content) { continue }
+    # Java: catch (IOException e) { } — любой список параметров, пустое тело.
+    if ($content -match 'catch\s*\(\s*[A-Za-z_]\w*\s*:\s*any\s*\)\s*\{\s*[^}]{0,20}\}' -or
+        $content -match 'catch\s*\(\s*[^)]*\)\s*\{\s*\}' -or
         $content -match 'catch\s*\{\s*\}') {
         $bareCatchHits += $f.FullName.Substring($Repo.Length).TrimStart('\','/')
     }
@@ -170,18 +182,37 @@ if ($HooksCfg -and $HooksCfg.PSObject.Properties['time_dependent_tests']) {
 # не может доказать себя, не нарушив правило проекта.
 if ($env:BCF_TIME_DEPENDENT_TESTS -eq '1') { $timeDepEnabled = $true }
 if ($timeDepEnabled) {
+    # Где лежат тесты. В JS-раскладке они внутри productPaths, и отдельный список не нужен.
+    # В Maven тесты живут в src/test/java, а productPaths по инструкции указывает на
+    # src/main/java — то есть правило про часы не проверило бы ни одного файла, и маски
+    # *Test/*Tests/*IT остались бы украшением. Список задаётся ключом test_paths, а при
+    # его отсутствии в проекте с pom.xml берётся стандартная раскладка Maven: каталог
+    # src/test/java задан спецификацией сборки, а не вкусом проекта.
+    $TestPaths = @()
+    if ($HooksCfg -and $HooksCfg.test_paths) { $TestPaths = @($HooksCfg.test_paths) }
+    elseif (Test-Path (Join-Path $Repo 'pom.xml')) {
+        $TestPaths = @(Get-ChildItem -LiteralPath $Repo -Recurse -Directory -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match '[\\/]src[\\/]test[\\/]java$' -and $_.FullName -notmatch '[\\/]target[\\/]' } |
+                       ForEach-Object { $_.FullName.Substring($Repo.Length).TrimStart('\', '/') })
+    }
     $timeHits = @()
-    foreach ($d in $ProductPaths) {
+    foreach ($d in (@($ProductPaths) + @($TestPaths) | Select-Object -Unique)) {
         $dir = Join-Path $Repo $d
         if (-not (Test-Path $dir)) { continue }
+        # Маски тестовых файлов: vitest/jest, pytest и JUnit. У JUnit имя файла — это
+        # соглашение surefire (*Test, *Tests) и failsafe (*IT), другого признака «это тест»
+        # в Java нет.
         $testFiles = Get-ChildItem -Path $dir -Recurse -File -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Name -match '\.(test|spec)\.[jt]sx?$' -or $_.Name -match '_test\.py$' }
+                     Where-Object { $_.Name -match '\.(test|spec)\.[jt]sx?$' -or $_.Name -match '_test\.py$' -or
+                                    $_.Name -match '(Test|Tests|IT)\.java$' }
         foreach ($tf in $testFiles) {
             $c = Get-Content -Raw -LiteralPath $tf.FullName -ErrorAction SilentlyContinue
             if (-not $c) { continue }
             # Подменённое время — это ПИНОВКА, а не зависимость: пропускаем.
-            if ($c -match 'useFakeTimers|setSystemTime|MockDate|freeze_time|freezegun') { continue }
-            $m = [regex]::Match($c, 'new\s+Date\s*\(\s*\)|Date\.now\s*\(\s*\)|\btoday\s*\(\s*\)|datetime\.now\s*\(')
+            # В Java пиновка выглядит как внедрённый Clock.fixed(...) либо подмена
+            # статического вызова через Mockito.mockStatic.
+            if ($c -match 'useFakeTimers|setSystemTime|MockDate|freeze_time|freezegun|Clock\.fixed\s*\(|mockStatic\s*\(') { continue }
+            $m = [regex]::Match($c, 'new\s+Date\s*\(\s*\)|Date\.now\s*\(\s*\)|\btoday\s*\(\s*\)|datetime\.now\s*\(|\b(LocalDate|LocalDateTime|LocalTime|ZonedDateTime|OffsetDateTime|Instant|Year|YearMonth)\.now\s*\(')
             if ($m.Success) {
                 $line = ($c.Substring(0, $m.Index) -split "`n").Count
                 $timeHits += "$($tf.FullName.Substring($Repo.Length).TrimStart('\','/')):$line  $($m.Value)"
@@ -193,7 +224,7 @@ if ($timeDepEnabled) {
             check       = 'time-dependent-test'
             severity    = 'error'
             count       = $timeHits.Count
-            remediation = 'Тест берёт «сейчас» из системных часов и не подменяет время. Результат такого теста зависит от дня прогона: он бывает зелёным в будни и красным в выходные, и тогда зелёный гейт ничего не доказывает. Зафиксируй дату явно (vi.setSystemTime / freeze_time) либо передавай дату параметром.'
+            remediation = 'Тест берёт «сейчас» из системных часов и не подменяет время. Результат такого теста зависит от дня прогона: он бывает зелёным в будни и красным в выходные, и тогда зелёный гейт ничего не доказывает. Зафиксируй дату явно (vi.setSystemTime / freeze_time / Clock.fixed) либо передавай дату параметром.'
             tail        = ($timeHits | Select-Object -First 15) -join "`n"
         }
     }
@@ -232,7 +263,12 @@ if ((Test-Path $detectorPath) -and $gitBash -and (Test-Path $gitBash)) {
     foreach ($d in $ProductPaths) {
         $dir = Join-Path $Repo $d
         if (Test-Path $dir) {
-            $targets += Get-ChildItem -Path $dir -Recurse -File -Include '*.ts','*.tsx','*.js','*.jsx','*.css','*.scss','*.vue','*.svelte','*.html' -ErrorAction SilentlyContinue |
+            # Расширения перечислены здесь, а не в детекторе: детектор получает готовый
+            # список файлов. Пока в списке были только веб-расширения, серверный Java-проект
+            # отдавал детектору ноль файлов, и правило существовало только на бумаге —
+            # строки интерфейса там лежат в .java и в ресурсах (messages*.properties,
+            # application*.yml).
+            $targets += Get-ChildItem -Path $dir -Recurse -File -Include '*.ts','*.tsx','*.js','*.jsx','*.css','*.scss','*.vue','*.svelte','*.html','*.java','*.properties','*.yml','*.yaml' -ErrorAction SilentlyContinue |
                 ForEach-Object { $_.FullName -replace '\\','/' }
         }
     }

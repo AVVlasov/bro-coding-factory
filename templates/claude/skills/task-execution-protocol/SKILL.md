@@ -39,8 +39,8 @@ description: Use at the START of any task from tasks/ (STACK-NN and others), bef
 | Слой подзадачи | Субагент |
 |----------------|----------|
 | Процессы, службы, жизненный цикл приложения | профильный агент слоя из `.claude/agents/` |
-| React / страницы / компоненты | `react-ui-developer` |
-| FastAPI / Python | `python-backend-developer` |
+| Экраны и компоненты интерфейса | профильный агент слоя из `.claude/agents/` |
+| Серверная логика и слой данных | профильный агент слоя из `.claude/agents/` |
 | Миграции БД | `db-migration-writer` |
 | Адаптеры внешних сервисов / транспорт | профильный агент слоя из `.claude/agents/` |
 | Навигация по коду «где это» | `codebase-explorer` |
@@ -50,8 +50,11 @@ description: Use at the START of any task from tasks/ (STACK-NN and others), bef
 ## Фазы A..E
 
 - **A — Реализация** по §2 задачи (vertical slice: IPC закрывается тремя местами разом).
-- **B — Самопроверка:** `tsc --noEmit` / `pytest` — прочитать exit code; для UI — поднять
-  0 ошибок в консоли приложения. Скил `/self-verification`.
+- **B — Самопроверка:** прогнать команды из `config/harness.json` → `backpressure.typecheck`
+  и прочитать exit code; для UI — поднять 0 ошибок в консоли приложения. Скил
+  `/self-verification`. Имя инструмента здесь не называется намеренно: в отчёт попадала
+  строка `npx tsc --noEmit → exit 0` из проекта, где ни tsc, ни npx нет, — доказательство
+  появлялось без проверки.
 - **C — Тестеры:** `/verify STACK-NN` → `architecture` (всегда) + `api` /
   `db-migration-writer` / `performance` по затронутым слоям.
 - **D — Визуальная проверка:** UI-задача → `/red-team`, vision `total ≥ 40` в 4 темах,
@@ -116,7 +119,7 @@ description: Use at the START of any task from tasks/ (STACK-NN and others), bef
 - Заблокировано: <что и чем блокировано; «нет», если ничего>
 
 **Проверено (чем):**
-- npx tsc --noEmit → exit 0
+- <команда быстрой проверки из config/harness.json → backpressure.typecheck> → exit <код>
 - <тест / grep / прогон + фактический результат>
 - НЕ проверено: <честно — тестеры, судья, verdict-файл, незакрытые assertions>
 

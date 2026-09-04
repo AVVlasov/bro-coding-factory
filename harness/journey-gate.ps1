@@ -40,6 +40,10 @@
 #   }
 #
 #   command  — чем сценарии прогоняются. Пусто = взять tests.command из harness.json.
+#   commandOne — чем прогоняется ОДИН сценарий; {id} подставляется. Обязателен для всего,
+#              кроме vitest и jest: только у них есть флаг -t, которым гейт добирает
+#              поштучную атрибуцию. Для Maven это ".\\mvnw.cmd -B verify -Dit.test={id}"
+#              (failsafe) или "-Dtest={id}" (surefire).
 #   id       — обязан дословно встречаться в выводе прогона (проще всего — в имени теста).
 #   proof    — путь к файлу, который сценарий доказывает. Обязан существовать.
 #   status   — "required" (по умолчанию) или "planned".
@@ -183,17 +187,35 @@ if (-not $cmd) {
 # Команда для ОДНОГО сценария. Нужна там, где важно не «всё зелено», а «какой именно
 # путь красный»: гейт слияния сравнивает множество зелёных путей до и после, и без
 # поштучной атрибуции он не отличит поломку от чужого предсуществующего долга.
-# {id} подставляется; если шаблона нет — берём общую команду и фильтр по имени теста.
+# {id} подставляется.
+#
+# ФОЛБЭК СУЖЕН ДО ТОГО, ГДЕ ОН ВЕРЕН. Раньше при пустом commandOne команда собиралась
+# как «общая команда + флаг -t <id>». Флаг -t понимают vitest и jest, и больше никто:
+# Maven, pytest, cargo и go на нём валятся разбором аргументов, а гейт истолковывал это
+# как «сценарий красный». Проект узнавал не о том, что у него нет команды поштучного
+# прогона, а о том, что у него якобы сломан сквозной путь — и чинил не то.
 $cmdOne = if ($reg.commandOne) { [string]$reg.commandOne } else { '' }
+$cmdOneFallbackOk = ($cmd -match '(?i)(^|[\\/\s])(vitest|jest)([\s"'']|$)')
+$cmdOneRefusal = "journeys.commandOne не задан, а общая команда — не vitest и не jest (`$cmd`). Флаг -t, из которого собирался фолбэк, понимают только они: Maven, pytest, cargo и go на нём падают разбором аргументов, и гейт назвал бы это «сценарий красный». Задай commandOne с подстановкой {id}, например `.\mvnw.cmd -B verify -Dit.test={id}`."
+
+# Возвращает Code/Out, либо Refused=$true, если поштучный прогон собрать нечем.
+# Отказ вслух вместо заведомо неверной команды: неверная команда даёт красный сценарий
+# и посылает чинить продукт вместо конфига.
 function Invoke-One([string]$id) {
+    if (-not $cmdOne -and -not $cmdOneFallbackOk) { return @{ Refused = $true; Code = 2; Out = '' } }
     $c = if ($cmdOne) { $cmdOne -replace '\{id\}', $id } else { "$cmd -t `"$id`"" }
     $o = (& pwsh -NoProfile -NonInteractive -Command $c 2>&1 | Out-String)
-    return @{ Code = $LASTEXITCODE; Out = $o }
+    return @{ Refused = $false; Code = $LASTEXITCODE; Out = $o }
 }
 
 if ($Only) {
     # Одиночный прогон: вопрос «работает ли ИМЕННО этот путь», а не «всё ли зелено».
     $r1 = Invoke-One $Only
+    if ($r1.Refused) {
+        if (-not $Json) { Write-Host "journey-gate: $cmdOneRefusal" -ForegroundColor Red }
+        foreach ($r in $results) { $r.status = 'no-command' }
+        Out-Result 'fail' $cmdOneRefusal $results 1
+    }
     $ran = ($r1.Out -match [regex]::Escape($Only))
     $ok  = ($r1.Code -eq 0) -and $ran
     foreach ($r in $results) { $r.status = $(if ($ok) { 'ok' } elseif ($ran) { 'red' } else { 'silent' }) }
@@ -227,10 +249,12 @@ foreach ($r in $results) { if ($r.status -eq 'ran' -and -not $runFailed) { $r.st
 # гейт слияния сравнивает множества зелёных путей до и после и без атрибуции считал бы
 # «красным всё» — то есть не отличал бы поломку от чужого долга и не блокировал бы
 # вообще ничего. Доплачиваем прогоном на путь только когда общий прогон уже красный.
+$attributionRefused = $false
 if ($runFailed -and $Json) {
     foreach ($r in $results) {
         if ($r.status -eq 'silent') { continue }
         $one = Invoke-One $r.id
+        if ($one.Refused) { $attributionRefused = $true; $r.status = 'no-command'; continue }
         $r.status = if (($one.Code -eq 0) -and ($one.Out -match [regex]::Escape($r.id))) { 'ok' } else { 'red' }
     }
 }
@@ -241,6 +265,9 @@ if ($runFailed -or $silent.Count) {
     if (-not $Json) {
         if ($runFailed) {
             Write-Host "ПРОВАЛ: прогон сценариев завершился кодом $code — сквозной путь сломан." -ForegroundColor Red
+            if (-not $cmdOne -and -not $cmdOneFallbackOk) {
+                Write-Host "Какой именно путь красный — не установлено: $cmdOneRefusal" -ForegroundColor Red
+            }
         }
         if ($silent.Count) {
             Write-Host "ПРОВАЛ: сценарии объявлены, но в выводе прогона не встретились: $($silent -join ', ')" -ForegroundColor Red
@@ -251,6 +278,7 @@ if ($runFailed -or $silent.Count) {
     $why = @()
     if ($runFailed) { $why += "прогон упал (exit $code)" }
     if ($silent.Count) { $why += "не прогнаны: $($silent -join ', ')" }
+    if ($attributionRefused) { $why += "поштучная атрибуция не сделана: $cmdOneRefusal" }
     Out-Result 'fail' ($why -join '; ') $results 1
 }
 
