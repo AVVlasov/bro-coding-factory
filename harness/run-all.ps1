@@ -7,7 +7,9 @@
 # (если предшественник не PASS — задача-наследник заблокируется и попадёт в «не сделано»).
 #
 # Подавляет per-task попапы Windows (в loop.ps1 через -AutoAdvance); в конце — ОДИН итоговый
-# REVIEW.md + одно окно + звук.
+# REVIEW.md, машиночитаемый run-all.status.json, код возврата и короткий звук. Модальных
+# окон не показывает: окно держит процесс до нажатия ОК, то есть прогон по расписанию не
+# заканчивается, а висит.
 #
 # Модель и task-id префикс берутся из config/harness.json (models.code, taskIdPrefix) —
 # не хардкодятся. loop.ps1 запускается через $PSScriptRoot.
@@ -480,17 +482,20 @@ if ($rep.complete) {
   Log "=== run-all завершён НЕПОЛНО: PASS $($rep.passed)/$($rep.total); НЕ закрыто $($rep.stuck) (человек: $($rep.needsHuman), каскад-гейт: $($rep.gateBlocked)). Итог — .bcf/REVIEW.md. ==="
   try { [console]::beep(660, 200); Start-Sleep -Milliseconds 110; [console]::beep(440, 450) } catch { }   # нисходящий = внимание
 }
-try {
-  Add-Type -AssemblyName System.Windows.Forms
-  if ($rep.complete) {
-    [System.Windows.Forms.MessageBox]::Show(
-      "Overnight run-all завершён.`nЗакрыто PASS: $($rep.passed) из $($rep.total) — ВСЁ закрыто.`n`nИтог — .bcf/REVIEW.md",
-      "Ralph run-all: готово", 'OK', 'Information') | Out-Null
-  } else {
-    [System.Windows.Forms.MessageBox]::Show(
-      "Очередь пройдена, но НЕ ВСЁ закрыто.`n`nЗакрыто PASS: $($rep.passed) из $($rep.total).`nНе закрыто: $($rep.stuck) (требуют тебя: $($rep.needsHuman), каскад-гейт: $($rep.gateBlocked)).`n`nПочини первым: $($rep.rootList)`nЗатем перезапусти прогон.`n`nИтог — .bcf/REVIEW.md",
-      "Ralph run-all: НЕЗАКРЫТО — нужно ревью", 'OK', 'Warning') | Out-Null
-  }
-} catch { }
-
-if ($rep.complete) { exit 0 } else { exit 1 }
+# ИТОГ ГОВОРИТСЯ В КОНСОЛЬ И В ФАЙЛЫ, А НЕ ОКНОМ.
+#
+# Здесь стоял [System.Windows.Forms.MessageBox]::Show в обеих ветках. Модальное окно
+# держит процесс до нажатия ОК: прогон по расписанию не завершался вовсе, а висел до
+# утра — и код возврата, ради которого всё это писалось, никто не получал. Для машины,
+# за которой работает человек, это ещё и окно поверх чужой работы среди ночи, а когда
+# фабрику ведут несколько человек — окно на чужом экране.
+#
+# Итог уже лежит в трёх местах, каждое читается без нажатия: .bcf/run-all.status.json,
+# .bcf/REVIEW.md и код возврата этой команды. Звук выше остаётся: он ничего не блокирует.
+if ($rep.complete) {
+  Log "Итог в .bcf/REVIEW.md, машиночитаемо в .bcf/run-all.status.json (complete=true), код возврата 0."
+  exit 0
+}
+Log "Итог в .bcf/REVIEW.md, машиночитаемо в .bcf/run-all.status.json (complete=false), код возврата 1."
+if ($rep.rootList) { Log "Чинить первым: $($rep.rootList)" }
+exit 1
