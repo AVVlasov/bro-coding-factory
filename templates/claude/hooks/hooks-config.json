@@ -18,6 +18,7 @@
     "banned_ui_patterns": "(lint-gate) List of regexes that must NOT appear in product source (e.g. platform-specific UI you forbid). Empty = check disabled.",
     "bare_catch_targets": "(lint-gate) File extensions scanned for an empty catch block. Defaults to TypeScript and Java: in Java the compiler forces you to handle a checked exception, and an empty block closes that requirement while destroying the error.",
     "time_dependent_tests": "(lint-gate) true = a test file that reads the wall clock (new Date() / Date.now() / today()) without freezing time is a violation. Such a test is green six days a week and red on the seventh, so a green gate stops meaning anything. Off by default because enabling it on an existing suite blocks every task until the suite is pinned — turn it on as its own task.",
+    "test_paths": "(lint-gate) Repo-relative dirs holding tests, when they live OUTSIDE product_paths. In a JS layout tests sit inside src/ and this stays empty. In a Maven one they sit in src/test/java while productPaths points at src/main/java, so the time-dependence rule would scan zero files and the *Test/*Tests/*IT masks would be decoration. Empty + a pom.xml present = the standard Maven layout is used automatically.",
     "product_paths": "(non-target-script-detector, mock-as-real-detector) Repo-relative dirs treated as product code — where stray writing systems and mock imports are forbidden. Keep it narrow: a detector that scans the whole repo trips on fixtures and gets switched off entirely. Defaults to ['src'].",
     "mock_scan_ext": "(mock-as-real-detector) File extensions scanned for mock/fixture/stub imports inside product_paths. Defaults to TypeScript and Java.",
     "renderer_dir": "(post-write-check) The UI/renderer directory that must not reach across an architectural boundary (e.g. 'src'). Empty = cross-layer import check disabled.",
@@ -45,6 +46,7 @@
   "banned_ui_patterns": [],
   "bare_catch_targets": [".ts", ".java"],
   "time_dependent_tests": false,
+  "test_paths": [],
 
   "product_paths": ["src"],
   "mock_scan_ext": [".ts", ".tsx", ".java"],

@@ -182,8 +182,21 @@ if ($HooksCfg -and $HooksCfg.PSObject.Properties['time_dependent_tests']) {
 # не может доказать себя, не нарушив правило проекта.
 if ($env:BCF_TIME_DEPENDENT_TESTS -eq '1') { $timeDepEnabled = $true }
 if ($timeDepEnabled) {
+    # Где лежат тесты. В JS-раскладке они внутри productPaths, и отдельный список не нужен.
+    # В Maven тесты живут в src/test/java, а productPaths по инструкции указывает на
+    # src/main/java — то есть правило про часы не проверило бы ни одного файла, и маски
+    # *Test/*Tests/*IT остались бы украшением. Список задаётся ключом test_paths, а при
+    # его отсутствии в проекте с pom.xml берётся стандартная раскладка Maven: каталог
+    # src/test/java задан спецификацией сборки, а не вкусом проекта.
+    $TestPaths = @()
+    if ($HooksCfg -and $HooksCfg.test_paths) { $TestPaths = @($HooksCfg.test_paths) }
+    elseif (Test-Path (Join-Path $Repo 'pom.xml')) {
+        $TestPaths = @(Get-ChildItem -LiteralPath $Repo -Recurse -Directory -ErrorAction SilentlyContinue |
+                       Where-Object { $_.FullName -match '[\\/]src[\\/]test[\\/]java$' -and $_.FullName -notmatch '[\\/]target[\\/]' } |
+                       ForEach-Object { $_.FullName.Substring($Repo.Length).TrimStart('\', '/') })
+    }
     $timeHits = @()
-    foreach ($d in $ProductPaths) {
+    foreach ($d in (@($ProductPaths) + @($TestPaths) | Select-Object -Unique)) {
         $dir = Join-Path $Repo $d
         if (-not (Test-Path $dir)) { continue }
         # Маски тестовых файлов: vitest/jest, pytest и JUnit. У JUnit имя файла — это
@@ -250,7 +263,12 @@ if ((Test-Path $detectorPath) -and $gitBash -and (Test-Path $gitBash)) {
     foreach ($d in $ProductPaths) {
         $dir = Join-Path $Repo $d
         if (Test-Path $dir) {
-            $targets += Get-ChildItem -Path $dir -Recurse -File -Include '*.ts','*.tsx','*.js','*.jsx','*.css','*.scss','*.vue','*.svelte','*.html' -ErrorAction SilentlyContinue |
+            # Расширения перечислены здесь, а не в детекторе: детектор получает готовый
+            # список файлов. Пока в списке были только веб-расширения, серверный Java-проект
+            # отдавал детектору ноль файлов, и правило существовало только на бумаге —
+            # строки интерфейса там лежат в .java и в ресурсах (messages*.properties,
+            # application*.yml).
+            $targets += Get-ChildItem -Path $dir -Recurse -File -Include '*.ts','*.tsx','*.js','*.jsx','*.css','*.scss','*.vue','*.svelte','*.html','*.java','*.properties','*.yml','*.yaml' -ErrorAction SilentlyContinue |
                 ForEach-Object { $_.FullName -replace '\\','/' }
         }
     }

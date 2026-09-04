@@ -18,7 +18,14 @@
 # он уходит в интерактивную настройку и вешает прогон).
 
 $ErrorActionPreference = 'Continue'
-try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+# $OutputEncoding — это кодировка, которой PowerShell пишет в стандартный ВХОД внешней
+# команды. [System.Text.Encoding]::UTF8 несёт с собой BOM, и хук, читающий со входа JSON,
+# получал перед скобкой три невидимых байта: разбор падал, хук выходил нулём и молчал —
+# то есть выглядел как «нарушений нет».
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+} catch { }
 
 $harnessDir  = Split-Path $PSScriptRoot -Parent
 $repoRoot    = Split-Path $harnessDir -Parent
@@ -219,6 +226,253 @@ Check "loop.ps1 исполняет набор каждую итерацию" ($l
 Check "провал уходит в backpressure агента" ($loopSrc -match '\$bp \+= \$bpf\.Message')
 Check "STATE.md собирается той же функцией" ($loopSrc -match 'Format-BcfStateBlock\s+-Iteration')
 Check "захардкоженного вызова npx tsc в цикле не осталось" ($loopSrc -notmatch '&\s*npx --no-install tsc')
+
+# ---------------------------------------------------------------------------
+Section "5. lint-gate: пустой catch и часы в Java"
+# ---------------------------------------------------------------------------
+# Оба правила существовали и до Java, и оба на Java молчали: список расширений для
+# пустого catch состоял из одного '.ts', а правило про часы искало тесты внутри
+# productPaths — в раскладке Maven тесты лежат снаружи, в src/test/java, и маски
+# *Test / *Tests / *IT не проверяли ни одного файла.
+$lintGate = Join-Path $harnessDir 'lint-gate.ps1'
+function New-LintFixture {
+    param([hashtable]$CfgOverride = @{})
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-lint-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path (Join-Path $d '.claude\hooks') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'config') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'src\main\java\app') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'src\test\java\app') | Out-Null
+    '<project><modelVersion>4.0.0</modelVersion></project>' |
+        Set-Content -LiteralPath (Join-Path $d 'pom.xml') -Encoding UTF8
+    # productPaths ровно такой, как рекомендует документация для Maven: тестов в нём нет.
+    (@{ productPaths = @('src/main/java', 'src/main/resources') } | ConvertTo-Json) |
+        Set-Content -LiteralPath (Join-Path $d 'config\harness.json') -Encoding UTF8
+    $cfg = Get-Content -Raw -LiteralPath $hooksCfgTpl | ConvertFrom-Json
+    $cfg.time_dependent_tests = $true
+    foreach ($k in $CfgOverride.Keys) {
+        $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $CfgOverride[$k] -Force
+    }
+    ($cfg | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $d '.claude\hooks\hooks-config.json') -Encoding UTF8
+    return $d
+}
+function Invoke-LintGate([string]$Dir) {
+    $prev = $env:RALPH_GUARD_BYPASS
+    $env:RALPH_GUARD_BYPASS = '1'
+    $out = & pwsh -NoProfile -NonInteractive -File $lintGate -Repo $Dir -JsonOutput 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($null -eq $prev) { Remove-Item env:RALPH_GUARD_BYPASS -ErrorAction SilentlyContinue } else { $env:RALPH_GUARD_BYPASS = $prev }
+    return @{ Code = $code; Out = $out }
+}
+
+$d = New-LintFixture; $cleanup += $d
+@'
+package app;
+public class Svc {
+    void run() {
+        try { work(); } catch (IllegalStateException e) { }
+    }
+}
+'@ | Set-Content -LiteralPath (Join-Path $d 'src\main\java\app\Svc.java') -Encoding UTF8
+@'
+package app;
+class VisitTest {
+    void t() { var d = java.time.LocalDate.now(); }
+}
+'@ | Set-Content -LiteralPath (Join-Path $d 'src\test\java\app\VisitTest.java') -Encoding UTF8
+@'
+package app;
+class BookingIT {
+    void t() { var i = java.time.Instant.now(); }
+}
+'@ | Set-Content -LiteralPath (Join-Path $d 'src\test\java\app\BookingIT.java') -Encoding UTF8
+@'
+package app;
+class PinnedTest {
+    java.time.Clock c = java.time.Clock.fixed(java.time.Instant.EPOCH, java.time.ZoneOffset.UTC);
+    void t() { var d = java.time.LocalDate.now(c); }
+}
+'@ | Set-Content -LiteralPath (Join-Path $d 'src\test\java\app\PinnedTest.java') -Encoding UTF8
+$r = Invoke-LintGate $d
+Check "гейт красный (exit 1)" ($r.Code -eq 1) "код=$($r.Code)"
+Check "пустой catch в .java назван" (($r.Out -match 'no-bare-catch') -and ($r.Out -match 'Svc\.java')) "вывод=$($r.Out)"
+Check "часы без пиновки в *Test.java названы" (($r.Out -match 'time-dependent-test') -and ($r.Out -match 'VisitTest\.java'))
+Check "маска *IT.java тоже считается тестом" ($r.Out -match 'BookingIT\.java')
+Check "Clock.fixed — это пиновка, а не нарушение" ($r.Out -notmatch 'PinnedTest\.java')
+
+# ---------------------------------------------------------------------------
+Section "6. journey-gate: без commandOne гейт отказывается, а не красит путь"
+# ---------------------------------------------------------------------------
+# Фолбэк поштучного прогона добавлял к общей команде флаг -t. Его понимают vitest и jest;
+# Maven на нём падает разбором аргументов, и гейт объявлял «сквозной путь сломан» —
+# проект шёл чинить продукт вместо конфига.
+$journeyGate = Join-Path $harnessDir 'journey-gate.ps1'
+$mvnLike = 'pwsh -NoProfile -Command "Write-Output ''operator-book''; exit 1"'
+function New-JourneyFixture {
+    param($Registry)
+    $d = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-jgj-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'config') | Out-Null
+    & git -C $d init -q -b main 2>&1 | Out-Null
+    & git -C $d config user.email t@t; & git -C $d config user.name t
+    ($Registry | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath (Join-Path $d 'config\journeys.json') -Encoding UTF8
+    'доказательство' | Set-Content -LiteralPath (Join-Path $d 'proof.txt') -Encoding UTF8
+    return $d
+}
+function Invoke-JourneyGate {
+    param([string]$Dir, [switch]$AsJson, [string]$Only = '')
+    $psArgs = @('-NoProfile', '-NonInteractive', '-File', $journeyGate, '-ProjectRoot', $Dir)
+    if ($AsJson) { $psArgs += '-Json' }
+    if ($Only)   { $psArgs += @('-Only', $Only) }
+    $out = & pwsh @psArgs 2>&1 | Out-String
+    return @{ Code = $LASTEXITCODE; Out = $out }
+}
+
+$d = New-JourneyFixture @{
+    command  = $mvnLike
+    journeys = @(@{ id = 'operator-book'; title = 'запись пациента'; proof = 'proof.txt' })
+}
+$cleanup += $d
+$r = Invoke-JourneyGate -Dir $d -AsJson
+Check "гейт красный (exit 1)" ($r.Code -eq 1) "код=$($r.Code)"
+Check "статус пути — no-command, а не red" ($r.Out -match 'no-command') "вывод=$($r.Out)"
+Check "назван ключ, которого не хватает" ($r.Out -match 'commandOne')
+Check "сказано, чей это флаг" ($r.Out -match 'vitest')
+
+$r = Invoke-JourneyGate -Dir $d
+Check "человекочитаемый отчёт тоже называет commandOne" ($r.Out -match 'commandOne') "вывод=$($r.Out)"
+
+$r = Invoke-JourneyGate -Dir $d -Only 'operator-book'
+Check "одиночный прогон отказывается, а не объявляет путь красным" (($r.Code -eq 1) -and ($r.Out -match 'commandOne')) "код=$($r.Code)"
+
+$d = New-JourneyFixture @{
+    command    = $mvnLike
+    commandOne = 'pwsh -NoProfile -Command "Write-Output ''{id}''; exit 0"'
+    journeys   = @(@{ id = 'operator-book'; title = 'запись пациента'; proof = 'proof.txt' })
+}
+$cleanup += $d
+$r = Invoke-JourneyGate -Dir $d -AsJson
+Check "с commandOne поштучная атрибуция делается" ($r.Out -match '"status"\s*:\s*"ok"') "вывод=$($r.Out)"
+Check "отказа при заданном commandOne нет" ($r.Out -notmatch 'no-command')
+
+# Зеркальный случай: у vitest флаг -t есть, и фолбэк остаётся законным.
+$d = New-JourneyFixture @{
+    command  = 'pwsh -NoProfile -Command "Write-Output ''operator-book''; exit 1" # vitest run'
+    journeys = @(@{ id = 'operator-book'; title = 'запись пациента'; proof = 'proof.txt' })
+}
+$cleanup += $d
+$r = Invoke-JourneyGate -Dir $d -AsJson
+Check "для vitest фолбэк не отменён" ($r.Out -notmatch 'no-command') "вывод=$($r.Out)"
+
+# ---------------------------------------------------------------------------
+Section "7. Хуки правки: Java-файл больше не проходит мимо"
+# ---------------------------------------------------------------------------
+function Invoke-Hook {
+    param([string]$Script, [string]$Stdin = '', [string[]]$HookArgs = @(), [string]$WorkDir = '')
+    $path = $Script -replace '\\', '/'
+    $prevLoc = (Get-Location).Path
+    if ($WorkDir) { Set-Location -LiteralPath $WorkDir }
+    try {
+        if ($Stdin) { $out = ($Stdin | & $bash $path @HookArgs 2>&1 | Out-String) }
+        else        { $out = (& $bash $path @HookArgs 2>&1 | Out-String) }
+        $code = $LASTEXITCODE
+    } finally { Set-Location -LiteralPath $prevLoc }
+    return @{ Code = $code; Out = $out }
+}
+
+# 7a. post-write-check: правка .java раньше не разбиралась вовсе.
+$d = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-pwc-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $d | Out-Null
+$cleanup += $d
+@'
+package app;
+public class Bad {
+    void r() {
+        System.out.println("x");
+        try { work(); } catch (Exception e) { }
+        try { work(); } catch (Exception e) { e.printStackTrace(); }
+        String q = "SELECT * FROM visit WHERE id=" + id;
+    }
+}
+'@ | Set-Content -LiteralPath (Join-Path $d 'Bad.java') -Encoding UTF8
+'package app; public class Good { }' | Set-Content -LiteralPath (Join-Path $d 'Good.java') -Encoding UTF8
+$pwcScript = Join-Path $repoRoot 'templates\claude\hooks\post-write-check.sh'
+$payload = (@{ tool_name = 'Write'; tool_input = @{ file_path = ((Join-Path $d 'Bad.java') -replace '\\', '/') } } | ConvertTo-Json -Compress)
+$r = Invoke-Hook -Script $pwcScript -Stdin $payload
+Check "печать в stdout названа" ($r.Out -match 'System\.out\.print') "вывод=$($r.Out)"
+Check "printStackTrace назван" ($r.Out -match 'printStackTrace')
+Check "пустой catch назван" ($r.Out -match 'empty catch')
+Check "склейка SQL строкой названа" ($r.Out -match 'SQL/JPQL')
+$payload = (@{ tool_name = 'Write'; tool_input = @{ file_path = ((Join-Path $d 'Good.java') -replace '\\', '/') } } | ConvertTo-Json -Compress)
+$r = Invoke-Hook -Script $pwcScript -Stdin $payload
+Check "на чистом Java-файле хук молчит" ($r.Out.Trim() -eq '') "вывод=$($r.Out)"
+
+# 7b. stop-verify: правка .java в рабочем дереве.
+$d = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-sv-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $d | Out-Null
+$cleanup += $d
+& git -C $d init -q -b main 2>&1 | Out-Null
+& git -C $d config user.email t@t; & git -C $d config user.name t
+'package app; public class Ok { }' | Set-Content -LiteralPath (Join-Path $d 'Ok.java') -Encoding UTF8
+& git -C $d add -A 2>&1 | Out-Null
+& git -C $d commit -qm base 2>&1 | Out-Null
+$svScript = Join-Path $repoRoot 'templates\claude\hooks\stop-verify.sh'
+$prevProj = $env:CLAUDE_PROJECT_DIR
+$env:CLAUDE_PROJECT_DIR = $d
+'package app; public class Ok { void r() { System.out.println("x"); } }' |
+    Set-Content -LiteralPath (Join-Path $d 'Ok.java') -Encoding UTF8
+$r = Invoke-Hook -Script $svScript
+Check "stop-verify видит печать в stdout в изменённом .java" ($r.Out -match 'System\.out\.print') "вывод=$($r.Out)"
+# Хук читал пути от git и грепал от текущего каталога, а счёт собирал конвейером,
+# который под pipefail печатает два нуля: пользователь получал ошибки bash вместо замечаний.
+Check "хук не сыплет ошибками bash" ($r.Out -notmatch 'integer expression expected|bad substitution|syntax error')
+& git -C $d checkout -- . 2>&1 | Out-Null
+$r = Invoke-Hook -Script $svScript
+Check "на чистом дереве замечаний по Java нет" ($r.Out -notmatch 'Java files') "вывод=$($r.Out)"
+if ($null -eq $prevProj) { Remove-Item env:CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue } else { $env:CLAUDE_PROJECT_DIR = $prevProj }
+
+# 7c. mock-as-real-detector: продуктовые каталоги и расширения из конфига.
+$d = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-mock-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path (Join-Path $d '.claude\hooks') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $d 'src\main\java\app') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $d 'src\main\resources') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $d 'src\test\java\app') | Out-Null
+$cleanup += $d
+$cfg = Get-Content -Raw -LiteralPath $hooksCfgTpl | ConvertFrom-Json
+$cfg.product_paths = @('src/main/java', 'src/main/resources')
+($cfg | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $d '.claude\hooks\hooks-config.json') -Encoding UTF8
+Copy-Item (Join-Path $repoRoot 'templates\claude\hooks\mock-as-real-detector.sh')    (Join-Path $d '.claude\hooks\')
+Copy-Item (Join-Path $repoRoot 'templates\claude\hooks\non-target-script-detector.sh') (Join-Path $d '.claude\hooks\')
+"package app;`nimport org.mockito.Mockito;`npublic class Svc { }`n" |
+    Set-Content -LiteralPath (Join-Path $d 'src\main\java\app\Svc.java') -Encoding UTF8
+"package app;`nimport org.mockito.Mockito;`nclass SvcTest { }`n" |
+    Set-Content -LiteralPath (Join-Path $d 'src\test\java\app\SvcTest.java') -Encoding UTF8
+$r = Invoke-Hook -Script (Join-Path $d '.claude\hooks\mock-as-real-detector.sh') -WorkDir $d
+Check "мок в продуктовом Java-коде блокирует (exit 2)" ($r.Code -eq 2) "код=$($r.Code), вывод=$($r.Out)"
+Check "назван продуктовый файл" ($r.Out -match 'Svc\.java')
+Check "тестовое дерево под запрет не попадает" ($r.Out -notmatch 'SvcTest\.java')
+
+# 7d. non-target-script-detector: ресурсы Java и экранирование \uXXXX.
+# В .properties не-ASCII традиционно хранится как \uXXXX, то есть шестью ASCII-символами;
+# без разэкранирования иероглиф проходит мимо регулярного выражения.
+$propPath = Join-Path $d 'src\main\resources\messages.properties'
+'greeting=Vot chto izmenilos s 昨晚' | Set-Content -LiteralPath $propPath -Encoding UTF8
+$r = Invoke-Hook -Script (Join-Path $d '.claude\hooks\non-target-script-detector.sh') `
+                 -HookArgs @(($propPath -replace '\\', '/')) -WorkDir $d
+Check "иероглиф в .properties за экранированием пойман (exit 2)" ($r.Code -eq 2) "код=$($r.Code), вывод=$($r.Out)"
+Check "назван сам файл ресурсов" ($r.Out -match 'messages\.properties')
+
+# ---------------------------------------------------------------------------
+Section "8. Шаблон и документация называют то, чего гейт теперь требует"
+# ---------------------------------------------------------------------------
+# Гейт, требующий ключ, которого нет ни в шаблоне, ни в документации, читается как
+# поломка инструмента: проект видит отказ и не знает, где написать ответ.
+$journeysTpl = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'templates\config\journeys.json')
+Check "шаблон реестра сценариев знает про commandOne" ($journeysTpl -match 'commandOne')
+$cfgDoc = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'docs\CONFIG.md')
+Check "CONFIG.md объясняет, когда commandOne обязателен" ($cfgDoc -match 'commandOne')
+Check "CONFIG.md называет test_paths" ($cfgDoc -match 'test_paths')
+$hooksTpl = Get-Content -Raw -LiteralPath $hooksCfgTpl
+Check "шаблон hooks-config объявляет java_targets" ($hooksTpl -match 'java_targets')
+Check "шаблон hooks-config объявляет test_paths" ($hooksTpl -match 'test_paths')
 
 foreach ($p in $cleanup) { Remove-Item -Recurse -Force -LiteralPath $p -ErrorAction SilentlyContinue }
 
