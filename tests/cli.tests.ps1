@@ -1822,7 +1822,11 @@ It 'здоровая проба авторизации отвечает и ма�
 
 It 'гард verify берёт журнал из того же каталога состояния, что и шина' {
     $v = Get-Content -Raw (Join-Path $root 'harness\verify.ps1')
-    Assert-NoMatch $v "Join-Path \\\$PSScriptRoot 'events\.jsonl'" 'гард снова читает журнал из каталога фабрики'
+    # Шаблон в ОДИНАРНЫХ кавычках. В двойных PowerShell подставлял сюда $PSScriptRoot, и
+    # проверка превращалась в поиск собственного пути: на каталоге, где встречается
+    # недопустимая escape-последовательность (например \M), она падала разбором регулярки,
+    # а на всех прочих молча проходила, ничего не проверив.
+    Assert-NoMatch $v 'Join-Path \$PSScriptRoot ''events\.jsonl''' 'гард снова читает журнал из каталога фабрики'
     Assert-Match $v 'Get-BcfStateDir \$root\) .events\.jsonl.' 'журнал гарда не привязан к состоянию проекта'
 }
 
@@ -1836,6 +1840,91 @@ It 'triggers.ps1 грузит список из проекта, где его р
     $t = Get-Content -Raw (Join-Path $root 'harness\triggers.ps1')
     Assert-Match $t 'Join-Path \(Join-Path \$Repo ''config''\) ''triggers\.json''' 'конфиг триггеров не читается из проекта'
     Assert-NoMatch $t '\$repoRoot' 'адрес всё ещё собирается от корня фабрики'
+}
+
+# --- maven ---------------------------------------------------------------------------
+#
+# Java-проект был для разбора невидим целиком: экосистемы maven не существовало, и все
+# четыре значения, ради которых разбор написан, оставались пустыми. Пустой productPaths
+# означает, что любая итерация засчитывается как «прогресса нет»; пустой tests.runner —
+# что гейт «фича доказана тестами» выключен, и задача закрывается без единого теста.
+Write-Host ''
+Write-Host '  maven' -ForegroundColor White
+
+function New-MavenSandbox {
+    param([string]$Name)
+    $p = Join-Path $sandboxRoot $Name
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'src\main\java\ru\clinic') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'src\main\resources') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'src\test\java\ru\clinic') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'target\classes') | Out-Null
+    Set-Content -LiteralPath (Join-Path $p 'pom.xml') -Encoding UTF8 -Value @'
+<project><modelVersion>4.0.0</modelVersion>
+  <groupId>ru.clinic</groupId><artifactId>schedule-core</artifactId><version>0.0.1</version>
+</project>
+'@
+    Set-Content -LiteralPath (Join-Path $p 'src\main\java\ru\clinic\App.java') -Encoding UTF8 `
+                -Value 'package ru.clinic; public class App { public static void main(String[] a) {} }'
+    Set-Content -LiteralPath (Join-Path $p 'src\main\resources\application.yml') -Encoding UTF8 -Value 'spring: {}'
+    Set-Content -LiteralPath (Join-Path $p 'src\test\java\ru\clinic\ModularityTests.java') -Encoding UTF8 -Value @'
+package ru.clinic;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+class ModularityTests {
+    @Test
+    void modulesAreClean() {}
+    @ParameterizedTest
+    void eachModuleHasApi() {}
+    @Test
+    void noCycles() {}
+}
+'@
+    Set-Content -LiteralPath (Join-Path $p 'target\classes\App.class') -Encoding UTF8 -Value 'compiled'
+    & git -C $p init -q 2>&1 | Out-Null
+    & git -C $p add -A 2>&1 | Out-Null
+    & git -C $p -c user.name=t -c user.email=t@local commit -qm init 2>&1 | Out-Null
+    return $p
+}
+
+It 'узнаёт сборку maven и раннер maven' {
+    $p = New-MavenSandbox 'detect-maven'
+    $r = Bcf @('detect', '--project', $p)
+    Assert-Match $r.Out 'maven'  'сборка maven не названа'
+    Assert-Match $r.Out 'Java'
+    $j = (Bcf @('detect', '--project', $p, '--json')).Out | ConvertFrom-Json
+    Assert-True (@($j.Ecosystems) -contains 'maven') "экосистемы: $(@($j.Ecosystems) -join ', ')"
+    Assert-True ($j.Tests.runner -eq 'maven') "раннер: $($j.Tests.runner)"
+}
+
+# Продуктовые пути названы точно, а не одним 'src'. Склеив их, разбор засчитал бы правку
+# теста продуктовым прогрессом — и петля не заметила бы, что фичи нет.
+It 'продуктовые пути maven — код и ресурсы, но не тесты' {
+    $p = New-MavenSandbox 'detect-maven-paths'
+    $j = (Bcf @('detect', '--project', $p, '--json')).Out | ConvertFrom-Json
+    $pp = @($j.ProductPaths)
+    Assert-True ($pp -contains 'src/main/java') "нет src/main/java: $($pp -join ', ')"
+    Assert-True ($pp -contains 'src/main/resources') "нет src/main/resources: $($pp -join ', ')"
+    Assert-True (-not ($pp -contains 'src')) "склеено в один 'src': $($pp -join ', ')"
+    Assert-True (-not ($pp -contains 'src/test/java')) "тесты попали в продуктовые пути: $($pp -join ', ')"
+}
+
+# target — вывод сборки. Не объявив его воспроизводимым, харнесс заблокирует слияние
+# готовой задачи ровно так же, как однажды заблокировал лок-файл.
+It 'target объявлен воспроизводимым, а тесты JUnit посчитаны' {
+    $p = New-MavenSandbox 'detect-maven-tests'
+    $j = (Bcf @('detect', '--project', $p, '--json')).Out | ConvertFrom-Json
+    Assert-True (@($j.Generated) -contains 'target') "generated: $(@($j.Generated) -join ', ')"
+    Assert-True ($j.TestCounts.maven -eq 3) "тестов насчитано: $($j.TestCounts.maven)"
+}
+
+# Обёртки mvnw.cmd в песочнице нет. Предлагать команду, которой не существует, нельзя:
+# гейт на несуществующей команде красный всегда, и агент начинает чинить несуществующее.
+It 'без обёртки mvnw.cmd быстрая проверка предлагается через mvn' {
+    $p = New-MavenSandbox 'detect-maven-nowrapper'
+    $j = (Bcf @('detect', '--project', $p, '--json')).Out | ConvertFrom-Json
+    $tc = @($j.Typechecks) -join ' '
+    Assert-Match $tc 'test-compile' 'быстрой проверки для Java не предложено'
+    Assert-NoMatch $tc 'mvnw' 'предложена обёртка, которой в проекте нет'
 }
 
 # --- Итог ----------------------------------------------------------------------------
