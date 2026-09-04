@@ -34,13 +34,18 @@ $closed  = @($items | Where-Object { $_.Pass })
 # «Готова» — обещание, что задача поедет. Без объявленных файлов она не поедет: граф не
 # допускает её в волну. Поэтому такие задачи вынесены в отдельное состояние, а не покрашены
 # зелёным вместе с остальными.
+#
+# Задача с исполнителем-человеком остаётся в списке — её видно и её считают, — но
+# в состояния фабрики не попадает: она не готова, не ждёт гейта и не недопущена.
+$human     = @($items | Where-Object { $_.IsHuman })
 $ready     = @($items | Where-Object { $_.Runnable })
-$noFiles   = @($items | Where-Object { $_.Ready -and -not $_.Admitted })
-$waiting   = @($items | Where-Object { -not $_.Pass -and -not $_.Ready })
+$noFiles   = @($items | Where-Object { $_.Ready -and -not $_.Admitted -and -not $_.IsHuman })
+$waiting   = @($items | Where-Object { -not $_.Pass -and -not $_.Ready -and -not $_.IsHuman })
 
 Write-BcfTitle "БЭКЛОГ  $(Split-Path $project -Leaf)" `
                ("всего $($items.Count) · закрыто $($closed.Count) · готово к работе $($ready.Count)" +
                 $(if ($noFiles.Count) { " · не допущено $($noFiles.Count)" } else { '' }) +
+                $(if ($human.Count) { " · у людей $($human.Count)" } else { '' }) +
                 " · ждёт $($waiting.Count)")
 
 if (-not $items.Count) {
@@ -57,20 +62,34 @@ function _trim([string]$s, [int]$n) {
 function _cells($t, $state) {
     $files = if ($t.Files.Count) { ($t.Files | Select-Object -First 2) -join ', ' } else { '(файлы не объявлены)' }
     if ($t.Files.Count -gt 2) { $files += " +$($t.Files.Count - 2)" }
-    return @($t.Id, $state, (_trim $t.Title 30), (_trim $files 34))
+    # Колонка исполнителя всегда заполнена: пустая клетка читается как «неизвестно»,
+    # а неизвестности тут нет — задача без поля принадлежит фабрике.
+    $who = if ($t.Executor) { $t.Executor } else { 'фабрика' }
+    return @($t.Id, $state, (_trim $t.Title 24), (_trim $files 26), (_trim $who 14))
 }
 
 $rows = New-BcfRows
 $colors = @()
 foreach ($t in $ready)   { Add-BcfRow $rows (_cells $t 'готова');  $colors += 'Green' }
-# Метка держится в ширине колонки (18): длиннее — и таблица разъезжается, а причина всё
+# Метка держится в ширине колонки (15): длиннее — и таблица разъезжается, а причина всё
 # равно печатается ниже отдельным предупреждением со списком id.
 foreach ($t in $noFiles) { Add-BcfRow $rows (_cells $t 'НЕ ДОПУЩЕНА'); $colors += 'Yellow' }
+foreach ($t in $human)   { Add-BcfRow $rows (_cells $t 'у человека'); $colors += 'Magenta' }
 foreach ($t in $waiting) { Add-BcfRow $rows (_cells $t "ждёт $($t.Preds -join ',')"); $colors += 'DarkGray' }
 foreach ($t in $closed)  { Add-BcfRow $rows (_cells $t 'PASS');    $colors += 'DarkCyan' }
 
-Write-BcfTable -Headers @('id', 'состояние', 'что', 'владеет файлами') `
-               -Widths @(10, 18, 31, 35) -Rows $rows -RowColors $colors
+# Ширины сжаты под пятую колонку так, чтобы вся таблица осталась уже прежних 99 знаков:
+# в узком окне обрезается ЗАГОЛОВОК, и колонка «исполнитель» превращается в «исполните».
+Write-BcfTable -Headers @('id', 'состояние', 'что', 'владеет файлами', 'исполнитель') `
+               -Widths @(10, 15, 25, 27, 15) -Rows $rows -RowColors $colors
+
+if ($human.Count) {
+    Write-Host ''
+    Write-BcfLine "  У ЛЮДЕЙ  $($human.Count)" 'Magenta'
+    foreach ($t in $human) { Write-BcfLine "    $($t.Id) — $($t.Executor)" 'Magenta' }
+    Write-BcfNote 'фабрика на них агента не запускает: ни bcf run queue, ни bcf run night.'
+    Write-BcfNote 'вернуть фабрике — убрать строку «Исполнитель:» из файла задачи или написать «фабрика».'
+}
 
 # Коллизия владения — единственное, что здесь считается сверх состояния. Две задачи на
 # одном файле без предшествования планировщик пустит в одну волну, и арбитр будет сводить
@@ -107,7 +126,9 @@ if ($collisions.Count) {
     Write-BcfNote 'дороже и рискованнее, чем прогнать по очереди. Лечится строкой «Вход» в задаче.'
 }
 
-$noFiles = @($items | Where-Object { -not $_.Pass -and -not $_.Files.Count })
+# Задачи людей сюда не входят: допуск в волну им не нужен, а совет объявить файлы
+# адресован фабрике.
+$noFiles = @($items | Where-Object { -not $_.Pass -and -not $_.Files.Count -and -not $_.IsHuman })
 if ($noFiles.Count) {
     Write-Host ''
     Write-BcfWarn "задач без объявленных файлов: $($noFiles.Count) ($(($noFiles | ForEach-Object { $_.Id }) -join ', '))"

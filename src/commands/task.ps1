@@ -1,6 +1,7 @@
 # bcf task — работа с задачами: создать, объяснить, почему не идёт.
 #
 #   bcf task new "<что сделать>"   создать файл задачи по шаблону
+#   bcf task new "<...>" --for Иван   то же, но задачу ведёт человек: фабрика её не берёт
 #   bcf task why <ID>              почему эта задача не может пойти в работу
 #   bcf task show <ID>             файл задачи, вердикт, разведка — одним экраном
 #
@@ -16,8 +17,32 @@
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
 
 $project = $script:BcfProject
-$sub = @($script:BcfArgs | Where-Object { $_ -notlike '-*' }) | Select-Object -First 1
-$rest = @($script:BcfArgs | Where-Object { $_ -notlike '-*' }) | Select-Object -Skip 1
+
+# --for <имя> вынимается ДО отбрасывания флагов. Общий фильтр `-notlike '-*'` убирает сам
+# флаг, но не его значение: «bcf task new чинить связь --for Иван» без этого разбора
+# создал бы задачу с названием «чинить связь Иван» и без исполнителя. Флаг, который
+# молча уезжает в чужой список, — тот же класс дефектов, что уже ловил тест про --project.
+$argv = @($script:BcfArgs)
+$forWhom = ''
+$clean = @()
+for ($i = 0; $i -lt $argv.Count; $i++) {
+    $a = [string]$argv[$i]
+    if ($a -match '^--for=(.+)$') { $forWhom = $Matches[1]; continue }
+    if ($a -eq '--for') {
+        $i++
+        $v = if ($i -lt $argv.Count) { [string]$argv[$i] } else { '' }
+        if (-not $v -or $v.StartsWith('-')) {
+            Write-BcfFail 'у флага --for нет значения: bcf task new "название" --for Иван'
+            exit 2
+        }
+        $forWhom = $v
+        continue
+    }
+    $clean += $a
+}
+
+$sub = @($clean | Where-Object { $_ -notlike '-*' }) | Select-Object -First 1
+$rest = @($clean | Where-Object { $_ -notlike '-*' }) | Select-Object -Skip 1
 
 $cfg = $null
 try { $cfg = Get-BcfHarnessConfig -Project $project } catch { }
@@ -84,10 +109,19 @@ switch ($sub) {
     # Строку предшественников кладём в ТОМ формате, который читает харнесс, — чтобы
     # человеку не пришлось выяснять, какой из двух форматов «правильный».
     $tpl = $tpl -replace '(?m)^—$', '**Gate-вход:** нет'
+    # Исполнитель проставляется в готовую строку шаблона, а не дописывается сбоку:
+    # два места, где может стоять одно поле, однажды разойдутся, и разойдутся молча.
+    if ($forWhom) { $tpl = $tpl -replace '(?m)^Исполнитель:.*$', "Исполнитель: $forWhom" }
     Set-Content -LiteralPath $path -Value $tpl -Encoding UTF8
 
     Write-BcfTitle "СОЗДАНА ЗАДАЧА  $id" $title
     Write-BcfOk ($path.Substring($project.Length).TrimStart('\', '/'))
+    if ($forWhom) {
+        Write-Host ''
+        Write-BcfWarn "исполнитель: $forWhom — фабрика эту задачу не возьмёт"
+        Write-BcfNote 'её не будет ни в bcf run night, ни в bcf run queue; в bcf tasks она видна.'
+        Write-BcfNote 'вернуть фабрике — стереть строку «Исполнитель:» или написать в ней «фабрика».'
+    }
     Write-Host ''
     Write-BcfLine '  ЧТО ЗАПОЛНИТЬ, ИНАЧЕ ЗАДАЧА НЕ ПОЕДЕТ' 'White'
     Write-BcfNote '· «## Файлы» — без списка задача к работе НЕ допускается: владение неизвестно,'
@@ -113,6 +147,19 @@ switch ($sub) {
     Write-BcfTitle "ПОЧЕМУ $id" $t.File.Name
 
     $blockers = @()
+
+    # Исполнитель проверяется ПЕРВЫМ и заканчивает разговор: у задачи человека все
+    # остальные ответы («ждёт предшественников», «нет секции Файлы») — не причина,
+    # по которой она стоит, а описание того, чего фабрика всё равно не будет делать.
+    $who = Get-TaskExecutor -TaskId $id -Root $project
+    if ($who -and -not (Test-BcfExecutorIsFactory $who) -and -not $t.Pass) {
+        Write-BcfWarn "задачу ведёт человек: $who"
+        Write-BcfNote 'фабрика её не берёт: из очереди run-all и графа она исключена по строке'
+        Write-BcfNote '«Исполнитель:» в файле задачи. Вернуть фабрике — стереть строку или'
+        Write-BcfNote 'написать в ней «фабрика».'
+        Write-Host ''
+        exit 0
+    }
 
     if ($t.Pass) {
         Write-BcfOk 'задача закрыта: verdict PASS — запускать нечего'
@@ -228,7 +275,7 @@ switch ($sub) {
 
 default {
     Write-BcfFail $(if ($sub) { "неизвестная подкоманда: $sub" } else { 'нужна подкоманда' })
-    Write-BcfNote 'доступно: new "<название>" | why <ID> | show <ID>'
+    Write-BcfNote 'доступно: new "<название>" [--for <имя>] | why <ID> | show <ID>'
     exit 2
 }
 }

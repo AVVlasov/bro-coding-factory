@@ -152,6 +152,103 @@ function Get-TaskPredecessors {
              Select-Object -Unique | Where-Object { $_ -ne $TaskId })
 }
 
+# --- Исполнитель задачи: человек или фабрика -------------------------------------------
+#
+# ЗАЧЕМ. Задачу, которую ведёт человек, до сих пор нечем было выразить: в очередь
+# run-all попадал ЛЮБОЙ файл tasks/<PREFIX>-NN-*.md с номером не 0. Единственный обход —
+# сентинел «**Gate-вход:** TASK-00»: задача навсегда висела в gate-block, то есть в
+# отчёте выглядела сломанной, а не занятой. Отличить «фабрика не может» от «фабрику
+# сюда не звали» было нечем ни человеку, ни экрану.
+#
+# Формат — одна строка «Исполнитель: <имя>» в ШАПКЕ задачи: между заголовком «# TASK-NN»
+# и первой секцией «## ». Рядом с ней живёт «Блокер: <причина>» — свободный текст для
+# человека, харнесс его не читает.
+#
+# ЗОНА ЧТЕНИЯ СУЖЕНА НАМЕРЕННО, и это не косметика. Во-первых, поле читает не только
+# фабрика: разборщики пула читают шапку до первой секции, и строка под «## Кто ведёт»
+# для них не существует — задача человека выглядела бы у них ничьей. Во-вторых, чтение
+# «где угодно в теле» ловит собственный хвост: в секции «## Проверки» лежит блок команд,
+# и строка «Исполнитель: Иван» внутри примера кода отправляла бы задачу человеку.
+#
+# Строки внутри тройных кавычек игнорируются отдельно — на случай, когда блок кода попал
+# в саму шапку.
+#
+# Старым задачам это ничего не ломает: строка в шапке не видна ни одному из трёх
+# существующих разборщиков (Get-TaskDeclaredFiles берёт только буллеты своей секции,
+# Get-TaskPredecessors — только токены <PREFIX>-NN своей, hook-валидаторы — только
+# чекбоксы и заголовки).
+#
+# Имя «Исполнитель», а не «Owner»: «Owner: <agent-type>» уже занят шаблонами подзадач
+# (templates/agents/task-decomposer.md) и означает ТИП агента фабрики, а не человека.
+
+# Значения, означающие «работает фабрика». Пустое поле — тоже фабрика: задача без
+# строки обязана вести себя ровно как до появления поля.
+$script:BcfFactoryExecutors = @('фабрика', 'factory', 'агент', 'agent', 'bcf', 'робот', 'нет', 'none', '—', '–', '-')
+
+# Шапка задачи: строки от начала файла до первой секции «## », без HTML-комментариев и
+# без содержимого блоков кода. Отсюда читаются и «Исполнитель:», и «Блокер:».
+function Get-BcfTaskHeader {
+    param([string]$Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return '' }
+    # Комментарии шаблона выкидываем ПЕРВЫМИ. Подсказка «Исполнитель: <имя человека>»
+    # живёт в templates/project/task.md; если её читать наравне с телом, каждая созданная
+    # по шаблону задача окажется человеческой и очередь опустеет молча.
+    $clean = [regex]::Replace($Body, '(?s)<!--.*?-->', '')
+    $out = New-Object System.Collections.Generic.List[string]
+    $inFence = $false
+    foreach ($line in ($clean -split "`r?`n")) {
+        # Забор проверяется ДО заголовка: «## » внутри блока кода — это текст примера,
+        # а не начало секции, и обрывать шапку по нему нельзя.
+        if ($line -match '^[ \t]*(```|~~~)') { $inFence = -not $inFence; continue }
+        if ($inFence) { continue }
+        if ($line -match '^[ \t]*##[ \t]') { break }
+        $out.Add($line)
+    }
+    return ($out -join "`n")
+}
+
+function Get-BcfExecutorFromText {
+    param([string]$Body)
+    $header = Get-BcfTaskHeader -Body $Body
+    if (-not $header) { return '' }
+    $m = [regex]::Match($header, '(?im)^[ \t]*(?:[-*][ \t]+)?\*{0,2}[ \t]*Исполнитель[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if (-not $m.Success) { return '' }
+    return $m.Groups[1].Value.Trim().Trim('*').Trim().Trim('`').Trim()
+}
+
+function Get-BcfBlockerFromText {
+    param([string]$Body)
+    $header = Get-BcfTaskHeader -Body $Body
+    if (-not $header) { return '' }
+    $m = [regex]::Match($header, '(?im)^[ \t]*(?:[-*][ \t]+)?\*{0,2}[ \t]*Блокер[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if (-not $m.Success) { return '' }
+    return $m.Groups[1].Value.Trim().Trim('*').Trim().Trim('`').Trim()
+}
+
+function Test-BcfExecutorIsFactory {
+    param([string]$Executor)
+    if ([string]::IsNullOrWhiteSpace($Executor)) { return $true }
+    return ($script:BcfFactoryExecutors -contains $Executor.Trim().ToLower())
+}
+
+function Get-TaskExecutor {
+    param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
+
+    $tasksDir = Get-BcfTasksDir -Root $Root
+    $tf = Get-ChildItem $tasksDir -Filter "$TaskId-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $tf) { return '' }
+    $body = Get-Content -Raw -LiteralPath $tf.FullName -ErrorAction SilentlyContinue
+    return (Get-BcfExecutorFromText -Body ([string]$body))
+}
+
+# Единственный вопрос, который задают очередь и планировщик: трогать ли эту задачу.
+function Test-TaskIsHuman {
+    param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
+
+    $ex = Get-TaskExecutor -TaskId $TaskId -Root $Root
+    return [bool]($ex -and -not (Test-BcfExecutorIsFactory $ex))
+}
+
 # --- Связность из истории: какие файлы ходят в коммитах вместе с данными ---
 #
 # Декларация врёт: агент правит scan.rs, а ломает main.rs, который его зовёт.

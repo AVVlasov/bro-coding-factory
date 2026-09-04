@@ -51,6 +51,10 @@ function Get-BcfQueue {
                 Files = @(Get-TaskDeclaredFiles -TaskId $id -Root $Project)
                 Preds = @(Get-TaskPredecessors -TaskId $id -Root $Project -Prefix $prefix)
                 Pass  = ((Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet))
+                # Исполнитель — тот же разбор, что у планировщика. Пустая строка значит
+                # «фабрика»: задачи без поля обязаны вести себя как до его появления.
+                Executor = (Get-BcfExecutorFromText -Body ([string]$body))
+                IsHuman  = $false
                 Ready = $false
                 # ДВА РАЗНЫХ УСЛОВИЯ, КОТОРЫЕ НЕЛЬЗЯ СКЛЕИВАТЬ В ОДНО СЛОВО.
                 #
@@ -68,9 +72,13 @@ function Get-BcfQueue {
     $passSet = @{}
     foreach ($t in $tasks) { if ($t.Pass) { $passSet[$t.Id] = $true } }
     foreach ($t in $tasks) {
+        $t.IsHuman  = -not $t.Pass -and $t.Executor -and -not (Test-BcfExecutorIsFactory $t.Executor)
         $t.Ready    = -not $t.Pass -and (@($t.Preds | Where-Object { -not $passSet.ContainsKey($_) }).Count -eq 0)
         $t.Admitted = -not $t.Pass -and [bool]$t.Files.Count
-        $t.Runnable = $t.Ready -and $t.Admitted
+        # Задача человека не Runnable по определению: `bcf run queue` её не возьмёт.
+        # Ready и Admitted оставлены как есть — это факты о самой задаче (входы закрыты,
+        # владение объявлено), и гасить их значило бы прятать причину под исполнителем.
+        $t.Runnable = $t.Ready -and $t.Admitted -and -not $t.IsHuman
     }
 
     # Владение файлами — та самая мина, которую граф ловит ДО запуска. Считается здесь тем
@@ -92,7 +100,7 @@ function Get-BcfQueue {
     # закрыты. Допущенными считаются только задачи с объявленными файлами.
     $closed = @{}
     foreach ($t in $tasks) { if ($t.Pass) { $closed[$t.Id] = $true } }
-    $pending = @($tasks | Where-Object { -not $_.Pass -and $_.Files.Count })
+    $pending = @($tasks | Where-Object { -not $_.Pass -and $_.Files.Count -and -not $_.IsHuman })
     $waves = @()
     while ($pending.Count) {
         $wave = @($pending | Where-Object { @($_.Preds | Where-Object { -not $closed.ContainsKey($_) }).Count -eq 0 })
@@ -123,6 +131,9 @@ function Get-BcfQueue {
         Undeclared  = @($undeclared)
         Waves       = @($waves)
         Blocked     = @($pending | ForEach-Object { $_.Id })
+        # Задачи у людей перечислены ОТДЕЛЬНО от Blocked: «фабрика не может» и «фабрику
+        # сюда не звали» лечатся разным, и склеенные в одно число они врут обоим.
+        HumanHeld   = @($tasks | Where-Object { $_.IsHuman } | ForEach-Object { $_.Id })
     }
 }
 

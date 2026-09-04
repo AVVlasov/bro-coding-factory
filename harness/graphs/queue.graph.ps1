@@ -62,7 +62,6 @@ foreach ($f in (Get-ChildItem (Join-Path $root 'tasks') -Filter "$prefix-*.md" -
     $num = [int]$Matches[1]
     if ($num -eq 0) { continue }
     $id = "$prefix-$($Matches[1])"
-    $body = Get-Content -Raw -LiteralPath $f.FullName
 
     # Разбор предшественников — общей функцией (harness/lib/claims.ps1), той же, что у
     # цикла и у CLI. Собственная копия регекспа здесь однажды разъедется с ними, и
@@ -72,13 +71,36 @@ foreach ($f in (Get-ChildItem (Join-Path $root 'tasks') -Filter "$prefix-*.md" -
     $tasks += [pscustomobject]@{ Id = $id; Num = $num; Preds = $preds; Files = $files; Pass = (Get-Verdict $id) }
 }
 
+# --- Задачи человека в граф не входят ---
+#
+# Тот же вопрос и той же функцией, что у цикла (harness/run-all.ps1): строка
+# «Исполнитель: <имя>» — решение, а не пометка для глаз. Граф собирает очередь сам, и
+# пока он этой функции не звал, `bcf run queue` брал в работу задачу, которую цикл уже
+# не брал: одна и та же задача была занята человеком и одновременно уезжала агенту.
+#
+# Отсев стоит ДО сужения по -GraphArgs: явно названная в аргументах задача человека —
+# такая же задача человека, и запускать её вручную через граф было бы обходом поля.
+$humanHeld = @()
+$tasks = @($tasks | Where-Object {
+    $ex = Get-TaskExecutor -TaskId $_.Id -Root $root
+    if ($ex -and -not (Test-BcfExecutorIsFactory $ex)) {
+        $humanHeld += [pscustomobject]@{ Task = $_.Id; Executor = $ex }
+        $false
+    } else { $true }
+})
+foreach ($h in $humanHeld) { Write-GraphLog "$($h.Task) — пропущена: исполнитель $($h.Executor)." }
+
 # Сузить очередь до переданных на вход задач (если их передали).
 $only = @($GraphArgs)
 if ($only.Count -and $only[0]) {
     $tasks = @($tasks | Where-Object { $only -contains $_.Id })
     Write-GraphLog "очередь сужена до: $($only -join ', ')"
 }
-if (-not $tasks.Count) { Write-GraphLog "очередь пуста — задач $prefix-NN в tasks/ нет"; return @{ complete = $false; reason = 'пустая очередь' } }
+if (-not $tasks.Count) {
+    $tail = if ($humanHeld.Count) { " Задач у людей: $($humanHeld.Count) ($(($humanHeld | ForEach-Object { $_.Task }) -join ', '))." } else { '' }
+    Write-GraphLog "очередь пуста — задач $prefix-NN в tasks/, которые ведёт фабрика, нет.$tail"
+    return @{ complete = $false; reason = 'пустая очередь' }
+}
 
 # Показываем САМ ПЛАН, а не факт того, что он вычислен. «Задач: 1, уже закрыто: 0» —
 # отчёт о работе счётчика: он верен всегда и не говорит ничего о том, что сейчас
