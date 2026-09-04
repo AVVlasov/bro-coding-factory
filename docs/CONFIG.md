@@ -21,8 +21,8 @@
 | `productPaths` | Что считается продуктовым кодом. |
 | `generatedFiles` | Файлы, воспроизводимые сборкой. |
 | `taskIdPattern` / `taskIdPrefix` | Формат id задач (умолчание `[A-Za-z][A-Za-z0-9]*-\d+`, префикс `TASK`). |
-| `backpressure.typecheck` | Быстрые проверки после каждой итерации. Пустой массив = пропустить. |
-| `tests.*` | `runner` (cargo/vitest/jest/pytest/go/custom) плюс переопределения `command`, `packageFlag`, `passedPattern`, `failedPattern`. |
+| `backpressure.typecheck` | Быстрые проверки после каждой итерации, массив команд для любого стека. Пустой массив = пропустить. |
+| `tests.*` | `runner` (cargo/vitest/jest/pytest/go/maven/custom) плюс переопределения `command`, `packageFlag`, `passedPattern`, `failedPattern`. |
 | `net.probeHost` / `.probePort` | Сторож соединения (хост API модели). **Пусто = выключен.** |
 | `timeouts.*` | `iterSec`, `streamStallSec`, `netWaitMaxSec`, `netStallRetryMax`, `stepSec`, `silentSec`, `testerSilentSec`. |
 | `limits.*` | `taskConcurrency`, `agentConcurrency`, `fanoutConcurrency`, `testerConcurrency`, `maxIterations`, `noProgressLimit`, `sprawlFileLimit`, `sprawlIterLimit`. |
@@ -36,9 +36,16 @@
 смотрит ревью. Ошибка здесь означает, что правки в доках засчитываются как работа над
 задачей — а цикл при этом честно докладывает о прогрессе.
 
-**`backpressure.typecheck`** вызывается КАЖДУЮ итерацию. Команда, которой не существует,
-делает гейт красным всегда, и агент начинает чинить несуществующее. Поэтому `bcf init`
-запускает кандидатов живьём и записывает только те, что отработали.
+**`backpressure.typecheck`** вызывается КАЖДУЮ итерацию: цикл исполняет этот массив как
+есть и сам ничего не знает ни про `npx`, ни про `mvnw`. Для TypeScript это
+`npx --no-install tsc --noEmit`, для Maven — `.\mvnw.cmd -B -q -o -DskipTests test-compile`
+(именно `test-compile`, иначе сломанный тестовый исходник доедет до верификации и сожжёт
+круг). Команда, которой не существует, делает гейт красным всегда, и агент начинает чинить
+несуществующее. Поэтому `bcf init` запускает кандидатов живьём и записывает только те, что
+отработали.
+
+Пустой массив — законное состояние, но означает он «не проверялось», а не «чисто»: цикл
+записывает событие `backpressure-skipped`, чтобы пропуск было видно в журнале.
 
 **`generatedFiles`** — что не блокирует слияние. Один изменённый лок-файл в основном
 дереве однажды завалил слияние семи задач подряд, каждая из которых уже дошла до PASS:

@@ -13,6 +13,9 @@ This project runs on Windows. The Bash tool in this environment resolves command
 - **Git POSIX tools** — `head`, `tail`, `grep`, `sed`, `awk`, `tr`, `sort`, `cut`, `wc`, `find`, `xargs` from `C:\Program Files\Git\usr\bin`.
 - **Node toolchain** — `node`, `npm`, `npx`, `tsc` (via `npx tsc`).
 - **Python 3.12** — `python`, `python -m <module>`.
+- **Java + Maven wrapper** — only in a project that ships them: `java -version` and the
+  wrapper in the repository root. On Windows the wrapper is `mvnw.cmd`; the bare `./mvnw`
+  form does not resolve in PowerShell, and `mvn` itself is usually not on PATH at all.
 - **docker / docker compose** — for `bcf-agent-memory` Postgres container.
 - **lms** — LM Studio CLI for embedding model loading.
 
@@ -50,6 +53,23 @@ When invoking from the Bash tool prefer `| head -N` (always available now). When
 npx tsc --noEmit                       # Read FULL output; exit code matters
 npx tsc --noEmit 2>&1 | head -100      # Truncate for context window
 ```
+
+### Java build and tests (Maven wrapper)
+
+```bash
+.\mvnw.cmd -B -q -DskipTests test-compile     # быстрая компиляция: main И тесты
+.\mvnw.cmd -B test -Dtest=VisitBookingTest    # один тестовый класс (surefire)
+.\mvnw.cmd -B verify                          # полный прогон, включая failsafe (*IT)
+```
+
+`test-compile`, а не `compile`: фаза `compile` не трогает `src/test/java`, и сломанный
+тестовый исходник выяснится только на верификации.
+
+`-q` уместен в компиляции и вреден в прогоне тестов: он гасит строки `[INFO] Tests run:`,
+по которым считается результат.
+
+Первый запуск обёртки скачивает дистрибутив Maven и все зависимости — это минуты, а не
+секунды. Быстрой проверкой такая команда становится со второго раза.
 
 ### Python type / compile checks
 
