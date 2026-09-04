@@ -18,7 +18,6 @@ $suites = @(
     @{ Name = 'раннер maven';     File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'maven-runner.tests.ps1' },
     @{ Name = 'java-хуки';        File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'java-hooks.tests.ps1' },
     @{ Name = 'исполнитель';      File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'executor-field.tests.ps1' },
-    @{ Name = 'исполнитель';      File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'executor-field.tests.ps1' },
     @{ Name = 'честность вердикта'; File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'verdict-honesty.tests.ps1' }
 )
 
