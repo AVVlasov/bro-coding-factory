@@ -527,6 +527,24 @@ if (Test-Path $smFile) {
     } catch { Write-BcfFail "config/scope-map.json не разобран: $($_.Exception.Message)"; $bad++ }
 }
 
+# --- СОСТОЯНИЕ РЕПОЗИТОРИЯ ---------------------------------------------------------------
+#
+# Оборванный прогон оставляет дерево в MERGING: арбитр слияния намеренно не отменяет
+# конфликтный merge, завершить обязан вызывающий, а он умер. Следующая ночь после такого
+# обрыва проходит целиком впустую — слияние отваливается у каждой задачи подряд с
+# причиной «основное дерево грязное», к самим задачам отношения не имеющей.
+#
+# До этой правки слово git не встречалось в doctor ни разу: самое дорогое состояние
+# проекта не проверялось вообще.
+Write-Host ''
+Write-BcfLine '  СОСТОЯНИЕ РЕПОЗИТОРИЯ' 'White'
+Write-Host ''
+. (Join-Path $BcfRoot 'src\lib\git-readiness.ps1')
+$gitState = Get-BcfGitReadiness -Root $project
+Write-BcfGitReadiness -State $gitState
+$bad  += $gitState.Blocking.Count
+$warn += $gitState.Warnings.Count
+
 # --- Итог -----------------------------------------------------------------------------
 Write-Host ''
 if ($bad) {
