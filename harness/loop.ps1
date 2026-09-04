@@ -1,7 +1,7 @@
 # harness/loop.ps1 — Ralph loop runner для the project (bounded-режим).
 #
 # Каждая итерация: opencode выполняет ОДИН шаг задачи в свежем контексте → раннер гоняет
-# backpressure (tsc + done-gate) → пишет результат в .bcf/STATE.md (legacy compat) +
+# backpressure (быстрая проверка из конфига + done-gate) → пишет результат в .bcf/STATE.md +
 # .bcf/events.jsonl (W3, append-only) → следующая итерация видит ошибки и исправляет.
 # Останавливается на verdict-гейте для ревью оператора.
 #
@@ -34,7 +34,7 @@ param(
   [int]$NetProbePort = 443,
   [int]$NetStallRetryMax = 8,       # макс. подряд retry одной итерации из-за обрывов сети (защита от флаппинга)
   [switch]$AutoAdvance,
-  [switch]$NoAutoRollback,          # M-09 E: отключить авто-откат регрессий tsc (default on)
+  [switch]$NoAutoRollback,          # M-09 E: отключить авто-откат регрессий быстрой проверки (default on)
   [switch]$Force,
   [string]$ProjectRoot = ''         # корень проекта; пусто = BCF_PROJECT_ROOT, иначе верх git-репозитория
 )
@@ -89,6 +89,10 @@ try {
   $OutputEncoding           = [System.Text.Encoding]::UTF8
   chcp 65001 | Out-Null
 } catch { }
+
+# Быстрая проверка после итерации: команды из config/harness.json, а не из кода.
+. (Join-Path $PSScriptRoot 'lib\backpressure.ps1')
+$BpCommands = Get-BcfBackpressureCommands -Config $Cfg
 
 # W3: подключаем event-bus.
 . (Join-Path $PSScriptRoot 'lib\event-bus.ps1')
@@ -464,7 +468,8 @@ $lastFailSig = ""                  # M-16 (2026-05-31): сигнатура на�
 $sameFailSetCount = 0              # сколько verify подряд падает ОДИН И ТОТ ЖЕ набор тестов
 $FailSetStall = 3                  # N verify подряд с тем же fail-set → гейт не сходится → callout
 $launchFailCount = 0
-$lastTscExit = 0                  # M-09 E: для детекции регрессии 0 → ≠0
+$lastBpClean = $true              # M-09 E: для детекции регрессии «было чисто → сломалось»
+$lastBpSignature = ($BpCommands -join ' ;; ')  # набор команд, по которому мерили прошлый раз
 $preIterTreeRef = ""              # M-09 E: SHA дерева ДО итерации (для git stash отката)
 
 for ($i = 1; $i -le $MaxIterations; $i++) {
@@ -846,64 +851,62 @@ $culprit
 Действия следующей итерации:
 1. Определи, что именно зависает (команда выше).
 2. Если это поломка инфраструктуры — это БЛОКЕР: заведи subtask на починку, не повторяй зависший шаг.
-3. Для быстрой проверки пока используй лёгкие команды (``tsc --noEmit``), не тяжёлый прогон.
+3. Для быстрой проверки пока используй лёгкие команды (набор из config/harness.json → backpressure.typecheck), не тяжёлый прогон.
 "@
     }
   }
   if ($launchErr -ne "") {
     $bp += "ЗАПУСК opencode ПРОВАЛЕН: $launchErr"
   }
-  # TSC-GATE: три состояния вместо молчаливого протухшего кода выхода.
-  # Раньше при недоступном npx в $tscExit попадал $LASTEXITCODE от ПРЕДЫДУЩЕЙ команды
-  # (обычно git), и проверка типов «проходила», не выполнившись ни разу. Теперь:
-  # нет package.json — проверять нечего, пропуск с событием; package.json есть, а npx
-  # недоступен — БЛОК: проект объявил JS, и уезжать на verify без проверки типов нельзя.
-  $tscRan = $true
-  if (-not (Test-Path (Join-Path $root 'package.json'))) {
-    $tscRan = $false
-    Append-Event -EventType 'tsc-gate-skipped' -TaskId $focus -Phase 'B' -Iteration $i `
-      -Payload @{ reason = 'no package.json' }
-  } elseif (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
-    $tscRan = $false
-    $bp += "TSC-GATE BLOCKED: в проекте есть package.json, а npx недоступен — типы не проверялись. Установи Node.js/npx или запусти задачу без tsc-gate."
-    Append-Event -EventType 'tsc-gate-unavailable' -TaskId $focus -Phase 'B' -Iteration $i `
-      -Payload @{ reason = 'npx not found' }
-  }
-  if ($tscRan) {
-    $tscOut = & npx --no-install tsc --noEmit 2>&1
-    $tscExit = $LASTEXITCODE
-    if ($tscExit -ne 0) {
-      $bp += "tsc --noEmit FAILED (exit $tscExit):`n" + (($tscOut | Select-Object -Last 12) -join "`n")
-      Append-Event -EventType 'tsc-failed' -TaskId $focus -Phase 'B' -Iteration $i `
-        -Payload @{ exit_code = $tscExit; tail = (($tscOut | Select-Object -Last 5) -join "`n") }
+  # BACKPRESSURE-GATE: быстрая проверка после итерации. Что именно проверять, знает
+  # проект — config/harness.json → backpressure.typecheck; цикл исполняет этот массив
+  # как есть и не знает ни про npx, ни про mvnw, ни про cargo.
+  #
+  # Раньше здесь был захардкожен `npx --no-install tsc --noEmit` по наличию package.json,
+  # а ключ backpressure.typecheck не читался ни разу за весь файл — при том, что
+  # документация обещала вызов каждую итерацию. Java-, Rust- и Go-проект не получали
+  # внутри итерации никакой обратной связи о том, что код перестал собираться, и
+  # узнавали об этом только на верификации, потратив круг целиком.
+  #
+  # Пустой массив — законное состояние, но не «чисто»: это «не проверялось», и оно
+  # уходит событием, а не молчаливым нулём.
+  $bpRes = Invoke-BcfBackpressure -Root $root -Commands $BpCommands
+  if ($bpRes.Skipped) {
+    Append-Event -EventType 'backpressure-skipped' -TaskId $focus -Phase 'B' -Iteration $i `
+      -Payload @{ reason = $bpRes.Reason }
+  } else {
+    foreach ($bpf in $bpRes.Failures) {
+      $bp += $bpf.Message
+      Append-Event -EventType 'backpressure-failed' -TaskId $focus -Phase 'B' -Iteration $i `
+        -Payload @{ command = $bpf.Command; exit_code = $bpf.ExitCode; tail = (($bpf.Tail -split "`n" | Select-Object -Last 5) -join "`n") }
     }
 
-    # M-09 E: tsc-clean → tsc-broken = регрессия. Откатываем правки итерации к pre-iter snapshot.
+    # M-09 E: было чисто → сломалось = регрессия. Откатываем правки итерации к pre-iter snapshot.
     # Default on (M-09 E, опт-аут через -NoAutoRollback). Стэш-объект из stash create
     # содержит diff working-tree + index; checkout его дерева вернёт файлы в pre-iter состояние.
+    # Сравнение идёт по ОДНОМУ И ТОМУ ЖЕ набору команд: сменился набор — сравнивать не с чем,
+    # и откат не срабатывает.
     # SAFETY: откатываемся ТОЛЬКО к свежему snapshot'у (stash-create объект),
     # который отличается от HEAD. Если stash create дал пусто и preIterTreeRef
     # свалился в fallback `rev-parse HEAD`, checkout вернул бы дерево к старому
     # HEAD и уничтожил все uncommitted-правки (дни работы). Тогда — не откатываем.
     $headSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
-    if ((-not $NoAutoRollback) -and $tscExit -ne 0 -and $lastTscExit -eq 0 -and $preIterTreeRef -and ($preIterTreeRef -ne $headSha)) {
-      Log "REGRESSION: tsc был чист на iter $($i-1), сломан на iter $i. Откат до $preIterTreeRef."
+    if ((-not $NoAutoRollback) -and (-not $bpRes.Clean) -and $lastBpClean -and ($lastBpSignature -eq $bpRes.Signature) -and $preIterTreeRef -and ($preIterTreeRef -ne $headSha)) {
+      Log "REGRESSION: backpressure был чист на iter $($i-1), сломан на iter $i. Откат до $preIterTreeRef."
       $regrDiff = (& git diff $preIterTreeRef HEAD --stat 2>$null | Out-String).Trim()
       # checkout всех файлов из snapshot обратно в working-tree
       & git checkout $preIterTreeRef -- . 2>&1 | Out-Null
       Append-Event -EventType 'iter-rolled-back' -TaskId $focus -Phase 'B' -Iteration $i `
-        -Payload @{ reason = 'tsc-regression'; pre_iter_ref = $preIterTreeRef; rolled_diff_stat = $regrDiff }
-      $bp += "AUTO-ROLLBACK: твои правки сломали tsc (был exit=0, стал exit=$tscExit). Раннер откатил working-tree до состояния начала этой итерации. Diff отката:`n$regrDiff`nДействия: НЕ повторяй те же правки. Сначала reproduce проблему минимальным шагом, потом точечный фикс."
-      # после отката пересчитываем tsc — для $lastTscExit на следующую итерацию
-      $tscOut = & npx --no-install tsc --noEmit 2>&1
-      $tscExit = $LASTEXITCODE
+        -Payload @{ reason = 'backpressure-regression'; pre_iter_ref = $preIterTreeRef; rolled_diff_stat = $regrDiff }
+      $bp += "AUTO-ROLLBACK: твои правки сломали быструю проверку (была чистой, стала красной). Раннер откатил working-tree до состояния начала этой итерации. Diff отката:`n$regrDiff`nДействия: НЕ повторяй те же правки. Сначала reproduce проблему минимальным шагом, потом точечный фикс."
+      # после отката пересчитываем набор — для следующей итерации
+      $bpRes = Invoke-BcfBackpressure -Root $root -Commands $BpCommands
     }
-  } else {
-    # Гейт не выполнялся: нейтральный ноль, чтобы не зажечь регрессионную логику
-    # фиктивной парой «был 0 / стал не-0» на следующих итерациях.
-    $tscExit = 0
   }
-  $lastTscExit = $tscExit
+  # Для отчёта пропуск и чистый прогон — разные вещи (первое ушло событием). Для
+  # регрессионной логики пропуск нейтрален: сравнивать не с чем, и откатывать нечего.
+  $lastBpClean = [bool]$bpRes.Clean -or [bool]$bpRes.Skipped
+  $lastBpSignature = $bpRes.Signature
   if ($hasBash) {
     $dgOut = & $bcfBash ".claude/hooks/done-gate.sh" 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -953,14 +956,14 @@ $culprit
   }
 
   # M-09 (2026-05-25, фикс A+B): если backpressure не чист — не зовём человека и
-  # не запускаем верификацию на заведомо плохом коде. Сначала агент чинит tsc/lint/done-gate,
+  # не запускаем верификацию на заведомо плохом коде. Сначала агент чинит быструю проверку/lint/done-gate,
   # потом — friction-trigger и verify. Раньше: human-callout прилетал на broken-syntax
   # коммит (TASK-03 iter=2), а judge крутился на dirty-bp коде (TASK-03 iter=1).
   $verifyMarker = Join-Path $root ".bcf\VERIFY-REQUEST"
   if ($bp.Count -gt 0) {
     if (Test-Path $verifyMarker) {
       Remove-Item $verifyMarker -Force -ErrorAction SilentlyContinue
-      Log "VERIFY-REQUEST снят: backpressure не чист — сначала фикс tsc/lint/done-gate."
+      Log "VERIFY-REQUEST снят: backpressure не чист — сначала фикс быстрой проверки/lint/done-gate."
       Append-Event -EventType 'verify-suppressed' -TaskId $focus -Phase 'B' -Iteration $i `
         -Payload @{ reason = 'backpressure-not-clean'; bp_count = $bp.Count }
       $bp += "VERIFY-REQUEST снят раннером: backpressure не чист (см. ошибки выше). Исправь их, потом снова создавай маркер."
@@ -1521,7 +1524,7 @@ $NoProgressLimit итерации подряд БЕЗ изменений про�
 У тебя ещё $remaining итераций. НЕ останавливайся. Сделай СЛЕДУЮЩЕЕ:
 1. Возьми КОНКРЕТНУЮ упавшую проверку из remediation последнего вердикта (ниже) и почини её
    минимальным точечным изменением ПРОДУКТОВОГО файла из DoD §3.
-2. Если правка ломала tsc и откатывалась — НЕ повторяй её; воспроизведи минимально, потом фикс.
+2. Если правка ломала быструю проверку и откатывалась — НЕ повторяй её; воспроизведи минимально, потом фикс.
 3. Если уверен, что всё сделано — создай .bcf/VERIFY-REQUEST (а не правь STATE.md).
 4. ЗАПРЕЩЕНО: редактировать только .bcf/-файлы, «думать» без edit, повторять откатанную правку.
 
@@ -1549,12 +1552,7 @@ $(if ($remBlock) { $remBlock } else { '(вердикта ещё нет — сд�
 
   # 6. STATE.md (legacy compat) + Compute-State JSON
   $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-  $block = "# Ralph STATE`n`n## Итерация $i — $ts — задача $focus`n`n"
-  if ($bp.Count -gt 0) {
-    $block += "BACKPRESSURE — исправь это первым шагом следующей итерации:`n`n" + ($bp -join "`n`n") + "`n"
-  } else {
-    $block += "Backpressure чист (tsc 0, done-gate ok). Переходи к следующей фазе активной задачи.`n"
-  }
+  $block = Format-BcfStateBlock -Iteration $i -TaskId $focus -Backpressure $bp -Timestamp $ts
   Set-Content $stateFile $block -Encoding UTF8
   Append-Event -EventType 'iter-completed' -TaskId $focus -Phase 'loop' -Iteration $i `
     -Payload @{ backpressure = ($bp.Count -gt 0); bp_summary = (($bp -join " || ").Substring(0, [Math]::Min(300, ($bp -join " || ").Length))) }
