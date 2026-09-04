@@ -97,7 +97,7 @@ Backtick (`` ` ``) is PowerShell line continuation; for Bash use `\`.
 Always quote paths with spaces:
 
 ```bash
-"{{PROJECT_ROOT}}/.claude/hooks/skill-lint.sh"
+".claude/hooks/skill-lint.sh"
 ```
 
 Forward slashes work in both shells for relative paths; backslashes need escaping in Bash strings.
@@ -117,7 +117,7 @@ A subagent that pipes output and ignores `$?` cannot tell PASS from FAIL.
 
 ## When NOT to use
 
-For one-off interactive exploration inside the Glaz bog meta project itself, this skill does not apply — that environment uses Git Bash directly. This skill targets agents acting inside `{{PROJECT_ROOT}}/`.
+This skill targets agents acting inside the repository root (`git rev-parse --show-toplevel`).
 
 ## Related
 

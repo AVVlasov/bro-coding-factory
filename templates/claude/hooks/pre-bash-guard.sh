@@ -51,7 +51,7 @@ fi
 
 # Deleting outside project directory
 if echo "$command" | grep -qE 'rm\s+.*\.\./|rm\s+/[^D]|del\s+/[sS]'; then
-  echo '{"decision":"block","reason":"Deletion outside project directory blocked. Only modify files within {{PROJECT_ROOT}}/."}'
+  echo '{"decision":"block","reason":"Deletion outside project directory blocked. Only modify files inside the repository root (git rev-parse --show-toplevel)."}'
   exit 0
 fi
 
