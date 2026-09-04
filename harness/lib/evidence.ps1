@@ -116,28 +116,47 @@ function Collect-Evidence {
         }
     }
 
-    # 4. Tests-results (если есть) -----------------------------------------
-    $trDir = Join-Path $Repo 'test-results'
-    if (Test-Path $trDir) {
-        $junit = Get-ChildItem -LiteralPath $trDir -Filter '*.xml' -Recurse -ErrorAction SilentlyContinue |
-                 Select-Object -First 1
-        if ($junit) {
+    # 4. Отчёты о тестах ---------------------------------------------------
+    #
+    # Каталогов больше одного, и файлов в каждом больше одного. Maven кладёт по XML на
+    # тестовый класс в target/surefire-reports (юниты) и target/failsafe-reports
+    # (интеграционные), поэтому «взять первый найденный», как было раньше, показало бы
+    # судье один класс из сотни, а на Java-проекте — пустую сводку: каталога test-results
+    # там нет вовсе. Читаем ВСЕ файлы во всех каталогах и складываем.
+    $reportDirs = @('test-results', 'target/surefire-reports', 'target/failsafe-reports')
+    $junitFiles = @()
+    foreach ($rd in $reportDirs) {
+        $d = Join-Path $Repo ($rd -replace '/', '\')
+        if (-not (Test-Path $d)) { continue }
+        $junitFiles += @(Get-ChildItem -LiteralPath $d -Filter '*.xml' -Recurse -File -ErrorAction SilentlyContinue)
+    }
+    if ($junitFiles.Count) {
+        $tot = 0; $fail = 0; $err = 0; $skip = 0; $suiteCount = 0
+        $srcDirs = @()
+        foreach ($junit in $junitFiles) {
             try {
                 [xml]$x = Get-Content -Raw -LiteralPath $junit.FullName
-                $ts = @($x.testsuites.testsuite)
-                $tot = 0; $fail = 0; $err = 0; $skip = 0
-                foreach ($s in $ts) {
+                $suites = @()
+                if ($x.testsuite)  { $suites += @($x.testsuite) }
+                if ($x.testsuites) { $suites += @($x.testsuites.testsuite) }
+                foreach ($s in @($suites | Where-Object { $_ })) {
+                    $suiteCount++
                     if ($s.tests)    { $tot  += [int]$s.tests }
                     if ($s.failures) { $fail += [int]$s.failures }
                     if ($s.errors)   { $err  += [int]$s.errors }
                     if ($s.skipped)  { $skip += [int]$s.skipped }
                 }
-                $ev.tests = [ordered]@{
-                    total = $tot; failed = $fail; errors = $err; skipped = $skip;
-                    passed = ($tot - $fail - $err - $skip)
-                    source = $junit.FullName.Substring($Repo.Length).TrimStart('\','/')
-                }
+                $srcDirs += (Split-Path $junit.FullName -Parent).Substring($Repo.Length).TrimStart('\','/')
             } catch { }
+        }
+        if ($suiteCount) {
+            $ev.tests = [ordered]@{
+                total = $tot; failed = $fail; errors = $err; skipped = $skip;
+                passed = ($tot - $fail - $err - $skip)
+                suites = $suiteCount
+                files  = $junitFiles.Count
+                source = (($srcDirs | Select-Object -Unique) -join ', ')
+            }
         }
     }
 

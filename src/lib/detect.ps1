@@ -76,6 +76,15 @@ $script:BcfEcosystems = @(
     @{ key = 'dotnet'; manifest = '*.sln'
        product = @('src'); typecheck = 'dotnet build --nologo -v q'
        tests = @{ runner = '' }; generated = @() }
+    # Maven. Продуктовые пути названы точно, а не одним 'src': в раскладке Maven под src
+    # лежат и тесты (src/test/java), и правка теста засчиталась бы продуктовым прогрессом.
+    # typecheck взят test-compile, а не compile: фаза compile пропускает src/test/java,
+    # и сломанный тестовый исходник доехал бы до верификации, потратив целый круг.
+    # target — вывод сборки: он обязан быть в generated, иначе грязный target заблокирует
+    # слияние ровно так же, как однажды заблокировал лок-файл.
+    @{ key = 'maven';  manifest = 'pom.xml'
+       product = @('src/main/java', 'src/main/resources'); typecheck = '.\mvnw.cmd -B -q -DskipTests test-compile'
+       tests = @{ runner = 'maven' }; generated = @('target') }
 )
 
 # Члены cargo-воркспейса. Разбирать их обязательно: в воркспейсе крейт может лежать где
@@ -150,11 +159,17 @@ function Get-BcfNodeScripts {
 function Get-BcfTestCounts {
     param([Parameter(Mandatory)][string]$Root, [string[]]$ProductPaths = @())
 
+    # ExtraDirs — каталоги вне продуктовых путей, где раннер держит свои тесты. У cargo,
+    # vitest, pytest и go тесты лежат рядом с кодом, а Maven уносит их в src/test/java,
+    # который в productPaths не входит намеренно. Без этой добавки полный набор JUnit 5
+    # был бы посчитан как ноль, и владелец решил бы, что тестов нет.
     $pats = @(
         @{ Runner = 'cargo';  Ext = @('.rs');            Rx = '#\[(tokio::)?test\]' }
         @{ Runner = 'vitest'; Ext = @('.ts', '.tsx', '.js', '.jsx'); Rx = '(?m)^\s*(it|test)\s*\(' }
         @{ Runner = 'pytest'; Ext = @('.py');            Rx = '(?m)^\s*def\s+test_' }
         @{ Runner = 'go';     Ext = @('.go');            Rx = '(?m)^func\s+Test\w+\(' }
+        @{ Runner = 'maven';  Ext = @('.java');          Rx = '(?m)^\s*@(Test|ParameterizedTest|RepeatedTest)\b'
+           ExtraDirs = @('src/test/java', 'src/it/java') }
     )
     $dirs = @($ProductPaths | ForEach-Object { Join-Path $Root ($_ -replace '/', '\') } | Where-Object { Test-Path $_ })
     if (-not $dirs.Count) { $dirs = @($Root) }
@@ -162,7 +177,11 @@ function Get-BcfTestCounts {
     $out = @{}
     foreach ($p in $pats) {
         $n = 0
-        foreach ($dir in $dirs) {
+        $scan = @($dirs)
+        if ($p.ContainsKey('ExtraDirs')) {
+            $scan += @($p.ExtraDirs | ForEach-Object { Join-Path $Root ($_ -replace '/', '\') } | Where-Object { Test-Path $_ })
+        }
+        foreach ($dir in @($scan | Select-Object -Unique)) {
             foreach ($f in (Get-ChildItem -LiteralPath $dir -Recurse -File -ErrorAction SilentlyContinue |
                             Where-Object { $p.Ext -contains $_.Extension.ToLower() })) {
                 try { $n += ([regex]::Matches((Get-Content -Raw -LiteralPath $f.FullName -EA SilentlyContinue), $p.Rx)).Count } catch { }
@@ -296,6 +315,13 @@ function Invoke-BcfDetect {
 
     # Крейты воркспейса вне 'src'/'crates' — например app/src-tauri в Tauri-проекте.
     $product += @(Get-BcfCargoMembers -Root $Root)
+
+    # Обёртка Maven на Windows зовётся mvnw.cmd, и форма ./mvnw в PowerShell не разрешится.
+    # Обёртки может не быть вовсе — тогда предложенная команда не существует, а гейт на
+    # несуществующей команде красный всегда, и агент чинит несуществующее. Падаем на mvn.
+    if (@($eco | Where-Object { $_.key -eq 'maven' }).Count -and -not (Test-Path (Join-Path $Root 'mvnw.cmd'))) {
+        $typechecks = @($typechecks | ForEach-Object { $_ -replace '^\.\\mvnw\.cmd', 'mvn' })
+    }
 
     # Node: команда быстрой проверки существует, только если в package.json есть скрипт.
     # Придумывать её самим — прямой путь к вечно красному гейту.
