@@ -2,7 +2,7 @@
 
 Локальный тест-харнес для проверки петли саморефлексии итераций <проект>.
 
-> **Зона ответственности:** Глаз бога (см. [[feedback_testing-infra-is-my-job]]).
+> **Зона ответственности:** владелец фабрики. Судьи и тест-обвязка — его слой, кодовый агент их не правит.
 > Харнес должен **реально проходить** на текущем коде ретроспектора/памяти/гейтов,
 > а не считаться рабочим «по старому аудиту».
 
@@ -46,13 +46,15 @@ retrospection/
 pwsh "<BCF_HOME>/meta/judges/harness/retrospection/run.ps1"
 ```
 
-Выход — markdown-отчёт в `$(Join-Path $env:BCF_PROJECT_ROOT '.bcfetros')\M-13-harness-run-<YYYY-MM-DD>.md`.
+Выход — markdown-отчёт в `$(Join-Path $env:BCF_PROJECT_ROOT '.bcf
+etros')\M-13-harness-run-<YYYY-MM-DD>.md`.
 
 ## Зависимости (env-check)
 
 - LM Studio с загруженной `bge-m3` на `http://localhost:1234/v1/embeddings`.
 - Postgres с pgvector, БД `bcf_agent_memory`, схема `agent_memory` (см. M-13 C2.0).
-- `$(Join-Path $env:BCF_PROJECT_ROOT '.claudegentsetrospector.md')` существует.
+- `$(Join-Path $env:BCF_PROJECT_ROOT '.claudegents
+etrospector.md')` существует.
 - Хук `$(Join-Path $env:BCF_PROJECT_ROOT '.claude\hooks\subagent-finding-gate.sh')` существует и исполняем.
 
 `env-check.ps1` падает явным сообщением, если чего-то нет — это **ожидаемое красное состояние**

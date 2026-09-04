@@ -75,4 +75,4 @@
 - [ ] `retrospector-judge` REJECT-rate не нулевой — судья реально что-то ловит,
       а не штампует ACCEPT. (Если 100% ACCEPT за месяц — судья деградировал.)
 
-См. `D:\eye of god\skills\drafts\retro-metrics.md` — скрипт сбора метрик.
+См. `meta/templates/retro-metrics.md` — скрипт сбора метрик.

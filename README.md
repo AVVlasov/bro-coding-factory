@@ -150,6 +150,8 @@ memory/      pgvector + история (одна установка на все 
 tests/       дымовые тесты CLI
 ```
 
+Что меняется в фабрике дальше — [docs/ROADMAP.md](docs/ROADMAP.md).
+
 Подробно — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), настройка —
 [docs/SETUP.md](docs/SETUP.md), все ключи конфига — [docs/CONFIG.md](docs/CONFIG.md).
 

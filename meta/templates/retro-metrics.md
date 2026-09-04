@@ -10,7 +10,7 @@ finding'и снова игнорируются).
 
 ## What it produces
 
-Markdown-отчёт в `D:\eye of god\projects\<project>\retros\metrics-<YYYY-MM-DD>.md`
+Markdown-отчёт в `meta/projects/<project>/retros/metrics-<YYYY-MM-DD>.md`
 со следующими разделами:
 
 1. **Vector memory health**
@@ -51,7 +51,7 @@ $avgSim     = & $psql "SELECT round(avg(similarity)::numeric, 3) FROM agent_memo
 
 # 3-5: ретроспективные JSON хранятся в samanta retros/ — парсятся отдельно.
 
-# Записать .md отчёт в D:\eye of god\projects\samanta_project\retros\metrics-<date>.md
+# Записать .md отчёт в meta/projects/<project>/retros/metrics-<date>.md
 ```
 
 ## When NOT to use
@@ -60,7 +60,7 @@ $avgSim     = & $psql "SELECT round(avg(similarity)::numeric, 3) FROM agent_memo
 
 ## Related
 
-- `D:\eye of god\wiki\best-practices\project-audit-checklist.md` §9 — чеклист, который
+- `meta/wiki/best-practices/project-audit-checklist.md` §9 — чеклист, который
   этот отчёт автоматизирует.
 - M-13 C6 — задача, в рамках которой драфт создан.
 
