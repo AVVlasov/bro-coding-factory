@@ -14,7 +14,8 @@ $suites = @(
     @{ Name = 'CLI';              File = Join-Path $PSScriptRoot 'cli.tests.ps1' },
     @{ Name = 'граф-рантайм';     File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'graph-runtime.tests.ps1' },
     @{ Name = 'слияние worktree'; File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'merge-integration.tests.ps1' },
-    @{ Name = 'journey-gate';     File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'journey-gate.tests.ps1' }
+    @{ Name = 'journey-gate';     File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'journey-gate.tests.ps1' },
+    @{ Name = 'java-хуки';        File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'java-hooks.tests.ps1' }
 )
 
 $results = @()
