@@ -125,7 +125,12 @@ foreach ($lens in @($lensSet.Lenses)) {
 }
 if (-not $LENSES.Count) {
     Write-GraphLog "ни у одного ракурса нет текста — ни в проекте, ни в шаблонах фабрики; смотреть нечем"
-    return @{ findings = 0; reason = 'ракурсы не заданы' }
+    # «findings = 0» здесь означало бы «посмотрели и не нашли», хотя не смотрел никто:
+    # graph.ps1 читает это поле и печатал «итог: ок». criticsExpected + criticsRun = 0
+    # разводят два разных нуля — «чисто» и «некому было смотреть».
+    return @{ findings = 0; criticsExpected = $true; criticsRun = 0
+              criticsReason = 'ракурсы ревью не заданы: текста нет ни в .claude/agents/critics/, ни в шаблонах фабрики'
+              reason = 'ракурсы не заданы' }
 }
 Write-GraphLog ("ракурсы ревью: $($LENSES.Count) из $(if ($lensSet.FromProject) { 'config/review-lenses.json' } else { 'умолчания фабрики' })" +
                 ", блокирующих $(@($LENSES | Where-Object { $_.Blocking }).Count)")
@@ -226,7 +231,7 @@ while ($dryRounds -lt $MAX_DRY) {
     Set-GraphVar known (@($seen.Keys) -join ' | ')
 
     # Промпты собирает общая функция — та же, что у приёмки. Текст ракурса уже прочитан
-    # выше (он не меняется между раундами), поэтому сюда он приходит полем Ask.
+    # выше (он не меняется между раундами), поэтому сюда он приходит готовым, полем Text.
     $built = Build-BcfCriticPrompts -Lenses $LENSES_USED -Root $root `
                 -Header 'Ты ищешь дефекты в изменённом коде. Твой РАКУРС — только этот, остальные смотрят другие:' `
                 -Tail @"

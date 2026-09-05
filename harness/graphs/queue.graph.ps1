@@ -722,6 +722,25 @@ $advisoryFailed = if ($measure) { [int]$measure.AdvisoryFailed } else { 0 }
 if ($criticsFailed) { Write-GraphLog "⚠ приёмка неполна: не ответило блокирующих ракурсов — $criticsFailed из $criticsRun" }
 if ($advisoryFailed) { Write-GraphLog "· не ответило совещательных ракурсов — $advisoryFailed (на вердикт не влияет)" }
 
+# ПРИЁМКА, КОТОРОЙ НЕ БЫЛО, — ЭТО НЕ «ПРИЁМКА БЕЗ НАХОДОК».
+#
+# У не ответившего критика сигнал есть ($criticsFailed выше). У случая «ни у одного ракурса
+# нет текста» его не было: $measure оставался $null, criticsRun и criticsFailed становились
+# нулями, в отчёт уезжало «P1 приёмки: 0», и прогон объявлял COMPLETE — при том что смотреть
+# было некому. Пока тексты лежали строками в этом файле, случай был невозможен; с переездом
+# текстов в проект он появился и выглядит исправным с обоих концов цепочки.
+#
+# Путь не выдуманный: запись внешней рассылки правил
+# {"id":"java","owner":"лидер java","blocking":true,"file":".claude/agents/testers/java.md"}
+# при отсутствующем файле тестера даёт ровно ноль промптов — и ни одной строки о том, что
+# приёмка не выполнялась.
+$acceptanceExpected = [bool]($passed.Count -and -not $script:GraphCtx.DryPlan)
+$acceptanceSkipped  = ($acceptanceExpected -and $criticsRun -eq 0)
+if ($acceptanceSkipped) {
+    Write-GraphLog ("⚠ приёмка НЕ ВЫПОЛНЯЛАСЬ: в дерево слито задач $($passed.Count), " +
+                    'а ракурсов с текстом ноль — смотреть было некому')
+}
+
 # ---------------------------------------------------------------------------
 Set-Phase 'Итог'
 # ---------------------------------------------------------------------------
@@ -743,7 +762,7 @@ $reviewFile = if ($script:GraphCtx.DryPlan) {
 $statusFile = if ($script:GraphCtx.DryPlan) { Join-Path $script:GraphCtx.Dir 'run-all.status.dry.json' } else { '' }
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $tasks.Count -Root $root `
     -ReviewFile $reviewFile -StatusFile $statusFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `
-    -AcceptanceP1 $blockP1
+    -AcceptanceP1 $blockP1 -AcceptanceSkipped:$acceptanceSkipped
 
 # Раздел приёмки пишет общая функция (harness/lib/critics.ps1): тот же раздел собирает
 # ревью, и две реализации «как показать находки» разъехались бы на первом же изменении.
@@ -825,5 +844,12 @@ return @{ complete = $rep.complete; passed = $rep.passed; total = $rep.total; st
           findings = $blockAll.Count; findingsP1 = $blockP1
           advisory = $(if ($measure) { @($measure.Advisory).Count } else { 0 })
           advisoryP1 = $(if ($measure) { [int]$measure.AdvisoryP1 } else { 0 })
-          criticsRun = $criticsRun; criticsFailed = $criticsFailed; advisoryFailed = $advisoryFailed }
+          criticsRun = $criticsRun; criticsFailed = $criticsFailed; advisoryFailed = $advisoryFailed
+          # criticsExpected отвечает на вопрос, который ноль в criticsRun сам по себе не
+          # различает: приёмка не запускалась потому, что сливать было нечего, или потому,
+          # что смотреть было некому. Второе — не зелёный прогон.
+          criticsExpected = $acceptanceExpected
+          criticsReason = $(if ($acceptanceSkipped) {
+              'слито задач ' + $passed.Count + ', а ракурсов с текстом ноль: ни в .claude/agents/critics/, ни в шаблонах фабрики'
+          } else { '' }) }
 

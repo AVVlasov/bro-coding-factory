@@ -122,7 +122,12 @@ function Emit-RunAllReport {
         # них не знал: круг приёмки печатал «COMPLETE» и следом список из трёх P1.
         # Находка уровня «пользователь видит неверные данные» — это не примечание к
         # готовности, это её отсутствие.
-        [int]$AcceptanceP1 = 0)
+        [int]$AcceptanceP1 = 0,
+        # Приёмка ОЖИДАЛАСЬ, но не выполнялась: в дерево слито хоть что-то, а смотреть
+        # оказалось некому — ни у одного ракурса нет текста. Ноль находок при нулевой
+        # приёмке неотличим от чистой приёмки, если не сказать об этом отдельно; так
+        # прогон и объявлял COMPLETE, ни разу никого не спросив.
+        [bool]$AcceptanceSkipped = $false)
 
   $gateBlocked = @($Stuck | Where-Object { $_.Reason -like 'gate-block*' })
   $needsHuman  = @($Stuck | Where-Object { $_.Reason -notlike 'gate-block*' })
@@ -153,7 +158,7 @@ function Emit-RunAllReport {
     }
   } catch { $journeyState = 'unknown'; $journeySummary = $_.Exception.Message }
 
-  $complete = $queueClosed -and ($journeyState -eq 'ok') -and ($AcceptanceP1 -eq 0)
+  $complete = $queueClosed -and ($journeyState -eq 'ok') -and ($AcceptanceP1 -eq 0) -and (-not $AcceptanceSkipped)
 
   $reasonOf = @{}
   foreach ($s in $Stuck) { $reasonOf[$s.Task] = $s.Reason }
@@ -172,6 +177,9 @@ function Emit-RunAllReport {
     queue_closed   = $queueClosed
     journeys       = $journeyState
     acceptance_p1  = $AcceptanceP1
+    # Вызывающий агент читает этот файл вместо попапа: «приёмка не выполнялась» обязана
+    # быть в нём отдельным полем, иначе ноль находок читается как чистая приёмка.
+    acceptance_skipped = $AcceptanceSkipped
     when         = $Ts
     total        = $Total
     passed       = @($Passed).Count
@@ -195,6 +203,12 @@ function Emit-RunAllReport {
   $gateLines = if ($gateBlocked.Count) { ($gateBlocked | ForEach-Object { "- **$($_.Task)** — $($_.Reason)" }) -join "`n" } else { "- (нет)" }
   $statusLine = if ($complete) {
     "**Статус:** COMPLETE — все $Total задач закрыты (PASS) И сквозные сценарии продукта зелёные."
+  } elseif ($queueClosed -and $AcceptanceSkipped) {
+    "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ПРИЁМКА НЕ ВЫПОЛНЯЛАСЬ — все $Total задач закрыты (PASS), " +
+    "но слитое дерево не смотрел ни один ракурс: текста нет ни в проекте (``.claude/agents/critics/``), " +
+    "ни в шаблонах фабрики. «Находок нет» здесь означало бы, что смотрели и не нашли, — а не смотрел " +
+    "никто. Проверь ``config/review-lenses.json``: ракурс со ссылкой на несуществующий файл пропускается. " +
+    "НЕ принимать за «готово»."
   } elseif ($queueClosed -and $journeyState -eq 'not-configured') {
     "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ПРОДУКТ НЕ ПРОВЕРЕН — все $Total задач закрыты (PASS), " +
     "но сквозные сценарии не заведены (config/journeys.json). Это НЕ «готово»: закрытая очередь " +
