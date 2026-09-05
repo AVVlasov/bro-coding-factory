@@ -465,17 +465,37 @@ Set-Content -LiteralPath (Join-Path $reportProj 'tasks\TASK-01-card.md') -Encodi
 
 - `src/app.ts`
 '@
+# Вторая задача называет ТО ЖЕ требование 3.1.1 и своё 3.2.7. Требование, названное двумя
+# задачами, — ровно тот случай, ради которого раздел заведён: одна задача из двух закрывает
+# половину пункта, а половина требования это незакрытое требование.
+Set-Content -LiteralPath (Join-Path $reportProj 'tasks\TASK-02-plan.md') -Encoding UTF8 -Value @'
+# TASK-02 — план врача
+
+**Требование:** 3.1.1, 3.2.7
+
+## Файлы
+
+- `src/plan.ts`
+'@
 
 $reportRunner = Join-Path $box 'run-report.ps1'
 Set-Content -LiteralPath $reportRunner -Encoding UTF8 -Value @'
-param([string]$RunAll, [string]$Root, [string]$Review, [string]$Status, [int]$P1, [string]$GraphFile, [string]$Result)
+param([string]$RunAll, [string]$Root, [string]$Review, [string]$Status, [int]$P1, [string]$GraphFile, [string]$Result,
+      [string]$PassedIds = 'TASK-01', [string]$StuckIds = '', [string]$Ts = '2026-09-05 00:00:00',
+      [switch]$BreakRequirements)
 $ErrorActionPreference = 'Stop'
 $env:BCF_REPORT_LIB_ONLY = '1'
 $env:BCF_PROJECT_ROOT = $Root
 if ($GraphFile) { $env:BCF_GRAPH_FILE = $GraphFile } else { Remove-Item Env:\BCF_GRAPH_FILE -ErrorAction SilentlyContinue }
 . $RunAll -ProjectRoot $Root
-$rep = Emit-RunAllReport -Passed @('TASK-01') -Stuck @() -Total 1 -Root $Root `
-    -ReviewFile $Review -StatusFile $Status -Ts '2026-09-05 00:00:00' -AcceptanceP1 $P1
+# Сторож молчаливого catch: разбор требований роняется нарочно, и отчёт обязан сказать об
+# этом вслух, а не выйти без раздела. Подмена работает потому, что PowerShell ищет команду
+# в момент вызова, а не в момент разбора функции.
+if ($BreakRequirements) { function Get-TaskRequirements { throw 'каталог задач недоступен' } }
+$passed = @($PassedIds -split ',' | Where-Object { $_ })
+$stuck  = @($StuckIds  -split ',' | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Task = $_; Reason = 'stuck' } })
+$rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total ($passed.Count + $stuck.Count) -Root $Root `
+    -ReviewFile $Review -StatusFile $Status -Ts $Ts -AcceptanceP1 $P1
 ([ordered]@{
     complete = [bool]$rep.complete
     review   = (Get-Content -Raw -LiteralPath $Review)
@@ -484,12 +504,16 @@ $rep = Emit-RunAllReport -Passed @('TASK-01') -Stuck @() -Total 1 -Root $Root `
 '@
 
 function Invoke-Report {
-    param([int]$P1 = 0, [string]$GraphFile = '')
+    param([int]$P1 = 0, [string]$GraphFile = '', [string]$PassedIds = 'TASK-01', [string]$StuckIds = '',
+          [string]$Ts = '2026-09-05 00:00:00', [switch]$BreakRequirements)
     $tag = [guid]::NewGuid().ToString('N').Substring(0, 6)
     $result = Join-Path $box "result-$tag.json"
-    & pwsh -NoProfile -NonInteractive -File $reportRunner -RunAll $runAll -Root $reportProj `
-        -Review (Join-Path $box "REVIEW-$tag.md") -Status (Join-Path $box "status-$tag.json") `
-        -P1 $P1 -GraphFile $GraphFile -Result $result *> $null
+    $argv = @('-RunAll', $runAll, '-Root', $reportProj,
+              '-Review', (Join-Path $box "REVIEW-$tag.md"), '-Status', (Join-Path $box "status-$tag.json"),
+              '-P1', $P1, '-GraphFile', $GraphFile, '-Result', $result,
+              '-PassedIds', $PassedIds, '-StuckIds', $StuckIds, '-Ts', $Ts)
+    if ($BreakRequirements) { $argv += '-BreakRequirements' }
+    & pwsh -NoProfile -NonInteractive -File $reportRunner @argv *> $null
     if (-not (Test-Path -LiteralPath $result)) { throw "Emit-RunAllReport не отработал (нет $result)" }
     $r = Get-Content -Raw -LiteralPath $result | ConvertFrom-Json
     $r | Add-Member -NotePropertyName statusObj -NotePropertyValue ($r.status | ConvertFrom-Json)
@@ -912,6 +936,43 @@ It 'требования доезжают до отчёта прогона' {
     $r = Invoke-Report -P1 0
     Assert-Match $r.review 'Требования заказчика'
     Assert-Match $r.review '3\.1\.1'
+}
+
+It 'требование, названное двумя задачами, закрыто только когда закрыты обе' {
+    # Ради этого случая раздел и заведён: 3.1.1 назвали TASK-01 и TASK-02, и пока обе не
+    # PASS, пункт договора не закрыт. Проверка идёт на ДВУХ задачах не для полноты: на одной
+    # задаче раздел был зелёным и при сломанном счёте, потому что список из одного элемента
+    # неотличим от строки, в которую он схлопывается.
+    $r = Invoke-Report -P1 0 -PassedIds 'TASK-01,TASK-02'
+    Assert-Match $r.review '- \*\*3\.1\.1\*\* — закрыто: TASK-01, TASK-02' 'пункт двух закрытых задач не объявлен закрытым'
+    Assert-Match $r.review 'Закрыто пунктов: 3 из 3'
+    Assert-NoMatch $r.review '3\.1\.1\*\* — НЕ закрыто' 'закрытый пункт напечатан незакрытым'
+}
+
+It 'закрытая половина требования оставляет его незакрытым и называет только незакрытую задачу' {
+    # Вторая половина: TASK-01 закрыта, TASK-02 застряла. В строке пункта должна стоять
+    # только TASK-02 (чинить надо её), а «всего задач» — настоящие две, а не единица.
+    $r = Invoke-Report -P1 0 -PassedIds 'TASK-01' -StuckIds 'TASK-02'
+    Assert-Match $r.review '- \*\*3\.1\.1\*\* — НЕ закрыто: TASK-02 \(всего задач: 2\)' 'счёт задач требования неверен'
+    Assert-Match $r.review '- \*\*ДКЦ1\*\* — закрыто: TASK-01' 'пункт единственной закрытой задачи не закрыт'
+    Assert-Match $r.review 'Закрыто пунктов: 1 из 3'
+}
+
+It 'шапка отчёта печатает время прогона, а не список задач' {
+    # Раздел требований стоит в той же функции, что и шапка, и однажды уже перетёр её:
+    # локальная переменная совпала по имени с параметром -Ts, и «Когда» стало списком задач.
+    $r = Invoke-Report -P1 0 -PassedIds 'TASK-01,TASK-02' -Ts '2026-09-05 03:14:15'
+    Assert-Match $r.review '\*\*Когда:\*\* 2026-09-05 03:14:15' 'в шапке отчёта не время прогона'
+    Assert-NoMatch $r.review '\*\*Когда:\*\*[^\r\n]*TASK-' 'в шапку отчёта уехали id задач'
+    Assert-Eq $r.statusObj.when '2026-09-05 03:14:15'
+}
+
+It 'упавший разбор требований назван в отчёте, а не проглочен' {
+    # Пустой catch оставлял отчёт вовсе без раздела и без единого слова о том, что раздел
+    # был: заказчик читает «требований нет» там, где на самом деле «разбор упал».
+    $r = Invoke-Report -P1 0 -BreakRequirements
+    Assert-Match $r.review 'Требования заказчика' 'раздел исчез вместе с ошибкой'
+    Assert-Match $r.review 'каталог задач недоступен' 'причина отказа не названа'
 }
 
 # --- 6. Чем получен вердикт ----------------------------------------------------------------
