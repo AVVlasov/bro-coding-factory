@@ -341,7 +341,7 @@ if (-not $DryPlan) {
     -Closed @($queue | Where-Object {      (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) | Out-Null
   # Коммитим сразу: доска меняется весь прогон, и некоммиченной она делает дерево грязным —
   # то есть отменяет и слияние задачи, и перемотку на старте следующего прогона.
-  Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($runId)" | Out-Null
+  Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($runId)" -RunId $runId -Model $Model -Backend $codeBackend | Out-Null
 }
 
 # --- Параллельный режим (MX-04). При TaskConcurrency <= 1 работает старый
@@ -392,7 +392,7 @@ if ($TaskConcurrency -gt 1 -or $DryPlan) {
 
   # Доска закрывается и уезжает вместе с волной ДО отчёта: отказ отправки обязан попасть
   # в сам отчёт затыком, а не остаться строкой в журнале.
-  $fin = Complete-TeamRun -Root $root -Run $runId -Team $team -Stuck @($res.Stuck)
+  $fin = Complete-TeamRun -Root $root -Run $runId -Team $team -Stuck @($res.Stuck) -Model $Model -Backend $codeBackend
   if (-not $fin.Publish.Ok) { Log "ВОЛНА НЕ ОПУБЛИКОВАНА: $($fin.Publish.Reason)" }
   elseif ($fin.Publish.Kind -eq 'pushed') { Log $fin.Publish.Reason }
 
@@ -459,9 +459,24 @@ while (-not $stopped) {
     [void]$doneSet.Add($task)
 
     if (Verdict-Pass $task) {
-      Log "<<< $task → PASS."
-      $passed += $task
-      Update-TaskStatus -Root $root -Run $runId -Task $task -State 'закрыта' -Node "работа-$task" | Out-Null
+      # ГЕЙТ ПРИЁМКИ И ЗДЕСЬ. Последовательный прогон работает прямо в основном дереве
+      # (M-17: изоляция снимком, а не отдельной веткой задачи) — Merge-TaskWorktree,
+      # где стоит тот же гейт у графа очереди и параллельного планировщика, сюда не
+      # вызывается вовсе, потому что сливать нечего: код уже лежит на месте. Поэтому
+      # гейт здесь не решает, пускать ли git, а решает, закрыта ли задача административно:
+      # CORE/NFR с зелёным вердиктом, но без tasks/.acceptance/<TASK>.md, не считается
+      # закрытой волной — уходит в needs_human той же дословной причиной, что и на
+      # остальных путях, а её код остаётся в дереве (откатывать нечего и незачем).
+      $gate = Test-BcfTaskAcceptanceGate -TaskId $task -Root $root
+      if (-not $gate.Ok) {
+        Log "<<< $task → verdict PASS, но $($gate.Reason) (класс $($gate.Class)) — ждёт приёмки лидера, не закрыта."
+        $stuck += [pscustomobject]@{ Task = $task; Reason = $gate.Reason }
+        Update-TaskStatus -Root $root -Run $runId -Task $task -State 'заблокирована' -Node "приёмка-$task" | Out-Null
+      } else {
+        Log "<<< $task → PASS."
+        $passed += $task
+        Update-TaskStatus -Root $root -Run $runId -Task $task -State 'закрыта' -Node "работа-$task" | Out-Null
+      }
     } else {
       # Реальная причина остановки из STATE.md (gate-block здесь исключён — преды уже PASS).
       $reason = 'не достиг PASS (лимит/затык)'
@@ -518,7 +533,7 @@ while (-not $stopped) {
 # --- Итоговый отчёт (ОДИН на всю ночь).
 # «Готово» звучит ТОЛЬКО при полностью закрытой очереди; иначе INCOMPLETE + exit 1,
 # чтобы неполный прогон не был принят за успешный ни человеком, ни вызывающим агентом. ---
-$fin = Complete-TeamRun -Root $root -Run $runId -Team $team -Stuck @($stuck)
+$fin = Complete-TeamRun -Root $root -Run $runId -Team $team -Stuck @($stuck) -Model $Model -Backend $codeBackend
 if (-not $fin.Publish.Ok) { Log "ВОЛНА НЕ ОПУБЛИКОВАНА: $($fin.Publish.Reason)" }
 elseif ($fin.Publish.Kind -eq 'pushed') { Log $fin.Publish.Reason }
 $stuck = @($fin.Stuck)

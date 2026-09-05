@@ -468,14 +468,16 @@ function Complete-TeamRun {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$Run,
         [Parameter(Mandatory)]$Team,
-        [object[]]$Stuck = @()
+        [object[]]$Stuck = @(),
+        # Трейлеры финального коммита доски — см. Publish-TaskStatus.
+        [string]$Model = '', [string]$Backend = ''
     )
     $stuck = @($Stuck | Where-Object { $_ })
     $needsHuman  = @($stuck | Where-Object { $_.Reason -notlike 'gate-block*' } | ForEach-Object { [string]$_.Task })
     $gateBlocked = @($stuck | Where-Object { $_.Reason -like 'gate-block*' }    | ForEach-Object { [string]$_.Task })
 
     Complete-TaskStatus -Root $Root -Run $Run -NeedsHuman $needsHuman -GateBlocked $gateBlocked | Out-Null
-    Publish-TaskStatus -Root $Root -Message "фабрика: доска задач ($Run)" | Out-Null
+    Publish-TaskStatus -Root $Root -Message "фабрика: доска задач ($Run)" -RunId $Run -Model $Model -Backend $Backend | Out-Null
 
     $wave   = if ($Team -and $Team.Wave)   { [string]$Team.Wave }   else { '' }
     $remote = if ($Team -and $Team.Remote) { [string]$Team.Remote } else { '' }
@@ -485,21 +487,29 @@ function Complete-TeamRun {
         $stuck += [pscustomobject]@{ Task = $(if ($wave) { $wave } else { 'публикация волны' }); Reason = $pub.Reason }
         $needsHuman += $(if ($wave) { $wave } else { 'публикация волны' })
         Complete-TaskStatus -Root $Root -Run $Run -NeedsHuman $needsHuman -GateBlocked $gateBlocked | Out-Null
-        Publish-TaskStatus -Root $Root -Message "фабрика: доска задач ($Run)" | Out-Null
+        Publish-TaskStatus -Root $Root -Message "фабрика: доска задач ($Run)" -RunId $Run -Model $Model -Backend $Backend | Out-Null
     }
     return @{ Stuck = @($stuck); Publish = $pub; NeedsHuman = @($needsHuman); GateBlocked = @($gateBlocked) }
 }
 
 # Доска едет в git вместе с волной. Коммит именно одного файла: иначе доска остаётся
 # грязью в tasks/, а грязный tasks/ отменяет слияние следующей задачи.
+#
+# Трейлеры коммита: доска не привязана к одной задаче (Task остаётся пустым), но её
+# коммит делает КОНКРЕТНЫЙ прогон — RunId/Model/Backend известны вызывающему, Role здесь
+# «оркестратор» (это не работа узла worker/planner/critic/arbiter, а бухгалтерия самого
+# прогона). Без RunId сообщение остаётся литеральным $Message без трейлеров — тот же
+# контракт, что у Publish-BcfClaimChange.
 function Publish-TaskStatus {
     param(
         [Parameter(Mandatory)][string]$Root,
-        [string]$Message = 'фабрика: доска задач'
+        [string]$Message = 'фабрика: доска задач',
+        [string]$RunId = '', [string]$Model = '', [string]$Backend = ''
     )
     $p = Get-TaskStatusPath -Root $Root
     if (-not (Test-Path -LiteralPath $p)) { return @{ Ok = $false; Reason = 'доски задач ещё нет' } }
-    return (Publish-BcfClaimChange -Root $Root -Paths @(Get-TaskStatusRelPath -Root $Root) -Message $Message)
+    return (Publish-BcfClaimChange -Root $Root -Paths @(Get-TaskStatusRelPath -Root $Root) -Message $Message `
+                -RunId $RunId -Role 'оркестратор' -Model $Model -Backend $Backend)
 }
 
 # Имя задачи из метки узла. Метки графа устроены как «работа-TASK-06», «арбитр-TASK-06»,

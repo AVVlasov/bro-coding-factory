@@ -169,7 +169,7 @@ if ($exportArgIdx -ge 0 -or $exportMonth) {
         [void]$lines.Add('(`.bcf/run-all.status.json`) — фабрика в этом месяце либо не работала над проектом,')
         [void]$lines.Add('либо работала до того, как в нём завели ' + '`config/harness.json`.')
         [void]$lines.Add('')
-        [void]$lines.Add('Отчёт умышленно пуст: строка из другого месяца была бы неправдой о этом.')
+        [void]$lines.Add('Отчёт умышленно пуст: строка из другого месяца была бы неправдой об этом.')
     } else {
         if ($rows.Count) {
             [void]$lines.Add('## Задачи')

@@ -220,7 +220,8 @@ if (-not $script:GraphCtx.DryPlan) {
     Reset-TaskStatusBoard -Root $root -Run $script:GraphCtx.RunId `
         -Queued @($tasks | Where-Object { -not $_.Pass } | ForEach-Object { $_.Id }) `
         -Closed @($tasks | Where-Object {      $_.Pass } | ForEach-Object { $_.Id }) | Out-Null
-    Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($($script:GraphCtx.RunId))" | Out-Null
+    Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($($script:GraphCtx.RunId))" `
+        -RunId (Get-GraphRunId) -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend) | Out-Null
 }
 
 # Задача без объявленных файлов к работе НЕ допускается — и отказ выдаётся здесь, до
@@ -852,7 +853,8 @@ $statusFile = if ($script:GraphCtx.DryPlan) { Join-Path $script:GraphCtx.Dir 'ru
 # Доска закрывается и уезжает вместе с волной ДО отчёта: отказ отправки обязан попасть в
 # сам отчёт затыком, а не остаться строкой в журнале, которую утром никто не откроет.
 if (-not $script:GraphCtx.DryPlan) {
-    $fin = Complete-TeamRun -Root $root -Run $script:GraphCtx.RunId -Team $team -Stuck @($stuck)
+    $fin = Complete-TeamRun -Root $root -Run $script:GraphCtx.RunId -Team $team -Stuck @($stuck) `
+        -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
     if (-not $fin.Publish.Ok) { Write-GraphLog "волна не опубликована: $($fin.Publish.Reason)" }
     elseif ($fin.Publish.Kind -eq 'pushed') { Write-GraphLog $fin.Publish.Reason }
     $stuck = @($fin.Stuck)

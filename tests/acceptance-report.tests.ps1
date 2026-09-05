@@ -61,6 +61,7 @@ function Assert-NoMatch {
 
 . (Join-Path $root 'harness\lib\worktree.ps1')       # тянет claims.ps1 и bcf-context.ps1
 . (Join-Path $root 'harness\lib\graph-runtime.ps1')  # Initialize-GraphRun / Get-GraphRunId
+. (Join-Path $root 'harness\lib\team-bus.ps1')       # Reset-TaskStatusBoard / Publish-TaskStatus / Complete-TeamRun
 
 function Get-Sha { param([string]$Repo, [string]$Ref = 'HEAD') return (& git -C $Repo rev-parse $Ref 2>$null | Out-String).Trim() }
 
@@ -346,6 +347,52 @@ It 'QUEUE.GRAPH.PS1: ПРИЧИНА ОТКАЗА УХОДИТ В $stuck ТЕМ �
         'провал узла интеграции не кладётся в $stuck тем же полем Reason — needs_human его не увидит'
 }
 
+# --- 2c2. run-all.ps1 (последовательный прогон) — тот же гейт, без Merge-TaskWorktree ------
+Write-Host ''
+Write-Host '2c2. run-all.ps1 (последовательный прогон): тот же гейт приёмки, без Merge-TaskWorktree' -ForegroundColor White
+
+# Проверяющий опроверг готовность 2026-09-06: гейт приёмки стоял только внутри
+# Merge-TaskWorktree, а последовательный ночной прогон (limits.taskConcurrency <= 1,
+# harness/run-all.ps1) работает прямо в основном дереве (M-17: изоляция снимком, а не
+# отдельной веткой задачи) и Merge-TaskWorktree не зовёт вовсе — CORE/NFR без приёмки на
+# этом пути молча уезжал в $passed. Живой прогон здесь не поставить дёшево: loop.ps1
+# запускается отдельным процессом (`& pwsh @loopArgs`), платная модель. Тот же приём, что
+# уже принят для scheduler.ps1/queue.graph.ps1 этим файлом — регекс по исходнику; сама
+# функция Test-BcfTaskAcceptanceGate уже доказана живьём в разделе 1.
+$runAllSrc = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\run-all.ps1')
+
+It 'RUN-ALL.PS1: ПОСЛЕ VERDICT-PASS ГЕЙТ ПРИЁМКИ ПРОВЕРЯЕТСЯ ПЕРЕД ЗАКРЫТИЕМ ЗАДАЧИ' {
+    $vpIdx = $runAllSrc.IndexOf('if (Verdict-Pass $task) {')
+    Assert-True ($vpIdx -ge 0) 'не нашёл ветку Verdict-Pass в последовательном цикле — сигнатура изменилась, поправь тест'
+    $vpTail = $runAllSrc.Substring($vpIdx, [Math]::Min(900, $runAllSrc.Length - $vpIdx))
+    Assert-True $vpTail.Contains('$gate = Test-BcfTaskAcceptanceGate -TaskId $task -Root $root') `
+        'после verdict: PASS гейт приёмки не проверяется — CORE/NFR без файла приёмки закроется как обычная задача'
+}
+
+It 'RUN-ALL.PS1: БЕЗ ПРИЁМКИ ЗАДАЧА НЕ ПОПАДАЕТ В $passed, УХОДИТ В $stuck ДОСЛОВНОЙ ПРИЧИНОЙ ГЕЙТА' {
+    Assert-True $runAllSrc.Contains('$stuck += [pscustomobject]@{ Task = $task; Reason = $gate.Reason }') `
+        'ветка отказа гейта не кладёт дословную причину ($gate.Reason) в $stuck — needs_human её не увидит'
+    $gateIdx = $runAllSrc.IndexOf('if (-not $gate.Ok) {')
+    $passedIdx = $runAllSrc.IndexOf('$passed += $task')
+    Assert-True ($gateIdx -ge 0 -and $gateIdx -lt $passedIdx) `
+        'проверка гейта стоит не раньше добавления задачи в $passed — CORE/NFR без приёмки успеет закрыться первой'
+}
+
+It 'RUN-ALL.PS1: ОТКАЗ ГЕЙТА НЕ ОТКАТЫВАЕТ КОД ЗАДАЧИ (ОТКАТ — ТОЛЬКО У РЕАЛЬНОГО НЕ-PASS)' {
+    # Последовательный прогон работает в одном дереве без отдельной ветки задачи — код уже
+    # закоммичен. M-17 откатывает дельту (git checkout $preTaskSnap) только когда задача
+    # НЕ достигла verdict: PASS; ветка отказа гейта приёмки лежит внутри if (Verdict-Pass)
+    # и не имеет права трогать этот откат — иначе принятый CORE/NFR потерял бы уже
+    # сделанную и зелёную работу только из-за того, что лидер ещё не нажал accept.
+    $gateBlockIdx = $runAllSrc.IndexOf('if (-not $gate.Ok) {')
+    Assert-True ($gateBlockIdx -ge 0) 'не нашёл ветку отказа гейта в последовательном цикле — поправь тест'
+    $elseIdx = $runAllSrc.IndexOf('} else {', $gateBlockIdx)
+    Assert-True ($elseIdx -gt $gateBlockIdx) 'не нашёл конец ветки отказа гейта (парный } else {) — поправь тест'
+    $gateBlockBody = $runAllSrc.Substring($gateBlockIdx, $elseIdx - $gateBlockIdx)
+    Assert-False $gateBlockBody.Contains('git checkout $preTaskSnap') `
+        'ветка отказа гейта откатывает код задачи — приёмка не должна стирать уже сделанную и зелёную работу'
+}
+
 # --- 2d. Остальные коммиты фабрики: вердикт, парковка правок владельца, заявка -------------
 Write-Host ''
 Write-Host '2d. Publish-TaskVerdict / Save-OwnerEditsToParkedBranch / Publish-BcfClaimChange: трейлеры' -ForegroundColor White
@@ -472,6 +519,80 @@ It 'QUEUE.GRAPH.PS1: ЗАЯВКА И ЕЁ СНЯТИЕ ЗОВУТСЯ С МЕТ�
     $removeWithRunId = ([regex]::Matches($queueSrc, [regex]::Escape('Remove-TaskClaim -TaskId $task -Root $root') + '[^\r\n]*[\r\n]+[^\r\n]*-RunId \(Get-GraphRunId\)')).Count
     Assert-Eq $removeWithRunId $removeCount `
         "не все вызовы Remove-TaskClaim в графе очереди передают -RunId ($removeWithRunId из $removeCount)"
+}
+
+# --- 2e. Доска задач (Publish-TaskStatus/Complete-TeamRun) — трейлеры коммита фабрики ------
+Write-Host ''
+Write-Host '2e. Доска задач: Publish-TaskStatus/Complete-TeamRun несут трейлеры прогона' -ForegroundColor White
+
+# Проверяющий опроверг готовность 2026-09-06: единственный оставшийся путь без трейлеров —
+# коммит доски задач. Publish-TaskStatus звала Publish-BcfClaimChange без Task/RunId/Role/
+# Model/Backend, хотя все четыре её вызывающих (run-all.ps1 x2 прямой вызов + x2 через
+# Complete-TeamRun, queue.graph.ps1 x1 прямой + x1 через Complete-TeamRun) знают прогон.
+# Живой репрод из отчёта проверяющего: Reset-TaskStatusBoard + Publish-TaskStatus.
+
+It 'PUBLISH-TASKSTATUS С МЕТАДАННЫМИ ПРОГОНА ДАЁТ КОММИТ ДОСКИ С ТРЕЙЛЕРАМИ' {
+    $d = New-PlainRepo
+    Reset-TaskStatusBoard -Root $d -Run 'g_test_board1' -Queued @('TASK-01') | Out-Null
+    $pub = Publish-TaskStatus -Root $d -Message 'фабрика: доска задач (g_test_board1)' `
+               -RunId 'g_test_board1' -Model 'opus' -Backend 'claude'
+    Assert-True $pub.Ok "доска не закоммичена: $($pub.Reason)"
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-True $t.Ok "коммит доски задач без трейлеров: не хватает $($t.Missing -join ', ')"
+    $body = (& git -C $d log -1 --format=%B $sha | Out-String)
+    Assert-Match $body 'Run-Id: g_test_board1'
+    Assert-Match $body 'Role: оркестратор'
+}
+
+It 'КОНТРОЛЬ: PUBLISH-TASKSTATUS БЕЗ RUNID — БЕЗ ТРЕЙЛЕРОВ, КАК РАНЬШЕ' {
+    $d = New-PlainRepo
+    Reset-TaskStatusBoard -Root $d -Run 'g_test_board2' -Queued @('TASK-01') | Out-Null
+    $pub = Publish-TaskStatus -Root $d -Message 'фабрика: доска задач (g_test_board2)'
+    Assert-True $pub.Ok $pub.Reason
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-False $t.Ok 'юнит-вызов Publish-TaskStatus без RunId вдруг получил трейлеры'
+}
+
+It 'COMPLETE-TEAMRUN ЗАКРЫВАЕТ ДОСКУ КОММИТОМ С ТРЕЙЛЕРАМИ (ЖИВОЙ ПРОГОН БЕЗ REMOTE)' {
+    $d = New-PlainRepo
+    $fin = Complete-TeamRun -Root $d -Run 'g_test_board3' -Team @{ Ok = $true; Wave = ''; Remote = '' } `
+               -Stuck @() -Model 'opus' -Backend 'claude'
+    Assert-True $fin.Publish.Ok "волна не закрылась локально: $($fin.Publish.Reason)"
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-True $t.Ok "коммит доски от Complete-TeamRun без трейлеров: не хватает $($t.Missing -join ', ')"
+    $body = (& git -C $d log -1 --format=%B $sha | Out-String)
+    Assert-Match $body 'Run-Id: g_test_board3'
+    Assert-Match $body 'Model: opus'
+    Assert-Match $body 'Backend: claude'
+}
+
+It 'RUN-ALL.PS1: ВСЕ ТРИ МЕСТА, ГДЕ ФАБРИКА ЗОВЁТ ДОСКУ, ПЕРЕДАЮТ RUNID/MODEL/BACKEND' {
+    $runAllSrc = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\run-all.ps1')
+    Assert-True $runAllSrc.Contains('Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($runId)" -RunId $runId -Model $Model -Backend $codeBackend') `
+        'прямой вызов Publish-TaskStatus в начале прогона не передаёт метаданные прогона'
+    $completeCalls = ([regex]::Matches($runAllSrc, [regex]::Escape('Complete-TeamRun -Root $root -Run'))).Count
+    $completeWithModel = ([regex]::Matches($runAllSrc, [regex]::Escape('Complete-TeamRun -Root $root -Run') + '[^\r\n]*-Model \$Model -Backend \$codeBackend')).Count
+    Assert-Eq $completeCalls 2 'ждал ровно два вызова Complete-TeamRun в run-all.ps1 (параллельный и последовательный итог) — сигнатура изменилась, поправь тест'
+    Assert-Eq $completeWithModel $completeCalls `
+        "не все вызовы Complete-TeamRun в run-all.ps1 передают -Model/-Backend ($completeWithModel из $completeCalls)"
+}
+
+It 'QUEUE.GRAPH.PS1: ДОСКА И ЕЁ ЗАКРЫТИЕ ПЕРЕДАЮТ RUNID/MODEL/BACKEND' {
+    $psIdx = $queueSrc.IndexOf('Publish-TaskStatus -Root $root -Message "фабрика: доска задач')
+    Assert-True ($psIdx -ge 0) 'не нашёл прямой вызов Publish-TaskStatus в графе очереди — сигнатура изменилась, поправь тест'
+    $psTail = $queueSrc.Substring($psIdx, [Math]::Min(220, $queueSrc.Length - $psIdx))
+    Assert-True $psTail.Contains('-RunId (Get-GraphRunId)') 'прямой вызов Publish-TaskStatus в графе очереди без -RunId'
+    Assert-True $psTail.Contains('-Model (Get-GraphVar codeModel)') 'прямой вызов Publish-TaskStatus в графе очереди без -Model'
+    Assert-True $psTail.Contains('-Backend (Get-GraphVar codeBackend)') 'прямой вызов Publish-TaskStatus в графе очереди без -Backend'
+
+    $ctIdx = $queueSrc.IndexOf('Complete-TeamRun -Root $root -Run $script:GraphCtx.RunId')
+    Assert-True ($ctIdx -ge 0) 'не нашёл вызов Complete-TeamRun в графе очереди — сигнатура изменилась, поправь тест'
+    $ctTail = $queueSrc.Substring($ctIdx, [Math]::Min(220, $queueSrc.Length - $ctIdx))
+    Assert-True $ctTail.Contains('-Model (Get-GraphVar codeModel)') 'Complete-TeamRun в графе очереди без -Model'
+    Assert-True $ctTail.Contains('-Backend (Get-GraphVar codeBackend)') 'Complete-TeamRun в графе очереди без -Backend'
 }
 
 # --- 3. Версия фабрики и хэш файла графа ---------------------------------------------------
