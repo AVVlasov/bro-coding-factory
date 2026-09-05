@@ -230,22 +230,19 @@ function Add-GraphLesson {
 # не строка «память доступна», а РОСТ чисел от прогона к прогону.
 function Get-GraphMemoryStats {
     if (-not (Test-GraphMemory)) { return $null }
-    # Конфиг ищем ТАМ ЖЕ, где клиент: проект, потом фабрика. Прежний путь
-    # (<фабрика>/config/memory.config.json) не существует вовсе — функция всегда возвращала
-    # $null, то есть приёмка прогона молча оставалась без сводки по памяти.
-    $cfgFile = ''
-    foreach ($c in @(
-        $env:BCF_MEM_CONFIG,
-        (Join-Path (Get-BcfProjectRoot) 'config\memory.config.json'),
-        (Join-Path $script:GMemRoot 'memory\memory.config.json')
-    )) {
-        if ($c -and (Test-Path $c)) { $cfgFile = $c; break }
-    }
-    if (-not $cfgFile) { return $null }
+    # Конфиг ищем ТАМ ЖЕ, где клиент, и через тот же файл правил (memory-config.ps1):
+    # проект, потом фабрика, поверх — накладка машины с подобранным контейнером. Прежний
+    # путь (<фабрика>/config/memory.config.json) не существует вовсе — функция всегда
+    # возвращала $null, то есть приёмка прогона молча оставалась без сводки по памяти.
+    . (Join-Path $PSScriptRoot 'memory-config.ps1')
+    $cfg = Resolve-BcfMemorySettings -Project (Get-BcfProjectRoot) -FactoryMemoryDir (Join-Path $script:GMemRoot 'memory')
+    if (-not $cfg) { return $null }
+    # Счётчики считаются через docker exec в НАШ контейнер: для базы на другой машине
+    # такого контейнера нет, и врать про её состояние нечем.
+    if (-not $cfg.IsLocalHost) { return $null }
     try {
-        $cfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
         $sql = "select (select count(*) from agent_memory.anti_patterns) || '|' || (select count(*) from agent_memory.bugs) || '|' || (select count(*) from agent_memory.recall_events);"
-        $raw = & docker exec $cfg.container psql -U $cfg.user -d $cfg.database -t -A -c $sql 2>$null
+        $raw = & docker exec $cfg.Container psql -U $cfg.User -d $cfg.Database -t -A -c $sql 2>$null
         $parts = ("$raw".Trim() -split '\|')
         if ($parts.Count -lt 3) { return $null }
         return @{ AntiPatterns = [int]$parts[0]; Bugs = [int]$parts[1]; Recalls = [int]$parts[2] }
