@@ -355,25 +355,55 @@ Check '"docker commit" не путается с "git commit"' (-not $r8b.Out.Tri
 & $gitExe -C $p8 restore --staged . 2>&1 | Out-Null
 
 # ---------------------------------------------------------------------------
-Section '9. doctor объявляет Windows требованием'
+Section '9. secret-scan.sh: -a/-am не даёт обойти сканер секретом из рабочего дерева'
+# ---------------------------------------------------------------------------
+# Регрессия найдена ревью M-05: `git commit -am` стажирует отслеживаемые правки ВНУТРИ
+# самого commit, уже после того, как хук проверил `git diff --cached`. Секрет, лежащий
+# только в рабочем дереве (git add не делали), на пустом индексе проезжал мимо хука
+# молча — ровно так, как воспроизведено ревью.
+$p9a = New-GitFixture 'scan-dash-a-bypass'
+Set-Content -LiteralPath (Join-Path $p9a 'creds.txt') -Value 'просто текст, без секретов' -Encoding UTF8
+& $gitExe -C $p9a add -A 2>&1 | Out-Null
+& $gitExe -C $p9a commit -qm 'creds.txt без секрета' 2>&1 | Out-Null
+# Правим отслеживаемый файл и НЕ делаем git add — ровно сценарий из находки ревью.
+Set-Content -LiteralPath (Join-Path $p9a 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$stagedBefore = & $gitExe -C $p9a diff --cached --stat
+Check 'контроль сценария: индекс на момент правки пуст (правка НЕ добавлена в staging)' (-not $stagedBefore)
+
+$r9a = Invoke-SecretScan -ProjectDir $p9a -Command 'git -c user.name="t" -c user.email="t@local" commit -am wip'
+Check '-am: хук блокирует секрет из рабочего дерева, а не только из индекса' (
+    $r9a.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r9a.Out
+Check '-am: код возврата хука 2' ($r9a.Code -eq 2) "код $($r9a.Code): $($r9a.Out)"
+Check '-am: причина называет файл и строку' ($r9a.Out -match 'creds\.txt:1') $r9a.Out
+Check '-am: само значение ключа НЕ печатается' ($r9a.Out -notmatch [regex]::Escape($fakeAwsKey)) $r9a.Out
+
+# Без -a/-am тот же незастейдженный секрет по-прежнему вне области видимости --cached —
+# регресс-контроль, что фикс не начал сканировать рабочее дерево ВСЕГДА.
+$r9b = Invoke-SecretScan -ProjectDir $p9a -Command 'git -c user.name="t" -c user.email="t@local" commit -m wip'
+Check 'без -a/-am незастейдженный секрет по-прежнему не сканируется (регресс не внесён)' (-not $r9b.Out.Trim()) $r9b.Out
+& $gitExe -C $p9a checkout -- creds.txt 2>&1 | Out-Null
+
+# ---------------------------------------------------------------------------
+Section '10. doctor объявляет Windows требованием'
 # ---------------------------------------------------------------------------
 # $IsWindows у PowerShell — константа ("Cannot overwrite variable IsWindows because it is
 # read-only"), поэтому ветка «не Windows» проверяется тестовым швом BCF_SIMULATE_NOT_WINDOWS,
 # а не подменой автоматической переменной.
-$p9 = New-GitFixture 'doctor-not-windows'
-$r9 = Bcf @('doctor', '--no-probe', '--project', $p9) -Env @{ BCF_SIMULATE_NOT_WINDOWS = '1' }
-Check 'doctor отказывает на "не Windows"' ($r9.Code -ne 0) "код $($r9.Code)"
+$p10 = New-GitFixture 'doctor-not-windows'
+$r10 = Bcf @('doctor', '--no-probe', '--project', $p10) -Env @{ BCF_SIMULATE_NOT_WINDOWS = '1' }
+Check 'doctor отказывает на "не Windows"' ($r10.Code -ne 0) "код $($r10.Code)"
 # Матчим ИМЕННО текст гейта из doctor.ps1, а не голое 'Windows' — та подстрока встречается
 # в куче безобидных мест (заголовок доктора, версия pwsh) и остаётся зелёной, даже когда
 # сам гейт вырезан. Проверено мутацией: со снятой веткой gate в doctor.ps1 этот Check
 # краснеет, а с голым 'Windows' — нет.
 Check 'причина — конкретный текст гейта doctor.ps1' (
-    $r9.Out -match [regex]::Escape('doctor поддерживает только Windows')
-) $r9.Out
-Check 'дальше живой пробы не идёт (нет вывода про роли/память)' ($r9.Out -notmatch 'ЖИВАЯ ПРОБА РОЛЕЙ|ПАМЯТЬ') $r9.Out
+    $r10.Out -match [regex]::Escape('doctor поддерживает только Windows')
+) $r10.Out
+Check 'дальше живой пробы не идёт (нет вывода про роли/память)' ($r10.Out -notmatch 'ЖИВАЯ ПРОБА РОЛЕЙ|ПАМЯТЬ') $r10.Out
 
-$r9b = Bcf @('doctor', '--no-probe', '--project', $p9)
-Check 'на самой Windows doctor отрабатывает как обычно (регресс не внесён)' ($r9b.Out -notmatch 'doctor поддерживает только Windows') $r9b.Out
+$r10b = Bcf @('doctor', '--no-probe', '--project', $p10)
+Check 'на самой Windows doctor отрабатывает как обычно (регресс не внесён)' ($r10b.Out -notmatch 'doctor поддерживает только Windows') $r10b.Out
 
 # Конкретная формулировка требования, а не голое 'Windows' (та подстрока была в обоих
 # файлах и до правки M-05 — например "Windows PowerShell 5 не подходит" в SETUP.md).
@@ -383,6 +413,25 @@ Check 'README называет Windows требованием (конкретн�
 Check 'docs/SETUP.md называет Windows требованием (конкретная формулировка)' (
     (Get-Content -Raw -LiteralPath (Join-Path $root 'docs\SETUP.md')) -match [regex]::Escape('фабрика пока только под неё')
 )
+
+# ---------------------------------------------------------------------------
+Section '11. CI: workflow гоняет tests/all.ps1 на push и pull_request на windows-latest'
+# ---------------------------------------------------------------------------
+# Регрессия найдена ревью M-05: до этого раздела ни одна сюита не читала
+# .github/workflows/tests.yml — удаление файла или подмена runs-on/команды прогона не
+# красили ничего. Проверяем по содержимому, а не по факту существования: подмена
+# 'runs-on: windows-latest' на 'ubuntu-latest' обязана уронить эту секцию.
+$workflowPath = Join-Path $root '.github\workflows\tests.yml'
+Check 'workflow-файл .github/workflows/tests.yml существует' (Test-Path -LiteralPath $workflowPath)
+if (Test-Path -LiteralPath $workflowPath) {
+    $wf = Get-Content -Raw -LiteralPath $workflowPath
+    Check 'триггер: push' ($wf -match '(?m)^\s*push:\s*$') $wf
+    Check 'триггер: pull_request' ($wf -match '(?m)^\s*pull_request:\s*$') $wf
+    Check 'раннер: windows-latest' ($wf -match '(?m)^\s*runs-on:\s*windows-latest\s*$') $wf
+    Check 'шаг запускает pwsh -NoProfile -File tests/all.ps1' (
+        $wf -match 'pwsh\s+-NoProfile\s+-File\s+tests[\\/]all\.ps1'
+    ) $wf
+}
 
 # ---------------------------------------------------------------------------
 Restore-TestEnv

@@ -23,6 +23,13 @@
 #
 # Найденный секрет НЕ печатается — только имя файла, номер строки и имя правила.
 #
+# ОБХОД ЧЕРЕЗ -a/-am/--all. `git commit -a` (и короткая склейка `-am`) стажирует
+# отслеживаемые правки ИЗНУТРИ самого commit, уже после того, как этот хук успел
+# посмотреть на индекс — секрет, лежащий только в рабочем дереве (git add не делали),
+# при сканировании одного `git diff --cached` проезжает мимо: индекс на момент проверки
+# пуст. Поэтому при -a/-am/--all в командной строке дополнительно сканируется
+# `git diff` (рабочее дерево против индекса, без --cached) — см. HAS_ALL_FLAG ниже.
+#
 # ФОРМАТ ОТВЕТА PreToolUse. Сверено 2026-09-05 с code.claude.com/docs/en/hooks: для
 # PreToolUse ответ обязан идти через hookSpecificOutput.permissionDecision (значение
 # "deny"), а не через верхнеуровневое поле decision — дока прямо говорит "should use
@@ -109,6 +116,20 @@ repo_root = os.environ.get('REPO_ROOT') or ''
 if not repo_root:
     emit_nothing()   # не git-репозиторий — сканировать нечего, сам git commit откажет
 
+# HAS_ALL_FLAG: -a/--all у git commit стажируют отслеживаемые правки прямо в момент
+# коммита — если это пропустить, секрет из рабочего дерева пройдёт хук на пустом
+# --cached и уедет в историю уже после единственной проверки. Без полного шелл-парсера
+# (тот же уровень строгости, что и у regex на "git ... commit" выше): берём хвост
+# команды после слова commit до конца строки или ближайшего оператора шелла (&&, ||,
+# ;, |) и ищем в нём "--all" целым словом либо короткий флаг, содержащий "a"
+# (-a, -am, -qam...) — длинные опции ("--author=...") исключены отдельно: они
+# начинаются с двух дефисов, а короткий-флаговый разбор смотрит только на "-X", не "--X".
+commit_tail = re.split(r'&&|\|\||[;|]', re.sub(r'^.*?\bcommit\b', '', command, count=1, flags=re.S), maxsplit=1)[0]
+has_all_flag = bool(
+    re.search(r'(?:^|\s)--all(?:\s|$)', commit_tail)
+    or re.search(r'(?:^|\s)-(?!-)[A-Za-z]*a[A-Za-z]*(?:\s|$)', commit_tail)
+)
+
 try:
     diff = subprocess.run(
         ['git', '-C', repo_root, 'diff', '--cached', '-U0', '--no-color'],
@@ -116,8 +137,18 @@ try:
     ).stdout
 except Exception:
     emit_nothing()
+
+if has_all_flag:
+    try:
+        diff += subprocess.run(
+            ['git', '-C', repo_root, 'diff', '-U0', '--no-color'],
+            capture_output=True, encoding='utf-8', errors='replace', timeout=20,
+        ).stdout
+    except Exception:
+        pass   # --cached уже прочитан — не откатываем всю проверку из-за второго вызова
+
 if not diff:
-    emit_nothing()   # нечего коммитить — staged-дифф пуст
+    emit_nothing()   # нечего коммитить — ни staged, ни (при -a) рабочее дерево не тронуты
 
 # --- Образцы: см. заголовок файла для источника и версии сверки -------------------------
 PATTERNS = [
