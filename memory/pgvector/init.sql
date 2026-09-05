@@ -8,6 +8,7 @@ CREATE SCHEMA IF NOT EXISTS agent_memory;
 -- Anti-pattern entries. Written only by the retrospector.
 CREATE TABLE IF NOT EXISTS agent_memory.anti_patterns (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project         text NOT NULL DEFAULT '',            -- чей это урок: одна база на все проекты
     agent_scope     text NOT NULL,                       -- 'code' | <subagent-name> | 'all'
     trigger_summary text NOT NULL,                       -- short description of the situation
     what_went_wrong text NOT NULL,
@@ -30,6 +31,7 @@ CREATE INDEX IF NOT EXISTS anti_patterns_scope_idx
 -- Recall-event log (metrics: "how often did memory fire").
 CREATE TABLE IF NOT EXISTS agent_memory.recall_events (
     id              bigserial PRIMARY KEY,
+    project         text NOT NULL DEFAULT '',
     iteration_id    text NOT NULL,
     agent_scope     text NOT NULL,
     matched_id      uuid REFERENCES agent_memory.anti_patterns(id) ON DELETE CASCADE,
@@ -43,6 +45,7 @@ CREATE INDEX IF NOT EXISTS recall_events_iter_idx ON agent_memory.recall_events 
 -- NOT short_id alone — a global UNIQUE on short_id caused cross-task UniqueViolation.
 CREATE TABLE IF NOT EXISTS agent_memory.bugs (
     id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    project              text NOT NULL DEFAULT '',
     short_id             text NOT NULL,                  -- per-task id, e.g. B-001
     task_id              text NOT NULL,
     signature            text,                           -- slug / stable signature
@@ -78,6 +81,7 @@ CREATE INDEX IF NOT EXISTS bugs_task_idx
 -- IF NOT EXISTS (ensure_proposals_schema); defined here so a fresh container has it too.
 CREATE TABLE IF NOT EXISTS agent_memory.proposals (
     id          serial PRIMARY KEY,
+    project     text NOT NULL DEFAULT '',
     kind        text NOT NULL,
     target      text NOT NULL,
     rationale   text,
@@ -85,6 +89,42 @@ CREATE TABLE IF NOT EXISTS agent_memory.proposals (
     status      text NOT NULL DEFAULT 'new',
     first_seen  timestamptz NOT NULL DEFAULT now(),
     last_seen   timestamptz NOT NULL DEFAULT now(),
-    sources     jsonb NOT NULL DEFAULT '[]'::jsonb,
-    UNIQUE (kind, target)
+    sources     jsonb NOT NULL DEFAULT '[]'::jsonb
+    -- уникальность (kind, target, project) заводится индексом ниже: одно место на
+    -- свежую базу и на миграцию старой, иначе на новом контейнере получаются два
+    -- ограничения об одном и том же.
 );
+
+-- ЧЕЙ ЭТО ОПЫТ: колонка project и миграция для баз, заведённых до неё.
+--
+-- Одна установка pgvector обслуживает все проекты машины. Пока строки не знали своего
+-- проекта, отзыв возвращал уроки чужого стека как свои: агенту на Java прилетал урок про
+-- Electron с высокой похожестью, потому что похожесть считается по тексту, а не по месту.
+-- Хуже того, предложения эволюции слипались по (kind, target) через границу проектов —
+-- частота росла суммой по всей машине, и триаж читал её как «в этом проекте просят пять
+-- раз».
+--
+-- Файл идемпотентен и применяется к живой базе: `python memory_client.py migrate`
+-- (его же зовёт `bcf memory init`). На свежем контейнере блоки ниже ничего не делают —
+-- колонки уже созданы выше.
+ALTER TABLE agent_memory.anti_patterns  ADD COLUMN IF NOT EXISTS project text NOT NULL DEFAULT '';
+ALTER TABLE agent_memory.recall_events  ADD COLUMN IF NOT EXISTS project text NOT NULL DEFAULT '';
+ALTER TABLE agent_memory.bugs           ADD COLUMN IF NOT EXISTS project text NOT NULL DEFAULT '';
+ALTER TABLE agent_memory.proposals      ADD COLUMN IF NOT EXISTS project text NOT NULL DEFAULT '';
+
+-- Отзыв сначала спрашивает свой проект, потом всю базу — фильтр по project идёт в каждом
+-- запросе, поэтому у него свой btree.
+CREATE INDEX IF NOT EXISTS anti_patterns_project_idx ON agent_memory.anti_patterns (project);
+CREATE INDEX IF NOT EXISTS bugs_project_idx          ON agent_memory.bugs (project);
+
+-- Уникальность предложений расширяется проектом. Старое ограничение (kind, target) на
+-- существующей базе снимается явно: пока оно живо, ON CONFLICT (kind, target, project)
+-- не на что опереться, и запись предложений падает целиком.
+ALTER TABLE agent_memory.proposals DROP CONSTRAINT IF EXISTS proposals_kind_target_key;
+CREATE UNIQUE INDEX IF NOT EXISTS proposals_kind_target_project_uidx
+    ON agent_memory.proposals (kind, target, project);
+
+-- У багов уникальность НЕ трогаем: она (task_id, short_id), а номер B-NN выдаётся
+-- перебором максимума по task_id без оглядки на проект. Добавить project в ограничение,
+-- не переписав выдачу номера, значит завести настоящие коллизии там, где сейчас их нет.
+
