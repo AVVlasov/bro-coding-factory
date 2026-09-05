@@ -155,11 +155,46 @@ if (Test-Path $settings1) {
     $txt1 = Get-Content -Raw -LiteralPath $settings1
     Check 'плейсхолдер {{BASH_PATH}} не остался' ($txt1 -notmatch '\{\{BASH_PATH\}\}') $txt1
     Check 'команда хука — не голый "bash"' ($txt1 -notmatch '"command":\s*"bash ') $txt1
-    Check 'команда хука — существующий bash.exe' ($txt1 -match '"command":\s*"([^"]*bash\.exe)') $txt1
-    if ($Matches -and $Matches[1]) {
+
+    # Через ConvertFrom-Json, а не регэксп по сырому тексту: сырой текст хранит
+    # экранированные кавычки вокруг пути (\"...\"), и регэксп на "не-кавычку" рвётся на
+    # первой же \" — ровно та ловушка, из-за которой дефект без кавычек прошёл прошлый
+    # прогон незамеченным.
+    $settingsObj1 = $txt1 | ConvertFrom-Json
+    $guardCmd1 = $settingsObj1.hooks.PreToolUse[0].hooks[0].command
+    $scanCmd1  = $settingsObj1.hooks.PreToolUse[0].hooks[1].command
+    Check 'pre-bash-guard: команда хука — существующий bash.exe' ($guardCmd1 -match 'bash\.exe') $guardCmd1
+    Check 'путь к bash.exe обёрнут в кавычки (пробел в "Program Files" не рвёт команду)' (
+        $guardCmd1 -match '^"[^"]*bash\.exe"\s'
+    ) $guardCmd1
+    if ($guardCmd1 -match '^"([^"]*bash\.exe)"\s') {
         Check 'путь из settings.json реально существует' (Test-Path -LiteralPath ($Matches[1] -replace '/', '\'))
     }
     Check 'secret-scan.sh подключён рядом с pre-bash-guard' ($txt1 -match 'secret-scan\.sh') $txt1
+    Check 'secret-scan: путь к bash.exe тоже обёрнут в кавычки' ($scanCmd1 -match '^"[^"]*bash\.exe"\s') $scanCmd1
+
+    # РЕАЛЬНЫЙ ЗАПУСК, а не догадка по строке: именно эта команда, слово в слово, уйдёт
+    # оболочке (Claude Code на Windows отдаёт command Git Bash; путь к settings.json может
+    # читать и обычный Windows-шелл). Пустой stdin — pre-bash-guard.sh на пустом
+    # tool_input.command молча выходит 0 (см. сам хук: command="" => exit 0), поэтому
+    # exit 0 здесь означает «команда СТАРТОВАЛА и отработала», а не «повезло с содержимым».
+    # На пути установки Git по умолчанию (с пробелом в "Program Files") дефект без кавычек
+    # ломает это ИМЕННО здесь: cmd.exe возвращает 1 («'C:/Program' is not recognized»),
+    # Git Bash — 127 («C:/Program: No such file or directory»).
+    Push-Location $p1
+    try {
+        $viaCmd = '' | & cmd.exe /c $guardCmd1 2>&1 | Out-String
+        $viaCmdCode = $LASTEXITCODE
+        Check 'команда хука реально запускается через cmd.exe (exit 0, без ошибки поиска команды)' (
+            $viaCmdCode -eq 0 -and $viaCmd -notmatch 'is not recognized'
+        ) "код $viaCmdCode : $viaCmd"
+
+        $viaBash = '' | & $bash -c $guardCmd1 2>&1 | Out-String
+        $viaBashCode = $LASTEXITCODE
+        Check 'команда хука реально запускается через Git Bash (exit 0, без "No such file")' (
+            $viaBashCode -eq 0 -and $viaBash -notmatch 'No such file'
+        ) "код $viaBashCode : $viaBash"
+    } finally { Pop-Location }
 }
 
 # ---------------------------------------------------------------------------
@@ -233,9 +268,15 @@ $p3 = New-GitFixture 'install-exec-path-e2e'
 $r3 = Bcf @('install', '--project', $p3)
 Check 'install (полноценное окружение) отработал зелёным' ($r3.Code -eq 0) "код $($r3.Code): $($r3.Out)"
 $settings3 = Join-Path $p3 '.claude\settings.json'
+# Через ConvertFrom-Json — тот же приём, что в разделе 1. Регэксп на "не-кавычку" по сырому
+# тексту рвётся на экранированной кавычке вокруг {{BASH_PATH}} (\"...\") и даёт ложный
+# провал даже при верно подставленном пути.
+$guardCmd3 = if (Test-Path $settings3) {
+    (Get-Content -Raw -LiteralPath $settings3 | ConvertFrom-Json).hooks.PreToolUse[0].hooks[0].command
+} else { '' }
 Check 'settings.json записан с реальным путём к bash' (
-    (Test-Path $settings3) -and ((Get-Content -Raw -LiteralPath $settings3) -match '"command":\s*"([^"]*bash\.exe)')
-)
+    $guardCmd3 -match '^"[^"]*bash\.exe"\s'
+) $guardCmd3
 
 # ---------------------------------------------------------------------------
 Section '4. bcf init переживает отказ bash: config/harness.json всё равно появляется'
@@ -273,7 +314,15 @@ $p6 = New-GitFixture 'scan-secret'
 Set-Content -LiteralPath (Join-Path $p6 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
 & $gitExe -C $p6 add -A 2>&1 | Out-Null
 $r6 = Invoke-SecretScan -ProjectDir $p6 -Command 'git -c user.name="t" -c user.email="t@local" commit -m "add creds"'
-Check 'хук возвращает decision: block' ($r6.Out -match '"decision"\s*:\s*"block"') $r6.Out
+# Формат PreToolUse по доке Claude Code (code.claude.com/docs/en/hooks, сверено 2026-09-05):
+# hookSpecificOutput.permissionDecision, не верхнеуровневый decision — верхнеуровневое поле
+# дока прямо называет неподходящим для PreToolUse. Блокировка держится на коде возврата 2
+# («Exit 2 means a blocking error... blocks whether or not you print JSON»), поэтому код
+# проверяем отдельно и это не необязательная деталь.
+Check 'хук возвращает hookSpecificOutput.permissionDecision: deny' (
+    $r6.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r6.Out
+Check 'код возврата хука 2 (блокирует по доке Claude Code независимо от JSON)' ($r6.Code -eq 2) "код $($r6.Code): $($r6.Out)"
 Check 'причина называет файл и строку' ($r6.Out -match 'creds\.txt:1') $r6.Out
 Check 'само значение ключа НЕ печатается' ($r6.Out -notmatch [regex]::Escape($fakeAwsKey)) $r6.Out
 & $gitExe -C $p6 restore --staged . 2>&1 | Out-Null
@@ -314,14 +363,26 @@ Section '9. doctor объявляет Windows требованием'
 $p9 = New-GitFixture 'doctor-not-windows'
 $r9 = Bcf @('doctor', '--no-probe', '--project', $p9) -Env @{ BCF_SIMULATE_NOT_WINDOWS = '1' }
 Check 'doctor отказывает на "не Windows"' ($r9.Code -ne 0) "код $($r9.Code)"
-Check 'причина названа (bash/пути под Windows)' ($r9.Out -match 'Windows') $r9.Out
+# Матчим ИМЕННО текст гейта из doctor.ps1, а не голое 'Windows' — та подстрока встречается
+# в куче безобидных мест (заголовок доктора, версия pwsh) и остаётся зелёной, даже когда
+# сам гейт вырезан. Проверено мутацией: со снятой веткой gate в doctor.ps1 этот Check
+# краснеет, а с голым 'Windows' — нет.
+Check 'причина — конкретный текст гейта doctor.ps1' (
+    $r9.Out -match [regex]::Escape('doctor поддерживает только Windows')
+) $r9.Out
 Check 'дальше живой пробы не идёт (нет вывода про роли/память)' ($r9.Out -notmatch 'ЖИВАЯ ПРОБА РОЛЕЙ|ПАМЯТЬ') $r9.Out
 
 $r9b = Bcf @('doctor', '--no-probe', '--project', $p9)
 Check 'на самой Windows doctor отрабатывает как обычно (регресс не внесён)' ($r9b.Out -notmatch 'doctor поддерживает только Windows') $r9b.Out
 
-Check 'README называет Windows требованием' ((Get-Content -Raw -LiteralPath (Join-Path $root 'README.md')) -match 'Windows')
-Check 'docs/SETUP.md называет Windows требованием' ((Get-Content -Raw -LiteralPath (Join-Path $root 'docs\SETUP.md')) -match 'Windows')
+# Конкретная формулировка требования, а не голое 'Windows' (та подстрока была в обоих
+# файлах и до правки M-05 — например "Windows PowerShell 5 не подходит" в SETUP.md).
+Check 'README называет Windows требованием (конкретная формулировка)' (
+    (Get-Content -Raw -LiteralPath (Join-Path $root 'README.md')) -match [regex]::Escape('Требуется **Windows**')
+)
+Check 'docs/SETUP.md называет Windows требованием (конкретная формулировка)' (
+    (Get-Content -Raw -LiteralPath (Join-Path $root 'docs\SETUP.md')) -match [regex]::Escape('фабрика пока только под неё')
+)
 
 # ---------------------------------------------------------------------------
 Restore-TestEnv

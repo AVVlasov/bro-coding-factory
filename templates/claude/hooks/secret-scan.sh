@@ -23,6 +23,14 @@
 #
 # Найденный секрет НЕ печатается — только имя файла, номер строки и имя правила.
 #
+# ФОРМАТ ОТВЕТА PreToolUse. Сверено 2026-09-05 с code.claude.com/docs/en/hooks: для
+# PreToolUse ответ обязан идти через hookSpecificOutput.permissionDecision (значение
+# "deny"), а не через верхнеуровневое поле decision — дока прямо говорит "should use
+# hookSpecificOutput.permissionDecision, not a top-level decision field". Блокировка
+# держится на коде возврата 2 ("Exit 2 means a blocking error... blocks whether or not
+# you print JSON" — сама дока), JSON с permissionDecisionReason и текст на stderr — это
+# то, откуда Claude Code берёт текст причины при показе блокировки.
+#
 # Контракт:
 #   $CLAUDE_PROJECT_DIR — корень проекта (ставит Claude Code); без него — $PWD
 #   BCF_SECRET_SCAN_DISABLED=1 — выключить хук
@@ -172,11 +180,20 @@ reason = (
     + '\nубери находку из индекса (git restore --staged <файл>) или замени на переменную окружения.'
     + '\nложное срабатывание — переформулируй строку так, чтобы она не совпадала с образцом.'
 )
-print(json.dumps({'decision': 'block', 'reason': reason}, ensure_ascii=False))
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': reason,
+    },
+}, ensure_ascii=False))
+print(reason, file=sys.stderr)
+sys.exit(2)
 PYEOF
 )"
+code=$?
 
 if [ -n "$RESULT" ]; then
   printf '%s\n' "$RESULT"
 fi
-exit 0
+exit "$code"

@@ -88,6 +88,11 @@ Claude Code исполняет `command` хука буквально, а гол�
 `config/`, `CLAUDE.md`) при этом всё равно ставится — довести настройку после установки
 Git Bash: `bcf install --only claude`.
 
+Подставленный путь в `settings.json` обёрнут в двойные кавычки
+(`"{{BASH_PATH}}" .claude/hooks/...`): путь по умолчанию у Git for Windows —
+`C:\Program Files\Git\bin\bash.exe`, пробел в `Program Files` без кавычек рвёт команду
+на два токена, и её не находит ни `cmd.exe`, ни сам Git Bash.
+
 ### Секреты перед коммитом
 
 `.claude/hooks/secret-scan.sh` встаёт на тот же `PreToolUse Bash`, что и `pre-bash-guard`:
@@ -100,6 +105,11 @@ Git Bash: `bcf install --only claude`.
 перед оператором присваивания. Иначе `password_default` из `config/memory.config.json`
 (несекретный локальный фолбэк, см. выше) считался бы находкой при каждом коммите,
 задевающем этот файл.
+
+Ответ хука для `PreToolUse` — по доке `code.claude.com/docs/en/hooks` (сверено
+2026-09-05): `hookSpecificOutput.permissionDecision: "deny"` вместо верхнеуровневого
+`decision`, блокировка держится на коде возврата 2, который блокирует независимо от
+того, разобран ли JSON.
 
 ## Векторная память
 
