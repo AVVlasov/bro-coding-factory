@@ -76,6 +76,9 @@ function Verdict-Pass($t, $atRoot) {
 # каждый по отдельности работает, а увидеть расхождение можно только сверив вывод с
 # вердиктами руками.
 . (Join-Path $PSScriptRoot 'lib\claims.ps1')
+# Номера требований заказчика — тем же разборщиком, что у `bcf tasks`: отчёт, считающий
+# закрытые пункты иначе, чем экран бэклога, спорит с ним на сдаче.
+. (Join-Path $PSScriptRoot 'lib\requirement.ps1')
 $predRegex = [regex]::Escape($taskIdPrefix) + '-\d+'
 function Get-GatePreds($t) {
   return @(Get-TaskPredecessors -TaskId $t -Root $root -Prefix $taskIdPrefix)
@@ -163,6 +166,8 @@ function Emit-RunAllReport {
 
   # run-all.status.json — машиночитаемый сигнал для вызывающего агента/автоматизации.
   $statusObj = [ordered]@{
+    factory_version = (Get-BcfFactoryVersion)
+    graph_hash      = (Get-BcfFileHash -Path ([string]$env:BCF_GRAPH_FILE))
     complete       = $complete
     queue_closed   = $queueClosed
     journeys       = $journeyState
@@ -219,6 +224,38 @@ function Emit-RunAllReport {
                        "проверено состояние дерева, а не работа пользователя.`n`n" }
     default          { "## Сквозные сценарии продукта`nСостояние неизвестно: $journeySummary`n`n" }
   }
+  # ТРЕБОВАНИЯ ЗАКАЗЧИКА — ДРУГОЙ СЧЁТ, ЧЕМ ЗАДАЧИ.
+  #
+  # «Закрыто 12 из 14» — счёт нарезки, а не счёт обязательств. Заказчик спрашивает про
+  # пункт 3.1.1, и ответ «задача TASK-07 закрыта» ему ничего не говорит, пока кто-то
+  # помнит, что 3.1.1 это и есть TASK-07. Пункт считается закрытым, только когда закрыты
+  # ВСЕ задачи, которые его назвали: половина требования — это незакрытое требование.
+  $reqBlock = ''
+  try {
+    $reqTasks = @{}
+    foreach ($t in (@($Passed) + @($Stuck | ForEach-Object { $_.Task }))) {
+      if (-not $t) { continue }
+      foreach ($r in @(Get-TaskRequirements -TaskId ([string]$t) -Root $Root)) {
+        if (-not $reqTasks.ContainsKey($r)) { $reqTasks[$r] = @() }
+        $reqTasks[$r] += [string]$t
+      }
+    }
+    if ($reqTasks.Count) {
+      $passSet = @{}
+      foreach ($p in @($Passed)) { $passSet[[string]$p] = $true }
+      $lines = @()
+      $closedReq = 0
+      foreach ($r in ($reqTasks.Keys | Sort-Object)) {
+        $ts = @($reqTasks[$r] | Select-Object -Unique)
+        $open = @($ts | Where-Object { -not $passSet.ContainsKey($_) })
+        if ($open.Count) { $lines += "- **$r** — НЕ закрыто: $($open -join ', ') (всего задач: $($ts.Count))" }
+        else { $closedReq++; $lines += "- **$r** — закрыто: $($ts -join ', ')" }
+      }
+      $reqBlock = "## Требования заказчика`n`nЗакрыто пунктов: $closedReq из $($reqTasks.Count).`n" +
+                  ($lines -join "`n") + "`n`n"
+    }
+  } catch { }
+
   $rootHint = if ($needsHuman.Count) {
     "## Корень: почини это первым`n" +
     (($needsHuman | ForEach-Object {
@@ -228,11 +265,18 @@ function Emit-RunAllReport {
     "`n`nПосле фикса перезапусти прогон — закрытые PASS пропустятся, каскад-гейт подтянется.`n`n"
   } else { "" }
 
+  # Чем получен отчёт: версия фабрики и хэш файла графа. Те же две строки стоят в вердикте
+  # задачи — по ним видно, одной ли обвязкой получены вердикт и итог, или вердикт остался
+  # от прошлой версии.
+  $provenance = (Get-BcfProvenanceLines) -join "`n"
+
   Set-Content -Path $ReviewFile -Encoding UTF8 -Value (
     "# Ralph overnight run-all — итог`n`n" +
     "**Когда:** $Ts`n$statusLine`n**Закрыто (PASS):** $(@($Passed).Count) / $Total`n`n" +
+    "```````n$provenance`n```````n`n" +
     $rootHint +
     $journeyBlock +
+    $reqBlock +
     "## PASS`n$passLines`n`n" +
     "## Требуют вмешательства (сама задача застряла/упала)`n$humanLines`n`n" +
     "## Заблокированы каскад-гейтом (закроются после фикса предшественника)`n$gateLines`n`n" +
