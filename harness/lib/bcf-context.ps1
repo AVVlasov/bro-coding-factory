@@ -49,6 +49,46 @@ function Get-BcfHomeRoot {
     return (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent)
 }
 
+# --- Происхождение вердикта -------------------------------------------------------------
+#
+# ЗАЧЕМ. Вердикт задачи и итоговый отчёт прогона не говорили, чем они получены. Разбор
+# чужого прогона («почему тут PASS, а у меня то же самое красное») начинался с вопроса
+# «какая версия фабрики и какой граф это гонял» — и ответа не было ни в одном файле.
+# Обе строки дешёвые и печатаются всегда: провенанс, который пишется «когда важно»,
+# отсутствует ровно тогда, когда он понадобился.
+
+function Get-BcfFactoryVersion {
+    $f = Join-Path (Get-BcfHomeRoot) 'VERSION'
+    if (Test-Path -LiteralPath $f) {
+        $v = (Get-Content -Raw -LiteralPath $f -ErrorAction SilentlyContinue)
+        if ($v) { return $v.Trim() }
+    }
+    return 'неизвестна'
+}
+
+# Короткий хэш содержимого файла. Именно содержимого, а не даты: файл графа правят чаще,
+# чем версию фабрики, и «версия 0.5.0» об этой правке не говорит ничего.
+function Get-BcfFileHash {
+    param([string]$Path, [int]$Length = 12)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    try {
+        $h = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+        if ($h.Length -gt $Length) { return $h.Substring(0, $Length) }
+        return $h
+    } catch { return '' }
+}
+
+# Две строки для шапки вердикта и отчёта. Граф передаёт путь к своему скрипту через
+# BCF_GRAPH_FILE; когда задача шла циклом, а не графом, это так и сказано — пустая
+# строка читалась бы как «граф был, но не записался».
+function Get-BcfProvenanceLines {
+    param([string]$GraphFile = '')
+    $gf = if ($GraphFile) { $GraphFile } else { [string]$env:BCF_GRAPH_FILE }
+    $hash = Get-BcfFileHash -Path $gf
+    $graphLine = if ($hash) { "$hash ($(Split-Path $gf -Leaf))" } else { 'нет (прогон без графа)' }
+    return @("factory_version: $(Get-BcfFactoryVersion)", "graph_hash: $graphLine")
+}
+
 # Какой bash звать под Windows.
 #
 # `bash` из PATH — НЕ тот, о котором думает автор хука. Первым там обычно стоит

@@ -1231,10 +1231,16 @@ if ([string]::IsNullOrWhiteSpace($testerLines)) { $testerLines = "  (тесте�
 $evidence = Collect-Evidence -Repo $root -TaskFiles $taskFiles -VerifyWorkDir $workDir
 $evidenceMd = Format-EvidenceMd -Evidence $evidence
 
+# Чем получен этот вердикт: версия фабрики и хэш файла графа, если задача шла графом.
+# Без этих двух строк разбор чужого вердикта начинается с вопроса «на чём это гонялось»,
+# и ответа нет ни в одном файле прогона.
+$provenance = (Get-BcfProvenanceLines) -join "`n"
+
 $verdictBody = @"
 # Verdict — $Task
 verdict: $verdict
 date: $today
+$provenance
 diff_fingerprint: $fp
 diff_base: $diffBase$(if ($explicitBase) { ' (задана человеком: приёмка уже приземлившейся работы)' })
 verified_by: harness/verify.ps1 — Фазы C-E (всё через opencode; кодинг/тестеры/судья — $Model, vision — $VisionModel, судья — $JudgeModel)
