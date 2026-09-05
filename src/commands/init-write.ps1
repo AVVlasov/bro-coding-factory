@@ -192,6 +192,14 @@ if ($installExit -ne 0) {
     foreach ($line in ($installOut -split "`r?`n")) {
         if ($line -match 'bash' -and $line.Trim()) { Write-BcfDim ('  ' + $line.Trim()) }
     }
+    # ЭТО ЖЕ ДОЛЖНО ЗАКРЫВАТЬ КОД ВОЗВРАТА init, А НЕ ТОЛЬКО ПЕЧАТЬ. install при этом же
+    # отказе выходит кодом 2 (см. install.ps1: exit 2 при $refused.Count) — init, вызвавший
+    # его подпроцессом, не имеет права отчитаться кодом 0 о команде, которая settings.json
+    # не написала: без него 15 хуков не подключены, а «init прошёл зелёным» читается как
+    # «обвязка на месте».
+    $blocking += @{ what = 'settings.json не записан: bcf install отказал (Git Bash не найден)'
+                    why  = 'хуки (pre-bash-guard, secret-scan и остальные) не подключены в .claude/settings.json — обвязка стоит наполовину.'
+                    fix  = 'поставь Git for Windows или укажи $env:BCF_BASH, затем bcf install --only claude' }
 }
 
 if ($kept.Count) {

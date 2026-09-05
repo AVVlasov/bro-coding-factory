@@ -21,6 +21,19 @@
 # коммите, задевающем эту строку. Здесь ключевое слово обязано стоять СРАЗУ перед
 # оператором присваивания — без суффикса.
 #
+# ЗНАЧЕНИЕ-ССЫЛКА — НЕ НАХОДКА. `token = process.env.GITHUB_TOKEN`, `apiKey = config.api_key`,
+# `API_KEY = os.environ["OPENAI_API_KEY"]`, `pwd = password or os.getenv("DB_PASSWORD")` — это
+# код, который УЖЕ читает секрет из окружения (то есть сделал ровно то, что советует текст
+# отказа), а не секрет. detect-secrets (KeywordDetector) отбрасывает такие ссылочные значения
+# отдельным фильтром; здесь то же самое — REFERENCE_VALUE_RE проверяет само значение
+# присваивания, а не только ключевое слово слева, и не даёт результата на код, который
+# читает секрет из окружения, а не хранит его текстом. У правила два эффекта одновременно:
+# из символов значения без кавычек убрана точка (значения-литералы ключей точек не содержат,
+# а `os.environ`/`config.api_key` обрываются на первой же точке короче порога), и отдельно
+# отбрасываются значения, начинающиеся с самой ссылки (process.env, os.environ, os.getenv,
+# System.getenv, config./cfg./settings., `${...}`) или с бытового ключевого слова-ссылки на
+# другую переменную с тем же смыслом (`pwd = password`).
+#
 # Найденный секрет НЕ печатается — только имя файла, номер строки и имя правила.
 #
 # ОБХОД ЧЕРЕЗ -a/-am/--all. `git commit -a` (и короткая склейка `-am`) стажирует
@@ -29,6 +42,19 @@
 # при сканировании одного `git diff --cached` проезжает мимо: индекс на момент проверки
 # пуст. Поэтому при -a/-am/--all в командной строке дополнительно сканируется
 # `git diff` (рабочее дерево против индекса, без --cached) — см. HAS_ALL_FLAG ниже.
+#
+# ОБХОД ЧЕРЕЗ `git add ... && git commit ...` В ОДНОЙ КОМАНДНОЙ СТРОКЕ. Тот же класс
+# обхода, что и -a/-am, только без флага commit: этот хук — PreToolUse, он видит
+# командную строку и индекс ДО того, как что-либо из неё выполнилось, поэтому `git add`
+# в НАЧАЛЕ той же строки ещё не сработал в момент проверки, и `git diff --cached` на
+# этот момент пуст независимо от того, что уедет в коммит через долю секунды. Команда
+# разбирается на сегменты по &&/||/;/| — сегмент до commit, начинающийся с `git ... add`,
+# даёт свои аргументы САМОМУ git через `git add --dry-run` (а не собственный разбор
+# pathspec: git уже умеет -A/./glob/.gitignore) — это НЕ исполняет добавление, только
+# спрашивает, что было бы добавлено. Отслеживаемые файлы из этого списка уже покрыты
+# диффом рабочего дерева (см. выше); неотслеживаемые НОВЫЕ файлы — то, чего `-a` вообще
+# не берёт (см. комментарий у HAS_ALL_FLAG), — сканируются целиком по содержимому,
+# отдельно от diff-парсера.
 #
 # ФОРМАТ ОТВЕТА PreToolUse. Сверено 2026-09-05 с code.claude.com/docs/en/hooks: для
 # PreToolUse ответ обязан идти через hookSpecificOutput.permissionDecision (значение
@@ -87,6 +113,7 @@ RESULT="$(REPO_ROOT="$REPO_ROOT" "$PY" - "$tmpf" <<'PYEOF'
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -109,26 +136,88 @@ if not command:
 # рвёт значение пробелом на два токена, и жёсткий разбор -c/--flag это упускает. Не
 # требует, чтобы "git" и "commit" были соседними словами — только чтобы между ними не
 # было конца команды. Отсекает "docker commit" (нет "git" перед "commit").
-if not re.search(r'\bgit\b(?:\s+\S+)*?\s+commit\b', command):
+GIT_COMMIT_RE = re.compile(r'\bgit\b(?:\s+\S+)*?\s+commit\b')
+GIT_ADD_RE = re.compile(r'\bgit\b(?:\s+\S+)*?\s+add\b')
+
+if not GIT_COMMIT_RE.search(command):
     emit_nothing()
 
 repo_root = os.environ.get('REPO_ROOT') or ''
 if not repo_root:
     emit_nothing()   # не git-репозиторий — сканировать нечего, сам git commit откажет
 
+# Командная строка разбирается на сегменты по операторам оболочки — тем же уровнем
+# строгости, что и весь остальной разбор в этом файле (без полного шелл-парсера): так
+# "git add ..." и "git commit ..." в одной строке не путаются друг с другом при поиске
+# ХВОСТА команды commit (иначе первое попавшееся слово "commit" где угодно в строке,
+# включая чужой текст до git commit, рвало бы разбор -a/-am не в том месте).
+segments = re.split(r'&&|\|\||[;|]|\r?\n', command)
+commit_seg_idx = None
+for i, seg in enumerate(segments):
+    if GIT_COMMIT_RE.search(seg):
+        commit_seg_idx = i   # последний git commit в строке — тот, что реально исполнится
+if commit_seg_idx is None:
+    emit_nothing()   # "git commit" виден только через границу оператора — считаем, что не наш случай
+commit_segment = segments[commit_seg_idx]
+
 # HAS_ALL_FLAG: -a/--all у git commit стажируют отслеживаемые правки прямо в момент
 # коммита — если это пропустить, секрет из рабочего дерева пройдёт хук на пустом
-# --cached и уедет в историю уже после единственной проверки. Без полного шелл-парсера
-# (тот же уровень строгости, что и у regex на "git ... commit" выше): берём хвост
-# команды после слова commit до конца строки или ближайшего оператора шелла (&&, ||,
-# ;, |) и ищем в нём "--all" целым словом либо короткий флаг, содержащий "a"
-# (-a, -am, -qam...) — длинные опции ("--author=...") исключены отдельно: они
-# начинаются с двух дефисов, а короткий-флаговый разбор смотрит только на "-X", не "--X".
-commit_tail = re.split(r'&&|\|\||[;|]', re.sub(r'^.*?\bcommit\b', '', command, count=1, flags=re.S), maxsplit=1)[0]
+# --cached и уедет в историю уже после единственной проверки. Берём хвост СЕГМЕНТА
+# commit (не всей команды) после слова commit и ищем в нём "--all" целым словом либо
+# короткий флаг, содержащий "a" (-a, -am, -qam...) — длинные опции ("--author=...")
+# исключены отдельно: они начинаются с двух дефисов, а короткий-флаговый разбор
+# смотрит только на "-X", не "--X".
+commit_tail = re.sub(r'^.*?\bcommit\b', '', commit_segment, count=1, flags=re.S)
 has_all_flag = bool(
     re.search(r'(?:^|\s)--all(?:\s|$)', commit_tail)
     or re.search(r'(?:^|\s)-(?!-)[A-Za-z]*a[A-Za-z]*(?:\s|$)', commit_tail)
 )
+
+# ОБХОД ЧЕРЕЗ `git add ... && git commit ...` — см. заголовок файла. Сегменты ДО commit,
+# которые сами являются "git ... add ...", отдают свои аргументы настоящему git через
+# --dry-run: он и разворачивает -A/./glob, и учитывает .gitignore за нас, не нужно
+# повторять его логику pathspec самим.
+add_segments = [seg for seg in segments[:commit_seg_idx] if GIT_ADD_RE.search(seg)]
+has_add_stage = bool(add_segments)
+
+staged_new_files = []   # неотслеживаемые файлы, которые git add реально бы добавил
+if add_segments:
+    try:
+        untracked_out = subprocess.run(
+            ['git', '-C', repo_root, 'ls-files', '--others', '--exclude-standard'],
+            capture_output=True, encoding='utf-8', errors='replace', timeout=20,
+        ).stdout
+    except Exception:
+        untracked_out = ''
+    untracked_set = set(p for p in untracked_out.split('\n') if p)
+
+    for seg in add_segments:
+        add_tail = re.sub(r'^.*?\badd\b', '', seg, count=1, flags=re.S).strip()
+        try:
+            add_args = shlex.split(add_tail)
+        except ValueError:
+            continue   # незакрытая кавычка в аргументах — эту команду add не разбираем
+        add_args = [a for a in add_args if a not in ('-v', '--verbose', '-n', '--dry-run')]
+        if not add_args:
+            continue
+        try:
+            # БЕЗ "--" перед аргументами: git-флаги add (-A, -u, .) обязаны остаться
+            # флагами, а не превратиться в буквальный pathspec ("-A" файлом с таким
+            # именем) — "--" здесь как раз это и сделал бы.
+            dr_out = subprocess.run(
+                ['git', '-C', repo_root, 'add', '--dry-run'] + add_args,
+                capture_output=True, encoding='utf-8', errors='replace', timeout=20,
+            ).stdout
+        except Exception:
+            continue
+        for line in dr_out.split('\n'):
+            dm = re.match(r"^add '(.+)'$", line)
+            # --dry-run НИЧЕГО не пишет в индекс (проверено фикстурой в сюите) — только
+            # спрашивает git, что было бы добавлено. Отслеживаемые правки из этого списка
+            # уже покрыты git diff ниже (has_add_stage включает его так же, как has_all_flag);
+            # интересны только НОВЫЕ файлы — то, чего -a вообще не берёт (см. HAS_ALL_FLAG выше).
+            if dm and dm.group(1) in untracked_set:
+                staged_new_files.append(dm.group(1))
 
 try:
     diff = subprocess.run(
@@ -138,7 +227,7 @@ try:
 except Exception:
     emit_nothing()
 
-if has_all_flag:
+if has_all_flag or has_add_stage:
     try:
         diff += subprocess.run(
             ['git', '-C', repo_root, 'diff', '-U0', '--no-color'],
@@ -147,8 +236,8 @@ if has_all_flag:
     except Exception:
         pass   # --cached уже прочитан — не откатываем всю проверку из-за второго вызова
 
-if not diff:
-    emit_nothing()   # нечего коммитить — ни staged, ни (при -a) рабочее дерево не тронуты
+if not diff and not staged_new_files:
+    emit_nothing()   # нечего коммитить — ни staged, ни рабочее дерево, ни новые файлы не тронуты
 
 # --- Образцы: см. заголовок файла для источника и версии сверки -------------------------
 PATTERNS = [
@@ -165,12 +254,49 @@ PATTERNS = [
     ('токен Slack (app-level)',     re.compile(r'(?i)\bxapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+\b')),
     ('вебхук Slack',                re.compile(r'(?:https?://)?hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}')),
     ('приватный ключ (PEM)',        re.compile(r'(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----')),
+    # Значение — ИЛИ кавычная строка (qval), ИЛИ голое слово без точки (uval): точка
+    # убрана из символов uval нарочно — литералы ключей точек не содержат, а типичные
+    # ссылки-обходы ("os.environ", "config.api_key", "process.env") обрываются на первой
+    # же точке короче порога в 8 символов и просто не матчатся здесь вообще. См.
+    # REFERENCE_VALUE_RE ниже — второй, независимый барьер для случаев подлиннее.
     ('присвоение секрета',          re.compile(
-        r"(?i)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token)\b"
+        r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token)\b"
         r"['\"]?\s*[:=]{1,2}\s*"
-        r"(?:(['\"])[^'\"]{8,}\2|[A-Za-z0-9][A-Za-z0-9/+_.=-]{7,})"
+        r"(?:(?P<q>['\"])(?P<qval>[^'\"]{8,})(?P=q)|(?P<uval>[A-Za-z0-9][A-Za-z0-9/+_=-]{7,}))"
     )),
 ]
+
+# ЗНАЧЕНИЯ-ССЫЛКИ — см. заголовок файла. Применяется ТОЛЬКО к правилу "присвоение
+# секрета": вендорские образцы (AKIA…, ghp_…, приватный ключ) матчят сам секрет
+# буквально и в фильтре не нуждаются.
+REFERENCE_VALUE_RE = re.compile(
+    r"^(?:"
+    r"process\.env\b|os\.environ\b|os\.getenv\b|getenv\(|System\.getenv\b|System\.Environment\b"
+    r"|\$\{"
+    r"|(?:config|cfg|settings|options|opts)\."
+    r"|password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def check_line(content):
+    """Возвращает имя сработавшего правила или None — общая точка для diff и для
+    полного содержимого новых файлов, чтобы фильтр значений-ссылок не жил в двух
+    местах и не разошёлся между ними на следующей правке."""
+    for name, rx in PATTERNS:
+        m = rx.search(content)
+        if not m:
+            continue
+        if name == 'присвоение секрета':
+            val = m.group('qval')
+            if val is None:
+                val = m.group('uval')
+            if val and REFERENCE_VALUE_RE.match(val):
+                continue   # значение — ссылка на переменную/окружение, не литерал
+        return name
+    return None
+
 
 hits = []
 current_file = None
@@ -192,14 +318,26 @@ for raw in diff.split('\n'):
     if raw.startswith('+'):
         content = raw[1:]
         if current_file is not None:
-            for name, rx in PATTERNS:
-                if rx.search(content):
-                    hits.append((current_file, new_line, name))
-                    break
+            name = check_line(content)
+            if name:
+                hits.append((current_file, new_line, name))
         new_line += 1
         continue
     # '-' (удалённая строка) и служебные строки diff --git/index/rename на новую
     # нумерацию не влияют — их пропускаем.
+
+# Новые (ранее неотслеживаемые) файлы, которые `git add` из командной строки реально
+# добавил бы, — они не проходят через diff-парсер выше (для git нет "before", значит нет
+# и unified diff), поэтому читаются и сканируются целиком, с первой строки.
+for path in dict.fromkeys(staged_new_files):
+    try:
+        with open(os.path.join(repo_root, path), encoding='utf-8', errors='replace') as f:
+            for lineno, line in enumerate(f, start=1):
+                name = check_line(line)
+                if name:
+                    hits.append((path, lineno, name))
+    except Exception:
+        continue
 
 if not hits:
     emit_nothing()

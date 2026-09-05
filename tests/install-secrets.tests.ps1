@@ -290,6 +290,14 @@ Check 'init не падает необработанным исключение�
 Check 'init сообщает о непоставленном settings.json' ($r4.Out -match 'закончился отказом') $r4.Out
 Check 'config/harness.json создан несмотря на отказ install' (Test-Path (Join-Path $p4 'config\harness.json'))
 Check 'settings.json НЕ создан голым' (-not (Test-Path (Join-Path $p4 '.claude\settings.json')))
+# Регрессия найдена ревью M-05: init отчитывался кодом 0 при неподключённых 15 хуках —
+# «init прошёл зелёным» читалось как «обвязка на месте», хотя settings.json не поставлен.
+# install при этом же отказе сам выходит кодом 2 (см. install.ps1: exit 2 при
+# $refused.Count) — init, вызвавший его подпроцессом, не имеет права отчитаться нулём.
+Check 'init код возврата ненулевой при отказе install (не тихий частичный успех)' ($r4.Code -ne 0) "код $($r4.Code)"
+Check 'init выносит отказ в "без этого прогон не поедет" (блокирующий список, не просто предупреждение мимоходом)' (
+    $r4.Out -match 'БЕЗ ЭТОГО ПРОГОН НЕ ПОЕДЕТ'
+) $r4.Out
 
 Restore-TestEnv
 
@@ -385,7 +393,85 @@ Check 'без -a/-am незастейдженный секрет по-прежн
 & $gitExe -C $p9a checkout -- creds.txt 2>&1 | Out-Null
 
 # ---------------------------------------------------------------------------
-Section '10. doctor объявляет Windows требованием'
+Section '10. secret-scan.sh: `git add ... && git commit ...` в одной строке не даёт обойти сканер'
+# ---------------------------------------------------------------------------
+# Регрессия найдена ревью M-05: хук — PreToolUse, он смотрит на командную строку и индекс
+# ДО того, как что-либо из неё выполнилось. `git add -A && git commit -m secret` в одну
+# команду: на момент проверки git add ещё не сработал, `git diff --cached` пуст, секрет
+# из НЕОТСЛЕЖИВАЕМОГО файла (в staging его никогда не заносили — ни здесь, ни отдельной
+# командой раньше) проезжал мимо хука молча. Воспроизведение ревью: creds.txt не в
+# индексе, {"tool_input":{"command":"git add -A && git commit -m secret"}} -> exit 0.
+$p10a = New-GitFixture 'scan-add-commit-bypass'
+Set-Content -LiteralPath (Join-Path $p10a 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$stagedBefore10 = & $gitExe -C $p10a diff --cached --stat
+Check 'контроль сценария: индекс пуст, creds.txt не добавлен ни разу' (-not $stagedBefore10)
+
+$r10a = Invoke-SecretScan -ProjectDir $p10a -Command 'git add -A && git commit -m secret'
+Check 'git add -A && git commit: хук блокирует секрет из НЕотслеживаемого файла' (
+    $r10a.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r10a.Out
+Check 'git add -A && git commit: код возврата хука 2' ($r10a.Code -eq 2) "код $($r10a.Code): $($r10a.Out)"
+Check 'git add -A && git commit: причина называет файл и строку' ($r10a.Out -match 'creds\.txt:1') $r10a.Out
+Check 'git add -A && git commit: само значение ключа НЕ печатается' ($r10a.Out -notmatch [regex]::Escape($fakeAwsKey)) $r10a.Out
+# Индекс после срабатывания хука обязан остаться пустым — сканирование идёт через
+# `git add --dry-run` (git явно обещает ничего не менять), а не через настоящий add.
+$stagedAfter10 = & $gitExe -C $p10a diff --cached --stat
+Check 'git add --dry-run не оставил побочных следов в индексе' (-not $stagedAfter10) $stagedAfter10
+
+# Тот же секрет, но git add адресует файл по имени, а не -A — pathspec тоже уходит
+# настоящему git (git add --dry-run <файл>), а не собственному разбору.
+$p10b = New-GitFixture 'scan-add-named-commit-bypass'
+Set-Content -LiteralPath (Join-Path $p10b 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r10b = Invoke-SecretScan -ProjectDir $p10b -Command 'git add creds.txt && git commit -m secret'
+Check 'git add <файл> && git commit: хук тоже блокирует (не только с -A)' (
+    $r10b.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r10b.Out
+Check 'git add <файл> && git commit: код возврата хука 2' ($r10b.Code -eq 2) "код $($r10b.Code)"
+
+# Регресс-контроль: чистый add+commit (без секрета) по-прежнему проходит молча — фикс не
+# начал блокировать любую связку add+commit как таковую.
+$p10c = New-GitFixture 'scan-add-commit-clean'
+Set-Content -LiteralPath (Join-Path $p10c 'note.txt') -Value 'просто текст, без секретов' -Encoding UTF8
+$r10c = Invoke-SecretScan -ProjectDir $p10c -Command 'git add -A && git commit -m note'
+Check 'git add -A && git commit без секрета проходит молча (регресс не внесён)' (-not $r10c.Out.Trim()) $r10c.Out
+Check 'чистый add+commit: код возврата хука 0' ($r10c.Code -eq 0) "код $($r10c.Code): $($r10c.Out)"
+
+# ---------------------------------------------------------------------------
+Section '11. secret-scan.sh: значение-ссылка на переменную/окружение — не находка'
+# ---------------------------------------------------------------------------
+# Регрессия найдена ревью M-05: правило "присвоение секрета" считало находкой код, который
+# УЖЕ читает секрет из окружения (`process.env.X`, `os.environ[...]`, `os.getenv(...)`,
+# `config.api_key`, обращение к другой переменной вида `pwd = password`) — то есть блокировало
+# ровно то решение, которое сам текст отказа советует принять. Четыре воспроизведения ревью:
+$refFiles = @(
+    @{ Name = 'app.js'; Content = 'const token = process.env.GITHUB_TOKEN;'; What = 'JS: token = process.env.*' }
+    @{ Name = 'app2.js'; Content = 'const apiKey = config.api_key;'; What = 'JS: apiKey = config.*' }
+    @{ Name = 'app3.js'; Content = 'const secret = process.env.MY_SECRET;'; What = 'JS: secret = process.env.*' }
+    @{ Name = 'app.py'; Content = 'API_KEY = os.environ["OPENAI_API_KEY"]'; What = 'Python: API_KEY = os.environ[...]' }
+    @{ Name = 'app2.py'; Content = 'pwd = password or os.getenv("DB_PASSWORD")'; What = 'Python: pwd = password or os.getenv(...)' }
+)
+foreach ($rf in $refFiles) {
+    $p11 = New-GitFixture ('scan-ref-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+    Set-Content -LiteralPath (Join-Path $p11 $rf.Name) -Value $rf.Content -Encoding UTF8
+    & $gitExe -C $p11 add -A 2>&1 | Out-Null
+    $rRef = Invoke-SecretScan -ProjectDir $p11 -Command 'git -c user.name="t" -c user.email="t@local" commit -m note'
+    Check "значение-ссылка не блокирует: $($rf.What)" (-not $rRef.Out.Trim()) $rRef.Out
+    & $gitExe -C $p11 restore --staged . 2>&1 | Out-Null
+}
+
+# Регресс-контроль: реальный литерал под тем же ключевым словом по-прежнему блокируется —
+# фильтр значений-ссылок не должен был выключить правило целиком.
+$p11b = New-GitFixture 'scan-real-literal-still-blocks'
+Set-Content -LiteralPath (Join-Path $p11b 'config.js') -Value 'const password = "realsecretvalue123";' -Encoding UTF8
+& $gitExe -C $p11b add -A 2>&1 | Out-Null
+$r11b = Invoke-SecretScan -ProjectDir $p11b -Command 'git -c user.name="t" -c user.email="t@local" commit -m note'
+Check 'реальный литерал password = "..." по-прежнему блокируется (правило не выключено)' (
+    $r11b.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r11b.Out
+& $gitExe -C $p11b restore --staged . 2>&1 | Out-Null
+
+# ---------------------------------------------------------------------------
+Section '12. doctor объявляет Windows требованием'
 # ---------------------------------------------------------------------------
 # $IsWindows у PowerShell — константа ("Cannot overwrite variable IsWindows because it is
 # read-only"), поэтому ветка «не Windows» проверяется тестовым швом BCF_SIMULATE_NOT_WINDOWS,
@@ -415,7 +501,7 @@ Check 'docs/SETUP.md называет Windows требованием (конкр
 )
 
 # ---------------------------------------------------------------------------
-Section '11. CI: workflow гоняет tests/all.ps1 на push и pull_request на windows-latest'
+Section '13. CI: workflow гоняет tests/all.ps1 на push и pull_request на windows-latest'
 # ---------------------------------------------------------------------------
 # Регрессия найдена ревью M-05: до этого раздела ни одна сюита не читала
 # .github/workflows/tests.yml — удаление файла или подмена runs-on/команды прогона не
