@@ -35,40 +35,18 @@ $env:BCF_PROJECT_ROOT = $project
 # Конфиг памяти — ТОТ ЖЕ, что возьмёт клиент, и в том же порядке.
 #
 # У клиента (memory_client.py, _config_candidates) приоритет такой: $BCF_MEM_CONFIG →
-# <проект>/config/memory.config.json → конфиг фабрики. Команда же читала ТОЛЬКО конфиг
-# фабрики — и на проекте со своей базой это расходилось молча: `bcf memory init` поднимал
-# контейнер фабрики (bcf-agent-memory:5433) и рапортовал об успехе, а клиент шёл в базу
-# проекта (например bgc-agent-memory:5434), которой никто не поднял. Человек видел
-# зелёный init и «память недоступна» на прогоне — одновременно.
+# <проект>/config/memory.config.json → конфиг фабрики, а поверх — накладка машины
+# .bcf/memory.local.json. Команда же читала ТОЛЬКО конфиг фабрики — и на проекте со
+# своей базой это расходилось молча: `bcf memory init` поднимал контейнер фабрики
+# (bcf-agent-memory:5433) и рапортовал об успехе, а клиент шёл в базу проекта
+# (например bgc-agent-memory:5434), которой никто не поднял. Человек видел зелёный init
+# и «память недоступна» на прогоне — одновременно. Поэтому правило живёт в ОДНОМ файле,
+# harness/lib/memory-config.ps1, и его читают все: команда, doctor, мостик и клиент.
+. (Join-Path (Get-BcfHarness) 'lib\memory-config.ps1')
+
 function Get-BcfMemoryConfig {
     param([string]$Project)
-    $candidates = @()
-    if ($env:BCF_MEM_CONFIG) { $candidates += $env:BCF_MEM_CONFIG }
-    if ($Project) { $candidates += (Join-Path $Project 'config\memory.config.json') }
-    $candidates += (Join-Path (Get-BcfMemoryDir) 'memory.config.json')
-
-    foreach ($c in $candidates) {
-        if ($c -and (Test-Path $c)) {
-            try {
-                $cfg = Get-Content -Raw -LiteralPath $c | ConvertFrom-Json
-                return [pscustomobject]@{
-                    Path      = $c
-                    Port      = $(if ($cfg.port) { [int]$cfg.port } else { 5433 })
-                    Container = $(if ($cfg.container) { [string]$cfg.container } else { 'bcf-agent-memory' })
-                    Database  = [string]$cfg.database
-                    User      = [string]$cfg.user
-                    PwEnv     = $(if ($cfg.password_env) { [string]$cfg.password_env } else { 'BCF_PG_PASSWORD' })
-                    PwDefault = [string]$cfg.password_default
-                    Endpoint  = $(if ($cfg.embedding_endpoint) { [string]$cfg.embedding_endpoint } else { 'http://localhost:1234/v1/embeddings' })
-                    Model     = [string]$cfg.embedding_model
-                    Dim       = $cfg.embedding_dim
-                    DataDir   = [string]$cfg.data_dir
-                    Raw       = $cfg
-                }
-            } catch { }
-        }
-    }
-    return $null
+    return (Resolve-BcfMemorySettings -Project $Project -FactoryMemoryDir (Get-BcfMemoryDir))
 }
 
 function Invoke-MemClient {
@@ -111,7 +89,8 @@ switch ($sub) {
         if ($m0) {
             # Адрес обязателен в сообщении: на проекте со своей базой «недоступна» без
             # адреса отправляет чинить не тот контейнер.
-            Write-BcfNote "ходили в: $($m0.Container) на 127.0.0.1:$($m0.Port)   (конфиг: $($m0.Path))"
+            Write-BcfNote "ходили в: $($m0.Container) на $($m0.Host):$($m0.Port)   (конфиг: $($m0.Path))"
+            if ($m0.PortFromLocal) { Write-BcfNote "порт подобран на этой машине и записан в $($m0.LocalPath)" }
         }
         Write-BcfNote 'поднять: bcf memory init'
         Write-Host ''
@@ -121,6 +100,11 @@ switch ($sub) {
     Write-Host ''
     $rows = New-BcfRows
     Add-BcfRow $rows @('уроки (анти-паттерны)', $(if ($null -eq $st.anti_patterns) { 'таблицы нет' } else { "$($st.anti_patterns)" }))
+    # Своих уроков отдельной строкой. База общая на все проекты машины: «уроков 340» на
+    # новом проекте выглядит как готовая память, хотя своего опыта там ещё нет.
+    Add-BcfRow $rows @("из них этого проекта", $(
+        if ($null -eq $st.anti_patterns_project) { 'нет колонки project — bcf memory init' }
+        else { "$($st.anti_patterns_project)   ($($st.project))" }))
     Add-BcfRow $rows @('баги', $(if ($null -eq $st.bugs) { 'таблицы нет' } else { "$($st.bugs)" }))
     Add-BcfRow $rows @('отзывы (recall)', $(if ($null -eq $st.recalls) { 'таблицы нет' } else { "$($st.recalls)" }))
     Add-BcfRow $rows @('предложения эволюции', $(if ($null -eq $st.proposals) { 'таблицы нет' } else { "$($st.proposals)" }))
@@ -197,105 +181,147 @@ switch ($sub) {
 'init' {
     Write-BcfTitle 'ПОДКЛЮЧЕНИЕ ПАМЯТИ' 'pgvector + сервер эмбеддингов'
 
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-BcfFail 'docker не найден — контейнер с базой поднять нечем'
-        Write-BcfNote 'поставь Docker Desktop и повтори. Память опциональна: без неё харнесс работает,'
-        Write-BcfNote 'но не учится на прошлых прогонах.'
-        exit 2
-    }
-
-    # Демон проверяем ДО первой команды docker. На Windows docker.exe при незапущенном
-    # Docker Desktop не падает, а запускает его и ждёт — вместо ответа человек получает
-    # минуты тишины и чужой диалог поверх экрана. Сказать прямо дешевле.
-    . (Join-Path (Get-BcfHarness) 'lib\docker.ps1')
-    if (-not (Test-BcfDockerDaemon)) {
-        Write-BcfFail 'docker установлен, но демон не отвечает — Docker Desktop не запущен'
-        Write-BcfNote 'запусти Docker Desktop, дождись зелёного значка и повтори.'
-        Write-BcfNote 'сами мы его не поднимаем: старт занимает минуты, и всё это время команда'
-        Write-BcfNote 'выглядела бы зависшей.'
-        exit 2
-    }
-
-    # Порт занят ЧУЖОЙ базой — самый неприятный из возможных исходов, и он молчаливый.
-    # Compose не поднимет свой контейнер, клиент подключится к чужому, получит отказ
-    # авторизации, и это будет выглядеть как «наша память сломалась». Проверяем ДО.
+    # КОНФИГ И ПАРОЛЬ — ДО ВСЕГО ОСТАЛЬНОГО.
+    #
+    # Пароль по умолчанию лежит в репозитории и предназначен ровно для одного случая:
+    # база в docker на этой же машине. На сетевом адресе тот же пароль означает базу,
+    # которую видит вся сеть, с паролем из открытого файла — а команда при этом
+    # отчитывается об успешном подключении. Проверяем раньше docker: отказ должен
+    # называть причину, а не тонуть за «демон не отвечает».
     $mcfg = Get-BcfMemoryConfig -Project $project
     if (-not $mcfg) {
         Write-BcfFail 'конфиг памяти не найден ни в проекте, ни в фабрике'
         Write-BcfNote 'ожидается config/memory.config.json в проекте или memory/memory.config.json в фабрике.'
         exit 2
     }
-    $port = $mcfg.Port
-    $ours = $mcfg.Container
-    Write-BcfDim "конфиг: $($mcfg.Path)"
-    Write-BcfDim "цель: контейнер $ours, порт $port"
-    # ЗАНЯТО — ЗНАЧИТ ПОДБИРАЕМ, А НЕ ОТПРАВЛЯЕМ ПРАВИТЬ КОНФИГ РУКАМИ.
-    #
-    # Раньше здесь стоял exit 2 с советом «поправь port и повтори». Совет верный по сути и
-    # негодный по форме: порт 5433 записан дефолтом во ВСЕ установки фабрики, поэтому
-    # столкновение — обычное состояние машины с двумя проектами, а не редкость, ради
-    # которой стоит будить человека. Подбираем свободный, пишем в конфиг проекта и
-    # говорим, что сделали.
-    . (Join-Path (Get-BcfHarness) 'lib\memory-port.ps1')
-    $pr = Resolve-BcfMemoryPort -Wanted $port -Container $ours -ConfigPath $mcfg.Path -ProjectRoot $project
-    if ($pr.Holder) {
-        $kind = if ($pr.HolderKind -eq 'container') { 'контейнером' } else { 'процессом' }
-        Write-BcfWarn "порт $port занят $kind '$($pr.Holder)' — это не наша база"
-        Write-BcfNote 'оставить как есть нельзя: клиент подключился бы к ЧУЖОЙ базе, получил отказ'
-        Write-BcfNote 'авторизации, и выглядело бы это как поломка нашей памяти.'
-    }
-    if ($pr.Error) {
-        Write-BcfFail "порт $port занят, заменить не вышло: $($pr.Error)"
-        Write-BcfNote "останови занявшего или впиши свободный port в $($mcfg.Path) и повтори."
+    $pw = Get-BcfMemoryPassword -Settings $mcfg
+    if (-not $mcfg.IsLocalHost -and $pw.IsDefault) {
+        Write-BcfFail "база на $($mcfg.Host), а пароль — тот, что лежит в репозитории"
+        Write-BcfNote "он не секрет и заведён для локального контейнера. На сетевом адресе это"
+        Write-BcfNote 'открытая база: пароль знает каждый, у кого есть доступ к исходникам.'
+        Write-BcfNote "задай настоящий: `$env:$($mcfg.PwEnv) = '…' (и в .env, см. .env.example),"
+        Write-BcfNote "либо верни host в localhost, если база должна быть на этой машине."
         exit 2
     }
-    if ($pr.Changed) {
-        $port = $pr.Port
-        Write-BcfOk "беру свободный порт $port — записан в $($pr.ConfigPath)"
-        Write-BcfNote 'проектный конфиг перекрывает фабричный: клиент памяти прочитает тот же порт.'
-        # Дальше всё считаем по НОВОМУ конфигу: имя контейнера, данные и адрес клиента
-        # должны сойтись, иначе мы починили порт и разошлись в остальном.
-        $mcfg = Get-BcfMemoryConfig -Project $project
+
+    Write-BcfDim "конфиг: $($mcfg.Path)"
+
+    if ($mcfg.IsLocalHost) {
+        # --- База на этой машине: контейнер, порт, данные ---------------------------
+        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+            Write-BcfFail 'docker не найден — контейнер с базой поднять нечем'
+            Write-BcfNote 'поставь Docker Desktop и повтори. Память опциональна: без неё харнесс работает,'
+            Write-BcfNote 'но не учится на прошлых прогонах.'
+            exit 2
+        }
+
+        # Демон проверяем ДО первой команды docker. На Windows docker.exe при незапущенном
+        # Docker Desktop не падает, а запускает его и ждёт — вместо ответа человек получает
+        # минуты тишины и чужой диалог поверх экрана. Сказать прямо дешевле.
+        . (Join-Path (Get-BcfHarness) 'lib\docker.ps1')
+        if (-not (Test-BcfDockerDaemon)) {
+            Write-BcfFail 'docker установлен, но демон не отвечает — Docker Desktop не запущен'
+            Write-BcfNote 'запусти Docker Desktop, дождись зелёного значка и повтори.'
+            Write-BcfNote 'сами мы его не поднимаем: старт занимает минуты, и всё это время команда'
+            Write-BcfNote 'выглядела бы зависшей.'
+            exit 2
+        }
+
+        # Порт занят ЧУЖОЙ базой — самый неприятный из возможных исходов, и он молчаливый.
+        # Compose не поднимет свой контейнер, клиент подключится к чужому, получит отказ
+        # авторизации, и это будет выглядеть как «наша память сломалась». Проверяем ДО.
+        $port = $mcfg.Port
         $ours = $mcfg.Container
-    }
+        Write-BcfDim "цель: контейнер $ours, порт $port"
+        # ЗАНЯТО — ЗНАЧИТ ПОДБИРАЕМ, А НЕ ОТПРАВЛЯЕМ ПРАВИТЬ КОНФИГ РУКАМИ.
+        #
+        # Раньше здесь стоял exit 2 с советом «поправь port и повтори». Совет верный по сути
+        # и негодный по форме: порт 5433 записан дефолтом во ВСЕ установки фабрики, поэтому
+        # столкновение — обычное состояние машины с двумя проектами, а не редкость, ради
+        # которой стоит будить человека. Подбираем свободный и пишем в накладку МАШИНЫ.
+        . (Join-Path (Get-BcfHarness) 'lib\memory-port.ps1')
+        $pr = Resolve-BcfMemoryPort -Wanted $port -Container $ours -ProjectRoot $project -HostName $mcfg.Host
+        if ($pr.Holder) {
+            $kind = if ($pr.HolderKind -eq 'container') { 'контейнером' } else { 'процессом' }
+            Write-BcfWarn "порт $port занят $kind '$($pr.Holder)' — это не наша база"
+            Write-BcfNote 'оставить как есть нельзя: клиент подключился бы к ЧУЖОЙ базе, получил отказ'
+            Write-BcfNote 'авторизации, и выглядело бы это как поломка нашей памяти.'
+        }
+        if ($pr.Error) {
+            Write-BcfFail "порт $port занят, заменить не вышло: $($pr.Error)"
+            Write-BcfNote "останови занявшего или впиши свободный port в $($mcfg.Path) и повтори."
+            exit 2
+        }
+        if ($pr.Changed) {
+            $port = $pr.Port
+            Write-BcfOk "беру свободный порт $port — записан в $($pr.ConfigPath)"
+            Write-BcfNote 'это накладка ЭТОЙ машины, она не попадает в git: порт — не решение проекта.'
+            # Дальше всё считаем по НОВОМУ конфигу: имя контейнера, данные и адрес клиента
+            # должны сойтись, иначе мы починили порт и разошлись в остальном.
+            $mcfg = Get-BcfMemoryConfig -Project $project
+            $ours = $mcfg.Container
+        }
 
-    # Compose параметризован переменными окружения (см. docker-compose.yml). Передаём ему
-    # ИМЕННО то, что прочитает клиент: иначе поднимется контейнер с другим именем и на
-    # другом порту, а команда отчитается об успехе.
-    Write-BcfDim "поднимаю контейнер $ours на порту $port…"
-    $env:BCF_MEM_CONTAINER = $ours
-    $env:BCF_PG_PORT = "$port"
-    if (-not $env:BCF_PG_PASSWORD -and $mcfg.PwDefault) { $env:BCF_PG_PASSWORD = $mcfg.PwDefault }
+        # Compose параметризован переменными окружения (см. docker-compose.yml). Передаём
+        # ему ИМЕННО то, что прочитает клиент: иначе поднимется контейнер с другим именем и
+        # на другом порту, а команда отчитается об успехе.
+        Write-BcfDim "поднимаю контейнер $ours на порту $port…"
+        $env:BCF_MEM_CONTAINER = $ours
+        $env:BCF_PG_PORT = "$port"
+        if (-not $env:BCF_PG_PASSWORD -and $mcfg.PwDefault) { $env:BCF_PG_PASSWORD = $mcfg.PwDefault }
 
-    # КАТАЛОГ ДАННЫХ — СВОЙ НА КАЖДУЮ БАЗУ. Пока он был один на всех, второй контейнер
-    # монтировал чужой postgres: пароль применяется только при первой инициализации
-    # пустого каталога, поэтому клиент получал «password authentication failed», а при
-    # одновременной работе двух контейнеров данные просто портятся.
-    $dataDir = $mcfg.DataDir
-    if (-not $dataDir) {
-        if ($ours -eq 'bcf-agent-memory') { $dataDir = './data' }   # общая база фабрики, как было
-        else { $dataDir = (Join-Path $project '.bcf\memory\data') }
-    }
-    if ($dataDir -ne './data') {
-        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-        $dataDir = (Resolve-Path $dataDir).Path
-        Write-BcfDim "данные: $dataDir"
-    }
-    $env:BCF_MEM_DATA = $dataDir
-    & docker compose -f $compose up -d 2>&1 | ForEach-Object { Write-BcfNote $_ }
-    if ($LASTEXITCODE -ne 0) { Write-BcfFail 'docker compose up не отработал'; exit 1 }
+        # КАТАЛОГ ДАННЫХ — СВОЙ НА КАЖДУЮ БАЗУ. Пока он был один на всех, второй контейнер
+        # монтировал чужой postgres: пароль применяется только при первой инициализации
+        # пустого каталога, поэтому клиент получал «password authentication failed», а при
+        # одновременной работе двух контейнеров данные просто портятся.
+        $dataDir = $mcfg.DataDir
+        if (-not $dataDir) {
+            if ($ours -eq 'bcf-agent-memory') { $dataDir = './data' }   # общая база фабрики, как было
+            else { $dataDir = (Join-Path $project '.bcf\memory\data') }
+        }
+        if ($dataDir -ne './data') {
+            New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+            $dataDir = (Resolve-Path $dataDir).Path
+            Write-BcfDim "данные: $dataDir"
+        }
+        $env:BCF_MEM_DATA = $dataDir
+        & docker compose -f $compose up -d 2>&1 | ForEach-Object { Write-BcfNote $_ }
+        if ($LASTEXITCODE -ne 0) { Write-BcfFail 'docker compose up не отработал'; exit 1 }
 
-    # Ждём healthy, а не «команда вернула 0»: контейнер поднимается раньше, чем база
-    # готова принимать соединения, и первая же запись после старта падала бы молча.
-    $ok = $false
-    for ($i = 0; $i -lt 30; $i++) {
-        $h = (& docker inspect -f '{{.State.Health.Status}}' $ours 2>$null | Out-String).Trim()
-        if ($h -eq 'healthy') { $ok = $true; break }
-        Start-Sleep -Seconds 2
+        # Ждём healthy, а не «команда вернула 0»: контейнер поднимается раньше, чем база
+        # готова принимать соединения, и первая же запись после старта падала бы молча.
+        $ok = $false
+        for ($i = 0; $i -lt 30; $i++) {
+            $h = (& docker inspect -f '{{.State.Health.Status}}' $ours 2>$null | Out-String).Trim()
+            if ($h -eq 'healthy') { $ok = $true; break }
+            Start-Sleep -Seconds 2
+        }
+        if ($ok) { Write-BcfOk 'база отвечает (healthy)' }
+        else {
+            Write-BcfWarn "база не сообщила healthy за минуту — проверь docker logs $ours"
+        }
     }
-    if ($ok) { Write-BcfOk 'база отвечает (healthy)' }
     else {
-        Write-BcfWarn "база не сообщила healthy за минуту — проверь docker logs $ours"
+        # Контейнер здесь не поднимается: база живёт на другой машине, и compose поднял бы
+        # ВТОРУЮ, пустую, рядом — а команда отчиталась бы об успехе. Дальше только схема и
+        # эмбеддинги.
+        Write-BcfOk "база на $($mcfg.Host):$($mcfg.Port) — контейнер не поднимаем, она не на этой машине"
+        if (-not $pw.FromEnv) {
+            Write-BcfNote "пароль берётся из `$env:$($mcfg.PwEnv)"
+        }
+    }
+
+    # СХЕМА ПРИМЕНЯЕТСЯ ЯВНО, А НЕ «КОНТЕЙНЕР САМ».
+    #
+    # init.sql выполняется образом postgres ровно один раз — при первой инициализации
+    # пустого каталога данных. У всех, кто поднял память раньше, новых колонок не
+    # появится никогда: запись начнёт падать на первом же прогоне, а выглядеть это будет
+    # как «память недоступна». Файл идемпотентен, поэтому зовём его всегда.
+    $mig = Invoke-MemClient @('migrate')
+    if ($mig -and $mig.Ok) { Write-BcfOk 'схема применена (init.sql)' }
+    elseif ($mig) {
+        Write-BcfWarn 'схему применить не удалось — часть колонок может отсутствовать'
+        Write-BcfNote (@($mig.Text -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1)
     }
 
     # Эмбеддинги. Без них recall не работает вовсе, а выглядит это как «память пустая».
@@ -403,6 +429,15 @@ switch ($sub) {
 }
 
 'down' {
+    # База не на этой машине — останавливать нечего, и лезть в чужой сервер нельзя.
+    $mdown = Get-BcfMemoryConfig -Project $project
+    if ($mdown -and -not $mdown.IsLocalHost) {
+        Write-BcfDim "база на $($mdown.Host) — это не наш контейнер, останавливать нечего"
+        Write-BcfNote 'сервер памяти держит не эта машина; выключать его отсюда мы не будем.'
+        Write-Host ''
+        exit 0
+    }
+
     # Проба демона ОБЯЗАТЕЛЬНА, как и в init. Без неё `bcf memory down` при закрытом
     # Docker Desktop сам его ЗАПУСКАЕТ и ждёт минуты — то есть команда «останови»
     # поднимает приложение, которое её об этом не просили.
