@@ -657,6 +657,102 @@ It 'в вызов отчёта граф передаёт счётчик блок
     Assert-Match $asg.Right.Extent.Text 'BlockingP1' '$blockP1 считается не по блокирующим ракурсам'
 }
 
+# --- 4в. Тот же вес в графе ревью ----------------------------------------------------------
+#
+# ВЕС РАКУРСА РЕШАЕТСЯ В ДВУХ МЕСТАХ, А СТОРОЖ СТОЯЛ У ОДНОГО. Приёмка отдаёт наверх
+# `$blockP1`, ревью — поле `findings` своего результата, и по нему graph.ps1 решает, назвать
+# прогон «ок» или нет. Пока эта строка не исполнялась, замена `$confirmedBlocking.Count` на
+# `$confirmed.Count` (поведение до правки: находка совещательного ракурса роняет ревью)
+# не красила ни одну сюиту — ровно тот дефект, который в графе очереди уже закрыт выше.
+#
+# Хвост вердикта вырезается из файла графа тем же способом и исполняется: от разделения
+# находок по весу до `return`. Подменены только журнал и узел сведения — всё, что касается
+# веса, считает настоящий код графа.
+Write-Host ''
+Write-Host '4в. Тот же вес ракурса в графе ревью' -ForegroundColor White
+
+$reviewRunner = Join-Path $box 'run-review-verdict.ps1'
+Set-Content -LiteralPath $reviewRunner -Encoding UTF8 -Value @'
+param([string]$Graph, [string]$Box, [string]$Result)
+$ErrorActionPreference = 'Stop'
+
+# Две находки, пережившие состязательную проверку: одна блокирующего ракурса, одна
+# совещательного. Разделить их обязан граф, а не тест.
+$confirmed = @(
+    [pscustomobject]@{ severity = 'P1'; file = 'src/app.ts'; line = 10; title = 'путь не проходится'
+                       why = 'нет обработчика пустого расписания'; lens = 'gates'; owner = 'лидер java'; blocking = $true },
+    [pscustomobject]@{ severity = 'P2'; file = 'src/ui.ts'; line = 20; title = 'подпись мимо макета'
+                       why = 'шрифт другого начертания'; lens = 'journey'; owner = 'аналитик'; blocking = $false }
+)
+$seen = @{ 'a' = $true; 'b' = $true; 'c' = $true }
+$round = 2
+$reportFile = Join-Path $Box 'REVIEW-graph.md'
+
+function Write-GraphLog { param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+function Invoke-Node {
+    param([string]$Prompt, [string]$Label = '', [string]$Role = '', $Schema = $null,
+          [Parameter(ValueFromRemainingArguments = $true)]$Rest)
+    # Узел сведения возвращает текст; тесту важно не что он сказал, а что ему показали.
+    Set-Content -LiteralPath (Join-Path $Box 'summary-prompt.txt') -Value $Prompt -Encoding UTF8
+    return 'сводка узла сведения'
+}
+
+# Хвост вердикта из файла графа: от разделения находок по весу до return с полем advisory.
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Graph, [ref]$null, [ref]$null)
+$from = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+              $n.Left.Extent.Text -eq '$confirmedBlocking' }, $true))[0]
+$ret = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and
+              $n.Extent.Text -match 'advisory' }, $true))[-1]
+if (-not $from) { throw 'в графе ревью нет разделения находок по весу ($confirmedBlocking)' }
+if (-not $ret)  { throw 'в графе ревью нет return с полем advisory' }
+if ($ret.Extent.EndOffset -le $from.Extent.StartOffset) { throw 'хвост вердикта в графе ревью идёт задом наперёд' }
+$src = Get-Content -Raw -LiteralPath $Graph
+$region = $src.Substring($from.Extent.StartOffset, $ret.Extent.EndOffset - $from.Extent.StartOffset)
+
+$out = & ([scriptblock]::Create($region))
+
+([ordered]@{
+    findings = [int]$out.findings
+    advisory = [int]$out.advisory
+    report   = (Get-Content -Raw -LiteralPath $reportFile)
+    prompt   = (Get-Content -Raw -LiteralPath (Join-Path $Box 'summary-prompt.txt'))
+} | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $Result -Encoding UTF8
+'@
+
+$script:reviewVerdict = $null
+function Get-ReviewVerdict {
+    if ($script:reviewVerdict) { return $script:reviewVerdict }
+    $result = Join-Path $box 'review-verdict.json'
+    $graph = Join-Path $root 'harness\graphs\review.graph.ps1'
+    & pwsh -NoProfile -NonInteractive -File $reviewRunner -Graph $graph -Box $box -Result $result *> $null
+    if (-not (Test-Path -LiteralPath $result)) { throw 'хвост вердикта графа ревью не отработал' }
+    $script:reviewVerdict = Get-Content -Raw -LiteralPath $result | ConvertFrom-Json
+    return $script:reviewVerdict
+}
+
+It 'ревью поднимает наверх находки блокирующих ракурсов, а не все подряд' {
+    # По полю findings graph.ps1 решает, называть ли прогон «ок». Уедет туда общее число —
+    # совещательный ракурс снова роняет прогон наравне с требованием заказчика.
+    $r = Get-ReviewVerdict
+    Assert-Eq $r.findings 1 'в вердикт ревью уехало общее число находок, а не число блокирующих'
+    Assert-Eq $r.advisory 1 'совещательная находка потерялась вовсе'
+}
+
+It 'совещательная находка ревью печатается своим разделом, а не молчит' {
+    # Вторая половина веса: находка не влияет на вердикт, но человек её видит и видит,
+    # что она совещательная. Молча выброшенная находка хуже, чем роняющая прогон.
+    $r = Get-ReviewVerdict
+    Assert-Match $r.report 'Совещательные ракурсы' 'в отчёте ревью нет раздела совещательных находок'
+    Assert-Match $r.report 'подпись мимо макета' 'совещательная находка не доехала до отчёта'
+    Assert-Match $r.report 'блокирующих 1, совещательных 1' 'отчёт не называет находки по весу'
+    Assert-Match $r.report 'путь не проходится' 'блокирующая находка не доехала до отчёта'
+    # И владелец ракурса едет вместе с находкой: иначе спросить по ней некого.
+    Assert-Match $r.report 'отвечает лидер java' 'владелец блокирующего ракурса потерян'
+    Assert-Match $r.prompt 'подпись мимо макета' 'узел сведения совещательных находок не видит'
+}
+
 # --- 5. Номера требований заказчика --------------------------------------------------------
 Write-Host ''
 Write-Host '5. Номера требований: шапка, секция и то, что требованием НЕ является' -ForegroundColor White
