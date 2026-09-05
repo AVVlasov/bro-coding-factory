@@ -26,14 +26,14 @@ $COMMANDS = [ordered]@{
     'doctor'   = @{ file = 'doctor.ps1';   help = 'живая проба окружения: бэкенды, авторизации, память, проверки' }
     'detect'   = @{ file = 'detect.ps1';   help = 'разбор проекта: языки, сборка, тесты, git — ничего не пишет' }
     'tasks'    = @{ file = 'tasks.ps1';    help = 'бэклог: что готово к работе, что ждёт, что закрыто' }
-    'task'     = @{ file = 'task.ps1';     help = 'задача: new "<название>" | why <ID> | show <ID>' }
+    'task'     = @{ file = 'task.ps1';     help = 'задача: new "<название>" | why <ID> | show <ID> | accept <ID> --as <имя>' }
     'run'      = @{ file = 'run.ps1';      help = 'прогон: loop <TASK> | queue | review | night' }
     'stop'     = @{ file = 'stop.ps1';     help = 'остановить прогон: мягко между задачами или --now' }
     'log'      = @{ file = 'log.ps1';      help = 'что агент ответил: вывод узла, ошибки, промпт' }
     'watch'    = @{ file = 'watch.ps1';    help = 'живая доска прогона: фазы, кто работает, токены, полоса' }
     'runs'     = @{ file = 'runs.ps1';     help = 'журналы прошлых прогонов графа' }
     'board'    = @{ file = 'board.ps1';    help = 'доска прогона: узлы, роли, стоимость' }
-    'report'   = @{ file = 'report.ps1';   help = 'итог прогона одним экраном' }
+    'report'   = @{ file = 'report.ps1';   help = 'итог прогона одним экраном | --export <yyyy-MM> — отчёт за месяц' }
     'cost'     = @{ file = 'cost.ps1';     help = 'расход: токены → деньги, подписки против API' }
     'memory'   = @{ file = 'memory.ps1';   help = 'векторная память: init | status | ask | stats' }
     'research' = @{ file = 'research.ps1'; help = 'разведка задачи до работы — только чтение' }

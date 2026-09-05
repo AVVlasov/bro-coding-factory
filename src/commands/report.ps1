@@ -126,9 +126,18 @@ if ($exportArgIdx -ge 0 -or $exportMonth) {
     # gate_blocked попадают в отчёт месяца, только если сам прогон («when») случился в
     # запрошенном окне — иначе застрявшая в прошлом месяце задача выглядела бы затыком
     # текущего.
-    $statusFile = Join-Path $project '.bcf\run-all.status.json'
+    #
+    # ИЩЕМ И В НОВОМ КАТАЛОГЕ, И В СТАРОМ (loop/) — тем же перебором, что ниже по файлу
+    # у обычного `bcf report`. Проект, не прошедший `bcf migrate`, держит итог ночного
+    # прогона в loop/run-all.status.json; --export, смотрящий только в .bcf/, объявлял
+    # такой месяц «умышленно пустым» — неправда о том, что фабрика в нём не работала.
+    $statusFile = ''
+    foreach ($d in @((Join-Path $project '.bcf'), (Join-Path $project 'loop'))) {
+        $s = Join-Path $d 'run-all.status.json'
+        if (-not $statusFile -and (Test-Path $s)) { $statusFile = $s }
+    }
     $stuckRows = @()
-    if (Test-Path -LiteralPath $statusFile) {
+    if ($statusFile -and (Test-Path -LiteralPath $statusFile)) {
         try {
             $st = Get-Content -Raw -LiteralPath $statusFile -ErrorAction Stop | ConvertFrom-Json
             $stWhen = $null

@@ -779,7 +779,12 @@ function Publish-BcfClaimChange {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string[]]$Paths,
-        [Parameter(Mandatory)][string]$Message
+        [Parameter(Mandatory)][string]$Message,
+        # Метаданные прогона — трейлеры коммита (New-BcfCommitMessage, bcf-context.ps1).
+        # Пусто = коммит остаётся литеральным $Message без трейлеров, как раньше: заявка
+        # и её снятие идут во время прогона (RunId известен графу/планировщику), а
+        # `bcf task accept` — действие лидера вне прогона, трейлеров не несёт.
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     $inside = (& git -C $Root rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
     if ($inside -ne 'true') { return @{ Ok = $false; Reason = 'не git-репозиторий' } }
@@ -787,7 +792,12 @@ function Publish-BcfClaimChange {
     & git -C $Root add -A -- @Paths 2>&1 | Out-Null
     $staged = @(& git -C $Root diff --cached --name-only -- @Paths 2>$null | Where-Object { $_ })
     if (-not $staged.Count) { return @{ Ok = $true; Reason = 'менять нечего' } }
-    $out = (& git -C $Root @id commit -q -m $Message -- @Paths 2>&1 | Out-String)
+    $msg = if ($RunId) {
+        New-BcfCommitMessage -Subject $Message -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+    } else {
+        $Message
+    }
+    $out = (& git -C $Root @id commit -q -m $msg -- @Paths 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Reason = $out.Trim() } }
     return @{ Ok = $true; Reason = 'закоммичено' }
 }
@@ -802,7 +812,9 @@ function Add-TaskClaim {
         # Коммитить при этом нечего: прогона не было.
         [switch]$Local,
         [string]$Who = '',
-        [string]$Branch = ''
+        [string]$Branch = '',
+        # Метаданные прогона — трейлеры коммита заявки. См. Publish-BcfClaimChange.
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     _With-ClaimsLock {
         $declared = Get-TaskDeclaredFiles -TaskId $TaskId -Root $Root
@@ -835,7 +847,8 @@ function Add-TaskClaim {
         $text = ConvertTo-BcfClaimText -TaskId $TaskId -Who $who -Branch $branch -Files $files -Since $since
         Set-Content -LiteralPath $path -Value $text -Encoding UTF8
         $rel = ($path.Substring($Root.Length).TrimStart('\', '/')) -replace '\\', '/'
-        Publish-BcfClaimChange -Root $Root -Paths @($rel) -Message "$TaskId — заявка: $who" | Out-Null
+        Publish-BcfClaimChange -Root $Root -Paths @($rel) -Message "$TaskId — заявка: $who" `
+            -Task $TaskId -RunId $RunId -Role $Role -Model $Model -Backend $Backend | Out-Null
     }
 }
 
@@ -843,7 +856,9 @@ function Remove-TaskClaim {
     param(
         [Parameter(Mandatory)][string]$TaskId,
         [string]$Root = '',
-        [switch]$Local
+        [switch]$Local,
+        # Метаданные прогона — трейлеры коммита снятия заявки. См. Publish-BcfClaimChange.
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     if (-not $Root) { $Root = Get-BcfProjectRoot }
     _With-ClaimsLock {
@@ -857,7 +872,8 @@ function Remove-TaskClaim {
         if (-not (Test-Path -LiteralPath $path)) { return }
         $rel = ($path.Substring($Root.Length).TrimStart('\', '/')) -replace '\\', '/'
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-        Publish-BcfClaimChange -Root $Root -Paths @($rel) -Message "$TaskId — заявка снята" | Out-Null
+        Publish-BcfClaimChange -Root $Root -Paths @($rel) -Message "$TaskId — заявка снята" `
+            -Task $TaskId -RunId $RunId -Role $Role -Model $Model -Backend $Backend | Out-Null
     }
 }
 

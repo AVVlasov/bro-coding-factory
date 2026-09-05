@@ -65,6 +65,64 @@ function Get-BcfGitIdentityArgs {
     return @('-c', 'user.name=bcf', '-c', 'user.email=bcf@local')
 }
 
+# --- ТРЕЙЛЕРЫ КОММИТОВ ПРОГОНА -----------------------------------------------------------
+#
+# ЗАЧЕМ. Коммит «TASK-07: работа агента» сам по себе не говорит, КАКОЙ прогон его сделал,
+# какой ролью узла и на какой модели/бэкенде: журнал прогона (.bcf/graph/<runId>/) живёт
+# рядом с состоянием и не переживает уборку `.bcf/`, а коммит в git остаётся навсегда.
+# Пять полей — минимум, достаточный чтобы восстановить обстоятельства коммита БЕЗ
+# журнала, когда разбор дефекта идёт спустя месяцы по одному только `git log`.
+#
+# Живут здесь, а не в worktree.ps1 (где появились первыми): claims.ps1 тоже коммитит от
+# имени прогона (заявка на файлы, снятие заявки, приёмка лидером) и не дот-сорсит
+# worktree.ps1 — только наоборот. bcf-context.ps1 — общий предок обоих файлов.
+function Format-BcfCommitTrailers {
+    param(
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '',
+        [string]$Model = '', [string]$Backend = ''
+    )
+    return @(
+        "Task: $Task"
+        "Run-Id: $RunId"
+        "Role: $Role"
+        "Model: $Model"
+        "Backend: $Backend"
+    ) -join "`n"
+}
+
+function New-BcfCommitMessage {
+    param(
+        [Parameter(Mandatory)][string]$Subject,
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '',
+        [string]$Model = '', [string]$Backend = ''
+    )
+    $trailers = Format-BcfCommitTrailers -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+    return "$Subject`n`n$trailers"
+}
+
+# Проверка ОБРАТНАЯ построению: сообщение обязано нести все пять трейлеров строкой
+# «Ключ: значение» — значение может быть пустым (бэкенд без роли, модель не сообщена),
+# важно само наличие ключа. Разбор дефекта, идущий по `git log`, не имеет права
+# наткнуться на коммит прогона без опознавательных полей — тогда узнать, чем он сделан,
+# можно только гадая.
+function Test-BcfCommitTrailers {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    $required = @('Task', 'Run-Id', 'Role', 'Model', 'Backend')
+    $missing = @()
+    foreach ($k in $required) {
+        if ($Message -notmatch "(?m)^$([regex]::Escape($k)):[ \t]?") { $missing += $k }
+    }
+    return @{ Ok = ($missing.Count -eq 0); Missing = @($missing) }
+}
+
+# То же самое, но на НАСТОЯЩЕМ коммите git, по sha — доказывает, что конкретный коммит
+# прогона несёт трейлеры, а не только что билдер их умеет строить.
+function Test-BcfCommitHasTrailers {
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Sha)
+    $msg = (& git -C $Root log -1 --format=%B $Sha 2>$null | Out-String)
+    return (Test-BcfCommitTrailers -Message $msg)
+}
+
 # Версия фабрики — печатается в каждый вердикт (factory_version:), чтобы разбор дефекта
 # видел, каким движком задача была проверена. Не полагаемся на src/lib/paths.ps1
 # (CLI-слой): harness обязан работать и без него, при ручном запуске verify.ps1.

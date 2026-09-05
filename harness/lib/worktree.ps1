@@ -15,59 +15,11 @@
 # файла (harness/tests/merge-integration.tests.ps1) дот-сорсят ТОЛЬКО worktree.ps1.
 . (Join-Path $PSScriptRoot 'claims.ps1')
 
-# --- ТРЕЙЛЕРЫ КОММИТОВ ПРОГОНА -----------------------------------------------------------
-#
-# ЗАЧЕМ. Коммит «TASK-07: работа агента» сам по себе не говорит, КАКОЙ прогон его сделал,
-# какой ролью узла и на какой модели/бэкенде: журнал прогона (.bcf/graph/<runId>/) живёт
-# рядом с состоянием и не переживает уборку `.bcf/`, а коммит в git остаётся навсегда.
-# Пять полей — минимум, достаточный чтобы восстановить обстоятельства коммита БЕЗ
-# журнала, когда разбор дефекта идёт спустя месяцы по одному только `git log`.
-function Format-BcfCommitTrailers {
-    param(
-        [string]$Task = '', [string]$RunId = '', [string]$Role = '',
-        [string]$Model = '', [string]$Backend = ''
-    )
-    return @(
-        "Task: $Task"
-        "Run-Id: $RunId"
-        "Role: $Role"
-        "Model: $Model"
-        "Backend: $Backend"
-    ) -join "`n"
-}
-
-function New-BcfCommitMessage {
-    param(
-        [Parameter(Mandatory)][string]$Subject,
-        [string]$Task = '', [string]$RunId = '', [string]$Role = '',
-        [string]$Model = '', [string]$Backend = ''
-    )
-    $trailers = Format-BcfCommitTrailers -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
-    return "$Subject`n`n$trailers"
-}
-
-# Проверка ОБРАТНАЯ построению: сообщение обязано нести все пять трейлеров строкой
-# «Ключ: значение» — значение может быть пустым (бэкенд без роли, модель не сообщена),
-# важно само наличие ключа. Разбор дефекта, идущий по `git log`, не имеет права
-# наткнуться на коммит прогона без опознавательных полей — тогда узнать, чем он сделан,
-# можно только гадая.
-function Test-BcfCommitTrailers {
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
-    $required = @('Task', 'Run-Id', 'Role', 'Model', 'Backend')
-    $missing = @()
-    foreach ($k in $required) {
-        if ($Message -notmatch "(?m)^$([regex]::Escape($k)):[ \t]?") { $missing += $k }
-    }
-    return @{ Ok = ($missing.Count -eq 0); Missing = @($missing) }
-}
-
-# То же самое, но на НАСТОЯЩЕМ коммите git, по sha — доказывает, что конкретный коммит
-# прогона несёт трейлеры, а не только что билдер их умеет строить.
-function Test-BcfCommitHasTrailers {
-    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Sha)
-    $msg = (& git -C $Root log -1 --format=%B $Sha 2>$null | Out-String)
-    return (Test-BcfCommitTrailers -Message $msg)
-}
+# Трейлеры коммитов прогона (Format-BcfCommitTrailers/New-BcfCommitMessage/
+# Test-BcfCommitTrailers/Test-BcfCommitHasTrailers) переехали в bcf-context.ps1: их
+# зовёт не только этот файл, а и claims.ps1 (Publish-BcfClaimChange коммитит заявки и
+# приёмку), а claims.ps1 сам по себе НЕ дот-сорсит worktree.ps1 — только наоборот. Живут
+# они в bcf-context.ps1, который дот-сорсят оба файла первой строкой.
 
 function Get-WorktreeRoot {
     param([Parameter(Mandatory)][string]$Root)
@@ -176,7 +128,10 @@ function Publish-TaskVerdict {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$Task,
         [Parameter(Mandatory)][string]$VerdictFile,
-        [string]$RelDir = 'tasks/.verdicts'
+        [string]$RelDir = 'tasks/.verdicts',
+        # Метаданные прогона — трейлеры коммита. Пусто = коммит остаётся литеральным
+        # «${Task}: вердикт» без трейлеров, как раньше (юнит-вызов вне графа/планировщика).
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     if (-not (Test-Path -LiteralPath $VerdictFile)) { return @{ Ok = $false; Reason = 'вердикта нет' } }
     $relDirWin = $RelDir -replace '/', '\'
@@ -192,7 +147,12 @@ function Publish-TaskVerdict {
     & git -C $Root add -A -- $rel 2>&1 | Out-Null
     $staged = @(& git -C $Root diff --cached --name-only -- $rel 2>$null | Where-Object { $_ })
     if (-not $staged.Count) { return @{ Ok = $true; Reason = 'вердикт уже в дереве' } }
-    $out = (& git -C $Root @id commit -q -m "${Task}: вердикт" -- $rel 2>&1 | Out-String)
+    $msg = if ($RunId) {
+        New-BcfCommitMessage -Subject "${Task}: вердикт" -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+    } else {
+        "${Task}: вердикт"
+    }
+    $out = (& git -C $Root @id commit -q -m $msg -- $rel 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Reason = $out.Trim() } }
     return @{ Ok = $true; Reason = 'закоммичен' }
 }
@@ -211,7 +171,11 @@ function Save-OwnerEditsToParkedBranch {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string[]]$Files,
-        [string]$Reason = 'правки владельца, найденные во время прогона'
+        [string]$Reason = 'правки владельца, найденные во время прогона',
+        # Метаданные прогона — трейлеры коммита парковки. Пусто = коммит остаётся
+        # литеральным «припарковано: …» без трейлеров, как раньше (юнит-вызов вне
+        # Merge-TaskWorktree, см. tests/team-claims.tests.ps1).
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     $files = @($Files | Where-Object { $_ })
     if (-not $files.Count) { return @{ Ok = $true; Branch = ''; Commit = ''; Files = @(); Message = 'парковать нечего' } }
@@ -233,7 +197,12 @@ function Save-OwnerEditsToParkedBranch {
         $tree = (& git -C $Root write-tree 2>$null | Out-String).Trim()
         if (-not $tree) { return @{ Ok = $false; Branch = $branch; Commit = ''; Files = $files; Message = 'git write-tree ничего не вернул' } }
         $id = Get-BcfGitIdentityArgs -Root $Root
-        $msg = "припарковано: $Reason — $($files -join ', ')"
+        $subject = "припарковано: $Reason — $($files -join ', ')"
+        $msg = if ($RunId) {
+            New-BcfCommitMessage -Subject $subject -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        } else {
+            $subject
+        }
         $commit = (& git -C $Root @id commit-tree $tree -p $parent -m $msg 2>$null | Out-String).Trim()
         if (-not $commit) { return @{ Ok = $false; Branch = $branch; Commit = ''; Files = $files; Message = 'git commit-tree ничего не вернул' } }
         & git -C $Root update-ref "refs/heads/$branch" $commit 2>&1 | Out-Null
@@ -455,7 +424,13 @@ function Merge-TaskWorktree {
     if ($harnessDirty.Count) {
         $hid = Get-BcfGitIdentityArgs -Root $Root
         & git -C $Root add -A -- @harnessDirty 2>&1 | Out-Null
-        & git -C $Root @hid commit -q -m "обвязка: вердикты, заявки и доска задач перед слиянием $Task" -- @harnessDirty 2>&1 | Out-Null
+        $hsubject = "обвязка: вердикты, заявки и доска задач перед слиянием $Task"
+        $hmsg = if ($RunId) {
+            New-BcfCommitMessage -Subject $hsubject -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        } else {
+            $hsubject
+        }
+        & git -C $Root @hid commit -q -m $hmsg -- @harnessDirty 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) { $dirty = @($dirty | Where-Object { $harnessDirty -notcontains $_ }) }
     }
 
@@ -476,7 +451,8 @@ function Merge-TaskWorktree {
     $ownerDirty = @($dirty | Where-Object { $_ -match '^(tasks|config)/' })
     if ($ownerDirty.Count) {
         $park = Save-OwnerEditsToParkedBranch -Root $Root -Files $ownerDirty `
-                    -Reason "правки в каталогах владельца во время слияния $Task"
+                    -Reason "правки в каталогах владельца во время слияния $Task" `
+                    -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
         $dirty = @($dirty | Where-Object { $ownerDirty -notcontains $_ })
         if ($park.Ok) {
             Write-Warning ("слияние: правки в каталогах владельца припаркованы — $($ownerDirty -join ', '). " +

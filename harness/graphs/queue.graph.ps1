@@ -287,7 +287,8 @@ while ($true) {
 
             $wt = New-TaskWorktree -Root $root -Task $task
             if (-not $wt) { return @{ Task = $task; Ok = $false; Reason = 'worktree не создан' } }
-            Add-TaskClaim -TaskId $task -Root $root -UseCoupling
+            Add-TaskClaim -TaskId $task -Root $root -UseCoupling `
+                -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
             $max = Get-GraphVar perTaskMax
             # -ProjectRoot ОБЯЗАТЕЛЕН и указывает на worktree задачи.
             #
@@ -348,7 +349,8 @@ while ($true) {
             # FAIL публикуем сразу и отдельным коммитом: слияния у него не будет, а список
             # ремедиации нужен человеку и следующей попытке.
             if ((Test-Path $vf) -and -not $isPass) {
-                $pv = Publish-TaskVerdict -Root $root -Task $task -VerdictFile $vf
+                $pv = Publish-TaskVerdict -Root $root -Task $task -VerdictFile $vf `
+                          -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
                 if (-not $pv.Ok) { Write-GraphLog "$task — вердикт FAIL не опубликован: $($pv.Reason)" }
             }
 
@@ -360,7 +362,8 @@ while ($true) {
             if (-not $isPass) {
                 $vfRoot = Join-Path $root "tasks\.verdicts\$task.md"
                 if ((Test-Path $vfRoot) -and (Select-String -Path $vfRoot -Pattern '^verdict:\s*PASS' -Quiet)) {
-                    Remove-TaskClaim -TaskId $task -Root $root
+                    Remove-TaskClaim -TaskId $task -Root $root `
+                        -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
                     Remove-TaskWorktree -Root $root -Task $task -KeepBranch
                     return @{ Task = $task; Ok = $false
                               Reason = "РАСЩЕПЛЁННЫЙ ПРОГОН: вердикт PASS лёг в основное дерево вместо worktree — цикл запущен не из своей копии. Работа задачи не потеряна (ветка bcf/task/$task), но слить её автоматически нельзя." }
@@ -383,7 +386,8 @@ while ($true) {
                     Copy-Item -LiteralPath $co -Destination (Join-Path $codir "$task.md") -Force -ErrorAction SilentlyContinue
                     $reason = "требует ревью человека — .bcf/callouts/$task.md (правка попала под friction-триггер)"
                 }
-                Remove-TaskClaim -TaskId $task -Root $root
+                Remove-TaskClaim -TaskId $task -Root $root `
+                    -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
                 Remove-TaskWorktree -Root $root -Task $task -KeepBranch
                 return @{ Task = $task; Ok = $false; Reason = $reason }
             }
@@ -516,7 +520,8 @@ while ($true) {
             # проверки на слитом. PASS-вердикт приехал тем же слиянием, что и код, — по
             # нему следующая волна считает готовность, а `bcf tasks` показывает закрытое.
 
-            Remove-TaskClaim -TaskId $task -Root $root
+            Remove-TaskClaim -TaskId $task -Root $root `
+                -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
             Remove-TaskWorktree -Root $root -Task $task -KeepBranch:(-not $outcome.Ok)
             return $outcome
         }

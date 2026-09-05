@@ -307,6 +307,173 @@ It 'SCHEDULER.PS1: ОТКАЗ ИЗ-ЗА НЕДОСТАЮЩЕЙ ПРИЁМКИ �
         'ветка needs-acceptance стоит не РАНЬШЕ общего разбора причины — тот доберётся до неё первым'
 }
 
+# --- 2c. Граф очереди (queue.graph.ps1) — тот же гейт на ГЛАВНОМ пути (bcf run queue) ------
+Write-Host ''
+Write-Host '2c. queue.graph.ps1: needs-acceptance на главном пути прогона — та же дословная причина' -ForegroundColor White
+
+# Проверяющий опроверг готовность 2026-09-05: ветка needs-acceptance в scheduler.ps1
+# (параллельный ночной прогон) была покрыта четырьмя регекс-тестами выше, а ровно та же
+# ветка в queue.graph.ps1 — ГЛАВНОМ пути `bcf run queue` — ни одним. Живой прогон здесь не
+# поставить дёшево: стадия работы зовёт loop.ps1 отдельным процессом (Invoke-CommandNode,
+# не модельный узел), и подмена агента (BCF_GRAPH_FAKE_AGENT) её не подменяет. Дешёвая
+# проверка — тот же приём, что уже принят для scheduler.ps1 этим же файлом.
+$queueSrc = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\graphs\queue.graph.ps1')
+
+It 'QUEUE.GRAPH.PS1: ОТКАЗ ИЗ-ЗА НЕДОСТАЮЩЕЙ ПРИЁМКИ — ОТДЕЛЬНАЯ ВЕТКА, А НЕ «СЛИЯНИЕ НЕ УДАЛОСЬ»' {
+    Assert-True $queueSrc.Contains("if (`$m.Kind -eq 'needs-acceptance') {") `
+        'нет отдельной ветки needs-acceptance в графе очереди — затык приёмки лидера обрабатывается как обычный отказ слияния'
+}
+
+It 'QUEUE.GRAPH.PS1: ПРИЧИНА ГЕЙТА ИДЁТ В ОТВЕТ ДОСЛОВНО ($m.Message), А НЕ ЗАВЁРНУТОЙ' {
+    Assert-True $queueSrc.Contains('return @{ Task = $task; Ok = $false; Reason = $m.Message }') `
+        'ветка needs-acceptance не пробрасывает дословную причину гейта ($m.Message) — заворачивает её в другой текст'
+}
+
+It 'QUEUE.GRAPH.PS1: NEEDS-ACCEPTANCE ПРОВЕРЯЕТСЯ РАНЬШЕ ОБЩЕГО РАЗБОРА ПРИЧИНЫ' {
+    # Иначе общий разбор ($why) доберётся до неё первым и напечатает «слияние не удалось —
+    # git отверг слияние: ждёт приёмки лидера» — неправда про git-механику отказа.
+    $branchIdx = $queueSrc.IndexOf("if (`$m.Kind -eq 'needs-acceptance') {")
+    $genericIdx = $queueSrc.IndexOf('$why = if ($m.Conflicts.Count)')
+    Assert-True ($branchIdx -ge 0 -and $genericIdx -gt $branchIdx) `
+        'ветка needs-acceptance в графе очереди стоит не РАНЬШЕ общего разбора причины — тот доберётся до неё первым'
+}
+
+It 'QUEUE.GRAPH.PS1: ПРИЧИНА ОТКАЗА УХОДИТ В $stuck ТЕМ ЖЕ ПОЛЕМ, ЧТО ЧИТАЕТ ДОСКА И needs_human' {
+    # Get-BcfTaskStatusUpdate/Complete-TeamRun (team-bus.ps1) делят needs_human и
+    # gate_blocked по префиксу «gate-block» в Reason — «ждёт приёмки лидера» под него не
+    # подпадает и обязана попасть именно в needs_human, а не потеряться по дороге.
+    Assert-True $queueSrc.Contains('$stuck += [pscustomobject]@{ Task = $r.Task; Reason = $r.Reason }') `
+        'провал узла интеграции не кладётся в $stuck тем же полем Reason — needs_human его не увидит'
+}
+
+# --- 2d. Остальные коммиты фабрики: вердикт, парковка правок владельца, заявка -------------
+Write-Host ''
+Write-Host '2d. Publish-TaskVerdict / Save-OwnerEditsToParkedBranch / Publish-BcfClaimChange: трейлеры' -ForegroundColor White
+
+# Проверяющий опроверг готовность 2026-09-05: трейлеры доехали до merge-коммита и до
+# авто-коммита scheduler.ps1, но не до трёх других коммитов той же фабрики — вердикта FAIL
+# (Publish-TaskVerdict), парковки правок владельца (Save-OwnerEditsToParkedBranch) и заявки
+# на файлы/её снятия (Publish-BcfClaimChange, claims.ps1). Все три теперь принимают
+# метаданные прогона и строят сообщение через New-BcfCommitMessage — живые проверки на
+# настоящем git, не регекс.
+
+It 'PUBLISH-TASKVERDICT С МЕТАДАННЫМИ ПРОГОНА ДАЁТ КОММИТ С ТРЕЙЛЕРАМИ' {
+    $d = New-PlainRepo
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks\.verdicts') | Out-Null
+    $vf = Join-Path $d 'src.verdict'
+    "verdict: FAIL`n" | Set-Content -LiteralPath $vf -Encoding UTF8
+    $pv = Publish-TaskVerdict -Root $d -Task 'TASK-90' -VerdictFile $vf `
+              -RunId 'g_test_v1' -Role 'worker' -Model 'opus' -Backend 'claude'
+    Assert-True $pv.Ok "публикация вердикта не удалась: $($pv.Reason)"
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-True $t.Ok "коммит вердикта без трейлеров: не хватает $($t.Missing -join ', ')"
+    $body = (& git -C $d log -1 --format=%B $sha | Out-String)
+    Assert-Match $body 'Task: TASK-90'
+    Assert-Match $body 'Run-Id: g_test_v1'
+}
+
+It 'КОНТРОЛЬ: PUBLISH-TASKVERDICT БЕЗ RUNID — БЕЗ ТРЕЙЛЕРОВ, КАК РАНЬШЕ' {
+    $d = New-PlainRepo
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks\.verdicts') | Out-Null
+    $vf = Join-Path $d 'src.verdict'
+    "verdict: FAIL`n" | Set-Content -LiteralPath $vf -Encoding UTF8
+    $pv = Publish-TaskVerdict -Root $d -Task 'TASK-91' -VerdictFile $vf
+    Assert-True $pv.Ok $pv.Reason
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-False $t.Ok 'юнит-вызов Publish-TaskVerdict без RunId вдруг получил трейлеры'
+    $msg = (& git -C $d log -1 --format=%s | Out-String).Trim()
+    Assert-Eq $msg 'TASK-91: вердикт' 'сообщение коммита без метаданных прогона изменилось'
+}
+
+It 'SAVE-OWNEREDITSTOPARKEDBRANCH С МЕТАДАННЫМИ ПРОГОНА ДАЁТ КОММИТ С ТРЕЙЛЕРАМИ' {
+    $d = New-PlainRepo
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks') | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-92.md') -Value 'исходная' -Encoding UTF8
+    & git -C $d add -A 2>&1 | Out-Null
+    & git -C $d commit -q -m 'задача' 2>&1 | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-92.md') -Value 'правка владельца' -Encoding UTF8
+
+    $park = Save-OwnerEditsToParkedBranch -Root $d -Files @('tasks/TASK-92.md') `
+                -Task 'TASK-92' -RunId 'g_test_p1' -Role 'worker' -Model 'opus' -Backend 'claude'
+    Assert-True $park.Ok "парковка не удалась: $($park.Message)"
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $park.Commit
+    Assert-True $t.Ok "коммит парковки без трейлеров: не хватает $($t.Missing -join ', ')"
+    $body = (& git -C $d log -1 --format=%B $park.Commit | Out-String)
+    Assert-Match $body 'Task: TASK-92'
+    Assert-Match $body 'Run-Id: g_test_p1'
+}
+
+It 'КОНТРОЛЬ: SAVE-OWNEREDITSTOPARKEDBRANCH БЕЗ RUNID — БЕЗ ТРЕЙЛЕРОВ, КАК РАНЬШЕ' {
+    $d = New-PlainRepo
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks') | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-93.md') -Value 'исходная' -Encoding UTF8
+    & git -C $d add -A 2>&1 | Out-Null
+    & git -C $d commit -q -m 'задача' 2>&1 | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-93.md') -Value 'правка владельца' -Encoding UTF8
+
+    $park = Save-OwnerEditsToParkedBranch -Root $d -Files @('tasks/TASK-93.md')
+    Assert-True $park.Ok $park.Message
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $park.Commit
+    Assert-False $t.Ok 'юнит-вызов Save-OwnerEditsToParkedBranch без RunId вдруг получил трейлеры'
+}
+
+It 'PUBLISH-BCFCLAIMCHANGE С МЕТАДАННЫМИ ПРОГОНА ДАЁТ КОММИТ С ТРЕЙЛЕРАМИ' {
+    $d = New-PlainRepo
+    Set-Content -LiteralPath (Join-Path $d 'claim.txt') -Value 'заявка' -Encoding UTF8
+    $pub = Publish-BcfClaimChange -Root $d -Paths @('claim.txt') -Message 'TASK-94 — заявка: тест' `
+               -Task 'TASK-94' -RunId 'g_test_c1' -Role 'worker' -Model 'opus' -Backend 'claude'
+    Assert-True $pub.Ok "заявка не закоммичена: $($pub.Reason)"
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-True $t.Ok "коммит заявки без трейлеров: не хватает $($t.Missing -join ', ')"
+}
+
+It 'КОНТРОЛЬ: PUBLISH-BCFCLAIMCHANGE БЕЗ RUNID — БЕЗ ТРЕЙЛЕРОВ, КАК ДЛЯ bcf task accept' {
+    $d = New-PlainRepo
+    Set-Content -LiteralPath (Join-Path $d 'claim2.txt') -Value 'заявка' -Encoding UTF8
+    $pub = Publish-BcfClaimChange -Root $d -Paths @('claim2.txt') -Message 'TASK-95 — заявка: тест'
+    Assert-True $pub.Ok $pub.Reason
+    $sha = Get-Sha -Repo $d
+    $t = Test-BcfCommitHasTrailers -Root $d -Sha $sha
+    Assert-False $t.Ok 'вызов без метаданных прогона (как bcf task accept) вдруг получил трейлеры'
+    $msg = (& git -C $d log -1 --format=%s | Out-String).Trim()
+    Assert-Eq $msg 'TASK-95 — заявка: тест' 'сообщение коммита без метаданных прогона изменилось'
+}
+
+It 'ADD-TASKCLAIM/REMOVE-TASKCLAIM С МЕТАДАННЫМИ ПРОГОНА ПРОБРАСЫВАЮТ ИХ В КОММИТ ЗАЯВКИ' {
+    $d = New-PlainRepo
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks') | Out-Null
+    "# TASK-96 — тестовая заявка`n`n## Файлы`n`n- ``a.txt```n" |
+        Set-Content -LiteralPath (Join-Path $d 'tasks\TASK-96-x.md') -Encoding UTF8
+    & git -C $d add -A 2>&1 | Out-Null
+    & git -C $d commit -q -m 'задача заявки' 2>&1 | Out-Null
+
+    Add-TaskClaim -TaskId 'TASK-96' -Root $d -Who 'узел' -RunId 'g_test_a1' -Role 'worker' -Model 'opus' -Backend 'claude'
+    $sha1 = Get-Sha -Repo $d
+    $t1 = Test-BcfCommitHasTrailers -Root $d -Sha $sha1
+    Assert-True $t1.Ok "коммит заявки (Add-TaskClaim) без трейлеров: не хватает $($t1.Missing -join ', ')"
+
+    Remove-TaskClaim -TaskId 'TASK-96' -Root $d -RunId 'g_test_a1' -Role 'worker' -Model 'opus' -Backend 'claude'
+    $sha2 = Get-Sha -Repo $d
+    Assert-True ($sha2 -ne $sha1) 'снятие заявки не сделало нового коммита'
+    $t2 = Test-BcfCommitHasTrailers -Root $d -Sha $sha2
+    Assert-True $t2.Ok "коммит снятия заявки (Remove-TaskClaim) без трейлеров: не хватает $($t2.Missing -join ', ')"
+}
+
+It 'QUEUE.GRAPH.PS1: ЗАЯВКА И ЕЁ СНЯТИЕ ЗОВУТСЯ С МЕТАДАННЫМИ ПРОГОНА' {
+    $addIdx = $queueSrc.IndexOf('Add-TaskClaim -TaskId $task -Root $root -UseCoupling')
+    Assert-True ($addIdx -ge 0) 'не нашёл вызов Add-TaskClaim в графе очереди — сигнатура вызова изменилась, поправь тест'
+    $addTail = $queueSrc.Substring($addIdx, [Math]::Min(220, $queueSrc.Length - $addIdx))
+    Assert-True $addTail.Contains('-RunId (Get-GraphRunId)') 'Add-TaskClaim без -RunId'
+    Assert-True $addTail.Contains("-Role 'worker'") 'Add-TaskClaim без -Role'
+    $removeCount = ([regex]::Matches($queueSrc, [regex]::Escape('Remove-TaskClaim -TaskId $task -Root $root'))).Count
+    $removeWithRunId = ([regex]::Matches($queueSrc, [regex]::Escape('Remove-TaskClaim -TaskId $task -Root $root') + '[^\r\n]*[\r\n]+[^\r\n]*-RunId \(Get-GraphRunId\)')).Count
+    Assert-Eq $removeWithRunId $removeCount `
+        "не все вызовы Remove-TaskClaim в графе очереди передают -RunId ($removeWithRunId из $removeCount)"
+}
+
 # --- 3. Версия фабрики и хэш файла графа ---------------------------------------------------
 Write-Host ''
 Write-Host '3. factory_version / graph_hash: строительные блоки и определение файла графа' -ForegroundColor White
@@ -575,10 +742,53 @@ It 'ОТЧЁТ ЗА МЕСЯЦ ПОКАЗЫВАЕТ НЕЗАКРЫТЫЕ ЗАД�
     Assert-Match $otherBody 'умышленно пуст'
 }
 
+# Проверяющий опроверг готовность 2026-09-05: --export смотрел только в .bcf/, тогда как
+# обычный `bcf report` (ниже по этому же файлу) читает и .bcf/, и старый loop/. Проект, не
+# прошедший `bcf migrate`, получал за месяц с реальным ночным прогоном отчёт «умышленно
+# пуст» — ровно ту неправду, против которой сделан весь механизм.
+It 'ОТЧЁТ ЗА МЕСЯЦ НАХОДИТ НОЧНОЙ ПРОГОН В СТАРОМ КАТАЛОГЕ loop/ (ПРОЕКТ БЕЗ bcf migrate)' {
+    $d = New-ReportFixture
+    New-Item -ItemType Directory -Force -Path (Join-Path $d 'loop') | Out-Null
+    $status = [ordered]@{
+        complete     = $false
+        queue_closed = $false
+        when         = '2026-09-20 10:00:00'
+        total        = 1
+        passed       = 0
+        stuck        = 1
+        needs_human  = @(@{ task = 'TASK-90'; reason = 'ждёт приёмки лидера'; blocks = @() })
+        gate_blocked = @()
+    }
+    ($status | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $d 'loop\run-all.status.json') -Encoding UTF8
+
+    $out = & pwsh -NoProfile -File $bcf report --export '2026-09' --project $d 2>&1 | Out-String
+    $reportFile = Join-Path $d 'docs\reports\2026-09.md'
+    Assert-True (Test-Path $reportFile) "файл отчёта не создан:`n$out"
+    $body = Get-Content -Raw -LiteralPath $reportFile
+    Assert-NoMatch $body 'умышленно пуст' `
+        'месяц с ночным прогоном в loop/ объявлен пустым — --export не заглянул в старый каталог'
+    Assert-Match $body '\| *TASK-90 *\|' "незакрытая задача из loop/run-all.status.json не попала в отчёт:`n$body"
+    Assert-Match $body 'ждёт приёмки лидера'
+}
+
 It 'BCF REPORT --EXPORT С НЕВЕРНЫМ ФОРМАТОМ МЕСЯЦА ОТКАЗЫВАЕТ' {
     $d = New-ReportFixture
     & pwsh -NoProfile -File $bcf report --export 'сентябрь' --project $d 2>&1 | Out-Null
     Assert-True ($LASTEXITCODE -ne 0) 'кривой формат месяца принят молча'
+}
+
+# --- 6. Справка bcf знает про accept и --export --------------------------------------------
+Write-Host ''
+Write-Host '6. bcf help: новые подкоманды названы, а не потеряны в списке' -ForegroundColor White
+
+It 'BCF HELP НАЗЫВАЕТ TASK ACCEPT И REPORT --EXPORT' {
+    # Проверяющий опроверг готовность 2026-09-05: bin/bcf.ps1 описывал task как
+    # 'new "<название>" | why <ID> | show <ID>' без accept и report как 'итог прогона
+    # одним экраном' без --export — человек, открывший `bcf help`, не находил приёмку и
+    # месячную выгрузку в списке команд.
+    $out = & pwsh -NoProfile -File $bcf help 2>&1 | Out-String
+    Assert-Match $out 'accept <ID>' "справка не упоминает bcf task accept:`n$out"
+    Assert-Match $out '--export <yyyy-MM>' "справка не упоминает bcf report --export:`n$out"
 }
 
 # --- Итог ---------------------------------------------------------------------------------
