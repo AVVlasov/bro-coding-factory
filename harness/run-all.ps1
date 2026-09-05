@@ -48,6 +48,9 @@ if (-not $Model -and $harnessCfg -and $harnessCfg.models -and $harnessCfg.models
 }
 $taskIdPrefix = if ($harnessCfg -and $harnessCfg.taskIdPrefix) { [string]$harnessCfg.taskIdPrefix } else { 'TASK' }
 $modelLabel   = if ($Model) { $Model } else { '(backend default)' }
+# Для трейлера Backend: в параллельном режиме тот же источник, что и у графа очереди
+# (queue.graph.ps1: Set-GraphVar codeBackend из agent.adapter).
+$codeBackend  = if ($harnessCfg -and $harnessCfg.agent -and $harnessCfg.agent.adapter) { [string]$harnessCfg.agent.adapter } else { '' }
 
 try {
   [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -375,7 +378,7 @@ if ($TaskConcurrency -gt 1 -or $DryPlan) {
     -LogFn { param($m) Log $m } `
     -Run $runId `
     -Concurrency $TaskConcurrency -MaxAgents $maxAgents -PerTaskMax $PerTaskMax `
-    -Model $Model -MergeChecks $mergeChecks -DryPlan:$DryPlan `
+    -Model $Model -Backend $codeBackend -MergeChecks $mergeChecks -DryPlan:$DryPlan `
     -GeneratedFiles @(if ($harnessCfg -and $harnessCfg.generatedFiles) { $harnessCfg.generatedFiles } else { @() })
 
   foreach ($p in $res.Plan) {

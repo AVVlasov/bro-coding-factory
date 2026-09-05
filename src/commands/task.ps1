@@ -208,7 +208,9 @@ switch ($sub) {
 
     # sha самого файла вердикта, а не diff-отпечатка внутри него: приёмка привязывается к
     # ТЕКСТУ, который лидер прочитал, — если вердикт перепишется (новый прогон, другой
-    # verdict/remediation), sha разойдётся, и это будет видно при следующем чтении.
+    # verdict/remediation), sha разойдётся, и `bcf task show` покажет приёмку устаревшей
+    # (сравнение — там же, ниже по файлу, ветка 'show'). Гейт слияния сам это не проверяет:
+    # он только требует наличия файла приёмки, см. Test-BcfTaskAcceptanceGate.
     $sha = (& git -C $project hash-object -- $t.Verdict 2>$null | Out-String).Trim()
     if (-not $sha) { $sha = 'нет-git' }
 
@@ -372,8 +374,20 @@ switch ($sub) {
         $accPath = Get-BcfAcceptancePath -TaskId $id -Root $project
         if (Test-Path -LiteralPath $accPath) {
             $acc = ConvertFrom-BcfAcceptanceText -Body (Get-Content -Raw -LiteralPath $accPath)
-            Write-BcfOk "принято: $($acc.Leader), $($acc.When)"
-            if ($acc.Lens) { Write-BcfDim "ракурс: $($acc.Lens)" }
+            # Приёмка привязана к ТЕКСТУ вердикта, который читал лидер (sha файла на
+            # момент accept). Новый прогон переписывает вердикт — sha расходится, и это
+            # обязано быть видно здесь, а не оставаться необещанным нигде: до этой правки
+            # ничто не сравнивало записанный sha с текущим, и устаревшая приёмка молча
+            # продолжала пускать слияние.
+            $curSha = if (Test-Path $t.Verdict) { (& git -C $project hash-object -- $t.Verdict 2>$null | Out-String).Trim() } else { '' }
+            if ($acc.VerdictSha -and $curSha -and $acc.VerdictSha -ne $curSha) {
+                Write-BcfWarn "приёмка устарела — вердикт пересчитан после $($acc.When)"
+                Write-BcfDim "было: $($acc.VerdictSha)  стало: $curSha"
+                Write-BcfNote "нужна новая приёмка: bcf task accept $id --as <имя>"
+            } else {
+                Write-BcfOk "принято: $($acc.Leader), $($acc.When)"
+                if ($acc.Lens) { Write-BcfDim "ракурс: $($acc.Lens)" }
+            }
         } elseif ($t.Pass) {
             Write-BcfWarn "ждёт приёмки лидера — bcf task accept $id --as <имя>"
         } else {

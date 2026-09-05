@@ -227,6 +227,11 @@ function Invoke-ParallelQueue {
         # Id прогона для доски задач (tasks/STATUS.json). Пусто = доска не ведётся: у
         # сухого плана и у вызова из чужой обвязки прогона как события нет.
         [string]$Run = '',
+        # Метаданные прогона для трейлеров коммитов (Task/Run-Id/Role/Model/Backend) —
+        # тех же, что граф очереди пишет в свои коммиты (queue.graph.ps1). Пусто здесь не
+        # значит «без трейлеров»: ключи в сообщении коммита стоят всегда (Format-BcfCommitTrailers),
+        # пустым остаётся только значение — как у графа, когда бэкенд не сообщён.
+        [string]$Backend = '',
         [switch]$DryPlan
     )
 
@@ -447,17 +452,40 @@ function Invoke-ParallelQueue {
                 Register-TaskConflict -Pair @($task, '(config)') -Files $cfgTouched -Kind 'config-violation'
             }
 
-            # Коммитим работу задачи в её ветке — без этого сливать нечего.
+            # Коммитим работу задачи в её ветке — без этого сливать нечего. Идентичность и
+            # трейлеры — те же, что у любого коммита фабрики (Get-BcfGitIdentityArgs,
+            # New-BcfCommitMessage): раньше здесь стояло намертво вшитое user.name=ralph,
+            # и параллельный ночной прогон (limits.taskConcurrency > 1) был единственным
+            # путём, где коммит фабрики не подписывался author.* владельца и не нёс
+            # Task/Run-Id/Role/Model/Backend, хотя граф очереди (queue.graph.ps1) их пишет.
             & git -C $r.Worktree add -A 2>&1 | Out-Null
-            & git -C $r.Worktree -c user.name=ralph -c user.email=ralph@local `
-                commit -m "${task}: работа агента (авто-коммит перед слиянием)" 2>&1 | Out-Null
+            $wid = Get-BcfGitIdentityArgs -Root $r.Worktree
+            $wmsg = New-BcfCommitMessage -Subject "${task}: работа агента (авто-коммит перед слиянием)" `
+                        -Task $task -RunId $Run -Role 'worker' -Model $Model -Backend $Backend
+            & git -C $r.Worktree @wid commit -m $wmsg 2>&1 | Out-Null
 
             # SHA до слияния запоминается ЗДЕСЬ, а не выводится потом из HEAD~1. Между
             # слиянием и проверками проходят минуты, и в общую ветку успевает приехать
             # чужой коммит: HEAD~1 снимет его, ничего не зная о том, чей он.
             $beforeMerge = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
-            $merge = Merge-TaskWorktree -Root $Root -Task $task -GeneratedFiles $GeneratedFiles
+            $merge = Merge-TaskWorktree -Root $Root -Task $task -GeneratedFiles $GeneratedFiles `
+                        -RunId $Run -Role 'worker' -Model $Model -Backend $Backend
             if (-not $merge.Ok) {
+                # CORE/NFR без файла приёмки — не «слияние не удалось» (это про git-механику),
+                # а решение, которого ждёт человек. Текст обязан быть ровно фразой гейта:
+                # по ней needs_human (run-all.ps1: всё, что не начинается с «gate-block») и
+                # доска задач узнают затык, который чинится не починкой кода, а `bcf task accept`.
+                # Раньше это падало в общую ветку ниже и печаталось как «git отверг слияние:
+                # ждёт приёмки лидера» — неправда про git и другой текст, чем ждёт задание.
+                if ($merge.Kind -eq 'needs-acceptance') {
+                    & $log "$task — verdict PASS, но класс требует приёмки лидера: $($merge.Message)"
+                    $stuck += [pscustomobject]@{ Task = $task; Reason = $merge.Message }
+                    & $board $task 'заблокирована' "приёмка-$task"
+                    Remove-TaskClaim -TaskId $task -Root $Root
+                    Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
+                    [void]$doneSet.Add($task)
+                    continue
+                }
                 # Причина важнее факта: «конфликт файлов», «git отверг слияние» и
                 # «дерево грязное» чинятся совершенно по-разному.
                 $why = if ($merge.Conflicts.Count) { "конфликт файлов: $($merge.Conflicts -join ', ')" }

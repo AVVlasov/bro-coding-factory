@@ -248,6 +248,65 @@ It 'ИДЕНТИЧНОСТЬ MERGE-КОММИТА БЕРЁТСЯ ИЗ author.* �
         'коммит подписан не тем именем, что задано в config/harness.json — репозиторий уже настроен на t/t@t, и старое поведение взяло бы его'
 }
 
+# --- 2b. Параллельный планировщик (scheduler.ps1) — та же идентичность и трейлеры, что граф --
+Write-Host ''
+Write-Host '2b. scheduler.ps1 (ночной прогон при limits.taskConcurrency > 1): не ralph, есть трейлеры' -ForegroundColor White
+
+# Живой прогон здесь не поставить: путь включается limits.taskConcurrency > 1 и реально
+# запускает loop.ps1 отдельным процессом на каждую задачу — платную модель. Дешёвая
+# проверка вместо этого — тот же приём, что уже принят в этом репозитории для ЭТОГО ЖЕ
+# файла (team-claims.tests.ps1: «в откате слияния не осталось reset --hard HEAD~1»):
+# регекс/подстрока по исходнику, а не запуск. Строительные блоки (Get-BcfGitIdentityArgs,
+# New-BcfCommitMessage, Merge-TaskWorktree с трейлерами) уже доказаны живьём выше —
+# здесь проверяется только то, что scheduler.ps1 их действительно зовёт, а не то, что
+# они вообще работают.
+$schedulerSrc = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\lib\scheduler.ps1')
+
+It 'SCHEDULER.PS1: АВТО-КОММИТ РАБОТЫ ЗАДАЧИ БОЛЬШЕ НЕ ПОДПИСАН НАМЕРТВО ВШИТЫМ ralph' {
+    # Проверяем именно КОД git-вызова (`-c user.name=ralph ...`), а не любое упоминание
+    # слова «ralph» — в комментарии рядом честно описана прежняя ошибка тем же словом.
+    Assert-False $schedulerSrc.Contains('-c user.name=ralph -c user.email=ralph@local') `
+        'параллельный прогон снова коммитит работу задачи от имени ralph, минуя author.* конфига проекта'
+}
+
+It 'SCHEDULER.PS1: АВТО-КОММИТ РАБОТЫ ЗАДАЧИ БЕРЁТ ИДЕНТИЧНОСТЬ И ТРЕЙЛЕРЫ ТАК ЖЕ, КАК ГРАФ' {
+    Assert-True $schedulerSrc.Contains('$wid = Get-BcfGitIdentityArgs -Root $r.Worktree') `
+        'идентичность авто-коммита не берётся из Get-BcfGitIdentityArgs (author.*/git config)'
+    Assert-True $schedulerSrc.Contains('$wmsg = New-BcfCommitMessage -Subject "${task}: работа агента (авто-коммит перед слиянием)"') `
+        'сообщение авто-коммита не строится New-BcfCommitMessage — трейлеров не будет'
+    Assert-True $schedulerSrc.Contains('-Task $task -RunId $Run -Role ''worker'' -Model $Model -Backend $Backend') `
+        'авто-коммит не передаёт все пять полей трейлера (Task/Run-Id/Role/Model/Backend)'
+    Assert-True $schedulerSrc.Contains('& git -C $r.Worktree @wid commit -m $wmsg') `
+        'коммит выполняется не с той идентичностью ($wid), что была вычислена из конфига'
+}
+
+It 'SCHEDULER.PS1: MERGE-TASKWORKTREE ЗОВЁТСЯ С МЕТАДАННЫМИ ПРОГОНА — MERGE-КОММИТ ПАРАЛЛЕЛЬНОГО ПРОГОНА НЕСЁТ ТРЕЙЛЕРЫ' {
+    $mergeCallIdx = $schedulerSrc.IndexOf('$merge = Merge-TaskWorktree -Root $Root -Task $task -GeneratedFiles $GeneratedFiles')
+    Assert-True ($mergeCallIdx -ge 0) 'не нашёл вызов Merge-TaskWorktree в параллельном прогоне — сигнатура вызова изменилась, поправь тест'
+    $mergeCallTail = $schedulerSrc.Substring($mergeCallIdx, [Math]::Min(220, $schedulerSrc.Length - $mergeCallIdx))
+    Assert-True $mergeCallTail.Contains('-RunId $Run') `
+        'Merge-TaskWorktree в параллельном прогоне вызывается без -RunId — merge-коммит останется без трейлеров, как раньше'
+    Assert-True $mergeCallTail.Contains("-Role 'worker'") 'Merge-TaskWorktree в параллельном прогоне вызывается без -Role'
+    Assert-True $mergeCallTail.Contains('-Model $Model') 'Merge-TaskWorktree в параллельном прогоне вызывается без -Model'
+    Assert-True $mergeCallTail.Contains('-Backend $Backend') 'Merge-TaskWorktree в параллельном прогоне вызывается без -Backend'
+}
+
+It 'SCHEDULER.PS1: ОТКАЗ ИЗ-ЗА НЕДОСТАЮЩЕЙ ПРИЁМКИ — ОТДЕЛЬНАЯ ВЕТКА С ДОСЛОВНОЙ ПРИЧИНОЙ ГЕЙТА, А НЕ «GIT ОТВЕРГ СЛИЯНИЕ»' {
+    Assert-True $schedulerSrc.Contains("if (`$merge.Kind -eq 'needs-acceptance') {") `
+        'нет отдельной ветки needs-acceptance — затык приёмки лидера обрабатывается как обычный отказ слияния'
+    # Причина уходит в $stuck ДОСЛОВНО ($merge.Message = «ждёт приёмки лидера» от
+    # Test-BcfTaskAcceptanceGate), а не завёрнутой в «git отверг слияние: …», как было
+    # раньше (то же неверно и про механику отказа, и про сам текст затыка).
+    Assert-True $schedulerSrc.Contains('$stuck += [pscustomobject]@{ Task = $task; Reason = $merge.Message }') `
+        'ветка needs-acceptance не пробрасывает дословную причину гейта ($merge.Message) — заворачивает её в другой текст'
+    # needs-acceptance обязана проверяться РАНЬШЕ общего разбора причины ($why): иначе тот
+    # доберётся до неё первым и напечатает «git отверг слияние: ждёт приёмки лидера».
+    $branchIdx = $schedulerSrc.IndexOf("if (`$merge.Kind -eq 'needs-acceptance') {")
+    $genericIdx = $schedulerSrc.IndexOf('$why = if ($merge.Conflicts.Count)')
+    Assert-True ($branchIdx -ge 0 -and $genericIdx -gt $branchIdx) `
+        'ветка needs-acceptance стоит не РАНЬШЕ общего разбора причины — тот доберётся до неё первым'
+}
+
 # --- 3. Версия фабрики и хэш файла графа ---------------------------------------------------
 Write-Host ''
 Write-Host '3. factory_version / graph_hash: строительные блоки и определение файла графа' -ForegroundColor White
@@ -297,6 +356,44 @@ It 'КОНТРОЛЬ: ВЫЗОВ НЕ ИЗ .graph.ps1 ОСТАВЛЯЕТ BCF_GRA
 }
 
 Remove-Item Env:\BCF_GRAPH_FILE -ErrorAction SilentlyContinue
+
+It 'VERIFY.PS1: FACTORY_VERSION И GRAPH_HASH ЛЕЖАТ ВНУТРИ ТЕЛА ВЕРДИКТА, А ЗНАЧЕНИЯ СЧИТАНЫ ДО ЕГО ЗАПИСИ' {
+    # Живой вердикт здесь не снять — verify.ps1 зовёт модели, а платные прогоны запрещены
+    # правилами задания. Дешёвая проверка вместо этого — тот же приём, что уже принят в
+    # этом репозитории (team-claims.tests.ps1:396-402): регекс/подстрока по исходнику.
+    # Строительные блоки (Get-BcfFactoryVersion, Get-BcfFileHash) уже доказаны живьём выше —
+    # здесь проверяется только то, что verify.ps1 кладёт их результат в тело вердикта, а не
+    # то, что они вообще работают.
+    $verifySrc = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\verify.ps1')
+
+    Assert-True $verifySrc.Contains('$FactoryVersion = Get-BcfFactoryVersion') `
+        'версия фабрики не считывается Get-BcfFactoryVersion'
+    Assert-True $verifySrc.Contains('$GraphHash = Get-BcfFileHash -Path $env:BCF_GRAPH_FILE') `
+        'хэш файла графа не считывается Get-BcfFileHash по BCF_GRAPH_FILE'
+
+    $bodyIdx = $verifySrc.IndexOf('$verdictBody = @"')
+    Assert-True ($bodyIdx -ge 0) 'не нашёл объявление $verdictBody — конструкция изменилась, поправь тест'
+    $closeIdx = $verifySrc.IndexOf('"@', $bodyIdx)
+    Assert-True ($closeIdx -gt $bodyIdx) 'не нашёл закрытие here-string тела вердикта'
+    $body = $verifySrc.Substring($bodyIdx, $closeIdx - $bodyIdx)
+
+    Assert-True $body.Contains('factory_version: $FactoryVersion') 'factory_version: не внутри тела вердикта ($verdictBody)'
+    Assert-True $body.Contains('graph_hash: $GraphHashLine') 'graph_hash: не внутри тела вердикта ($verdictBody)'
+
+    # Присвоение обязано стоять РАНЬШЕ объявления $verdictBody — иначе тело вердикта
+    # увидит переменную ещё не проставленной (обращение к необъявленной/пустой $null).
+    $assignIdx = $verifySrc.IndexOf('$FactoryVersion = Get-BcfFactoryVersion')
+    Assert-True ($assignIdx -ge 0 -and $bodyIdx -gt $assignIdx) `
+        '$FactoryVersion присваивается ПОСЛЕ объявления $verdictBody — вердикт получит незаполненное значение'
+    $hashLineAssignIdx = $verifySrc.IndexOf('$GraphHashLine = if ($GraphHash)')
+    Assert-True ($hashLineAssignIdx -ge 0 -and $bodyIdx -gt $hashLineAssignIdx) `
+        '$GraphHashLine присваивается ПОСЛЕ объявления $verdictBody — вердикт получит незаполненное значение'
+
+    # Место записи ровно одно (Set-Content ... -Value $verdictBody) — если появится второе,
+    # эта проверка тела перестаёт быть доказательством того, что реально едет в файл.
+    $writeSites = ([regex]::Matches($verifySrc, [regex]::Escape('-Value $verdictBody'))).Count
+    Assert-Eq $writeSites 1 'найдено не одно место записи $verdictBody в файл — тест проверял не то тело, которое реально пишется'
+}
 
 # --- 4. bcf task accept ---------------------------------------------------------------------
 Write-Host ''
@@ -361,6 +458,34 @@ It 'BCF TASK ACCEPT БЕЗ --AS ОТКАЗЫВАЕТ' {
     Assert-False (Test-Path (Join-Path $d 'tasks\.acceptance\TASK-72.md'))
 }
 
+# WORKFLOW.md обещает: «новый прогон перепишет вердикт, sha разойдётся, и bcf task show
+# покажет приёмку устаревшей». До этой правки ничего не сравнивало записанный sha с
+# текущим (ни гейт слияния, ни `bcf task show`) — устаревшая приёмка молча продолжала
+# считаться действующей.
+It 'BCF TASK SHOW: СВЕЖАЯ ПРИЁМКА ПОКАЗАНА ПРИНЯТОЙ, БЕЗ ПРЕДУПРЕЖДЕНИЯ ОБ УСТАРЕВАНИИ' {
+    $d = New-AcceptFixture -TaskId 'TASK-73'
+    & pwsh -NoProfile -File $bcf task accept 'TASK-73' --as 'Иван' --project $d 2>&1 | Out-Null
+    $out = & pwsh -NoProfile -File $bcf task show 'TASK-73' --project $d 2>&1 | Out-String
+    Assert-Match $out 'принято: Иван' "свежая приёмка не показана принятой:`n$out"
+    Assert-NoMatch $out 'устарела' "свежая приёмка ошибочно помечена устаревшей:`n$out"
+}
+
+It 'BCF TASK SHOW: ПЕРЕЗАПИСАННЫЙ ВЕРДИКТ ДЕЛАЕТ ПРИЁМКУ ВИДИМО УСТАРЕВШЕЙ (SHA РАЗОШЁЛСЯ)' {
+    $d = New-AcceptFixture -TaskId 'TASK-74'
+    & pwsh -NoProfile -File $bcf task accept 'TASK-74' --as 'Иван' --project $d 2>&1 | Out-Null
+    # Новый прогон переписал файл вердикта — ровно случай, который называет WORKFLOW.md.
+    @"
+# Verdict — TASK-74
+verdict: PASS
+date: 2026-09-06
+diff_fingerprint: deadbeef00
+"@ | Set-Content -LiteralPath (Join-Path $d 'tasks\.verdicts\TASK-74.md') -Encoding UTF8
+
+    $out = & pwsh -NoProfile -File $bcf task show 'TASK-74' --project $d 2>&1 | Out-String
+    Assert-Match $out 'устарела' "перезаписанный вердикт не отмечен как расхождение приёмки:`n$out"
+    Assert-NoMatch $out 'принято: Иван' "устаревшая приёмка всё ещё показана зелёной как действующая:`n$out"
+}
+
 # --- 5. bcf report --export <yyyy-MM> --------------------------------------------------------
 Write-Host ''
 Write-Host '5. bcf report --export: месяц без прогонов честен, месяц с вердиктом — нет' -ForegroundColor White
@@ -412,6 +537,41 @@ date: 2026-09-15
     $otherFile = Join-Path $d 'docs\reports\2026-08.md'
     $otherBody = Get-Content -Raw -LiteralPath $otherFile
     Assert-NoMatch $otherBody 'TASK-61' 'вердикт сентября утёк в отчёт за август'
+    Assert-Match $otherBody 'умышленно пуст'
+}
+
+It 'ОТЧЁТ ЗА МЕСЯЦ ПОКАЗЫВАЕТ НЕЗАКРЫТЫЕ ЗАДАЧИ НОЧНОГО ПРОГОНА, ЕСЛИ САМ ПРОГОН БЫЛ В ЭТОМ ОКНЕ' {
+    # .bcf/run-all.status.json назван источником --export в задании, но раньше --export
+    # его не открывал вовсе — незакрытые задачи ночного цикла (needs_human/gate_blocked)
+    # в месячный отчёт не попадали никак.
+    $d = New-ReportFixture
+    New-Item -ItemType Directory -Force -Path (Join-Path $d '.bcf') | Out-Null
+    $status = [ordered]@{
+        complete     = $false
+        queue_closed = $false
+        when         = '2026-09-20 10:00:00'
+        total        = 2
+        passed       = 0
+        stuck        = 2
+        needs_human  = @(@{ task = 'TASK-80'; reason = 'ждёт приёмки лидера'; blocks = @() })
+        gate_blocked = @(@{ task = 'TASK-81'; reason = 'gate-block: предшественник TASK-80 не закрыт' })
+    }
+    ($status | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $d '.bcf\run-all.status.json') -Encoding UTF8
+
+    $out = & pwsh -NoProfile -File $bcf report --export '2026-09' --project $d 2>&1 | Out-String
+    $reportFile = Join-Path $d 'docs\reports\2026-09.md'
+    Assert-True (Test-Path $reportFile) "файл отчёта не создан:`n$out"
+    $body = Get-Content -Raw -LiteralPath $reportFile
+    Assert-NoMatch $body 'умышленно пуст' 'месяц с прогоном ночного цикла объявлен пустым, хотя фабрика в нём работала'
+    Assert-Match $body '\| *TASK-80 *\|' "незакрытая задача needs_human не попала в отчёт:`n$body"
+    Assert-Match $body '\| *TASK-81 *\|' "незакрытая задача gate_blocked не попала в отчёт:`n$body"
+    Assert-Match $body 'ждёт приёмки лидера' 'причина needs_human не процитирована дословно'
+
+    # Прогон случился в сентябре — в августовский отчёт его незакрытые задачи попасть не должны.
+    $outOther = & pwsh -NoProfile -File $bcf report --export '2026-08' --project $d 2>&1 | Out-String
+    $otherFile = Join-Path $d 'docs\reports\2026-08.md'
+    $otherBody = Get-Content -Raw -LiteralPath $otherFile
+    Assert-NoMatch $otherBody 'TASK-80' 'незакрытая задача сентябрьского прогона утекла в отчёт за август'
     Assert-Match $otherBody 'умышленно пуст'
 }
 

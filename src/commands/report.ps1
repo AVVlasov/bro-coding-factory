@@ -9,12 +9,14 @@
 # прогон всегда заканчивался словом «готово» — даже когда закрыто 13 задач из 19, и
 # человек, и вызывающий агент принимали неполный прогон за успешный.
 #
-# --export НЕ ПРИДУМЫВАЕТ ДАННЫЕ ЗА МЕСЯЦ, КОТОРОГО НЕ БЫЛО. Три источника, и каждый —
+# --export НЕ ПРИДУМЫВАЕТ ДАННЫЕ ЗА МЕСЯЦ, КОТОРОГО НЕ БЫЛО. Четыре источника, и каждый —
 # то же самое, что уже показывают bcf tasks / bcf cost, просто собранное по датам:
 # tasks/.verdicts/*.md (поле date:, независимо от того, цикл их написал или граф),
-# tasks/.acceptance/*.md (приёмка лидера) и журналы графа .bcf/graph/*/journal.jsonl
-# (часы и токены по узлам, названным именем задачи). Месяц без единого вердикта в этом
-# окне даёт честно пустой отчёт, а не строку из прошлого месяца, принятую за текущий.
+# tasks/.acceptance/*.md (приёмка лидера), журналы графа .bcf/graph/*/journal.jsonl
+# (часы и токены по узлам, названным именем задачи) и .bcf/run-all.status.json (незакрытые
+# задачи последнего ночного прогона — needs_human/gate_blocked — если сам прогон случился
+# в этом месяце). Месяц без единого вердикта и без единого прогона в этом окне даёт честно
+# пустой отчёт, а не строку из прошлого месяца, принятую за текущий.
 
 . (Join-Path $BcfRoot 'src\lib\journal.ps1')
 
@@ -119,6 +121,27 @@ if ($exportArgIdx -ge 0 -or $exportMonth) {
         if ($null -eq $c) { $anyUnknownCost = $true } else { $totalCost += $c }
     }
 
+    # 4. Незакрытые задачи последнего ночного прогона — .bcf/run-all.status.json несёт
+    # только ОДИН прогон (последний, файл перезаписывается), поэтому его needs_human и
+    # gate_blocked попадают в отчёт месяца, только если сам прогон («when») случился в
+    # запрошенном окне — иначе застрявшая в прошлом месяце задача выглядела бы затыком
+    # текущего.
+    $statusFile = Join-Path $project '.bcf\run-all.status.json'
+    $stuckRows = @()
+    if (Test-Path -LiteralPath $statusFile) {
+        try {
+            $st = Get-Content -Raw -LiteralPath $statusFile -ErrorAction Stop | ConvertFrom-Json
+            $stWhen = $null
+            if ($st.when) {
+                try { $stWhen = [datetime]::Parse([string]$st.when, [Globalization.CultureInfo]::InvariantCulture) } catch { }
+            }
+            if ($stWhen -and $stWhen -ge $monthStart -and $stWhen -lt $monthEnd) {
+                foreach ($h in @($st.needs_human))  { $stuckRows += [pscustomobject]@{ Task = [string]$h.task; Reason = [string]$h.reason } }
+                foreach ($g in @($st.gate_blocked))  { $stuckRows += [pscustomobject]@{ Task = [string]$g.task; Reason = [string]$g.reason } }
+            }
+        } catch { }
+    }
+
     $reportsDir = Join-Path $project 'docs\reports'
     New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
     $reportPath = Join-Path $reportsDir "$exportMonth.md"
@@ -129,30 +152,50 @@ if ($exportArgIdx -ge 0 -or $exportMonth) {
     [void]$lines.Add("Сгенерировано ``bcf report --export $exportMonth`` — $(Get-Date -Format 'yyyy-MM-dd HH:mm').")
     [void]$lines.Add('')
 
-    if (-not $rows.Count) {
-        [void]$lines.Add("За $exportMonth не найдено ни одного вердикта (``$verdictsRel/*.md``, поле ``date:``)")
-        [void]$lines.Add('и ни одного прогона графа (`.bcf/graph/*/journal.jsonl`) — фабрика в этом месяце')
-        [void]$lines.Add('либо не работала над проектом, либо работала до того, как в нём завели ' + '`config/harness.json`.')
+    $reportEmpty = (-not $rows.Count) -and (-not $runs.Count) -and (-not $stuckRows.Count)
+
+    if ($reportEmpty) {
+        [void]$lines.Add("За $exportMonth не найдено ни одного вердикта (``$verdictsRel/*.md``, поле ``date:``),")
+        [void]$lines.Add('ни одного прогона графа (`.bcf/graph/*/journal.jsonl`), ни ночного прогона в этом окне')
+        [void]$lines.Add('(`.bcf/run-all.status.json`) — фабрика в этом месяце либо не работала над проектом,')
+        [void]$lines.Add('либо работала до того, как в нём завели ' + '`config/harness.json`.')
         [void]$lines.Add('')
         [void]$lines.Add('Отчёт умышленно пуст: строка из другого месяца была бы неправдой о этом.')
     } else {
-        [void]$lines.Add('## Задачи')
-        [void]$lines.Add('')
-        [void]$lines.Add('| задача | вердикт | приёмка | часы | токены |')
-        [void]$lines.Add('|---|---|---|---|---|')
-        $passCount = 0; $failCount = 0; $sumHours = 0.0; $anyHours = $false
-        foreach ($row in ($rows | Sort-Object Task)) {
-            if ($row.Verdict -eq 'PASS') { $passCount++ } elseif ($row.Verdict) { $failCount++ }
-            $hoursCell = if ($null -ne $row.Hours) { $anyHours = $true; $sumHours += $row.Hours; '{0:N1}' -f $row.Hours } else { '-' }
-            $tokensCell = if ($row.Tokens -gt 0) { '{0:N0}' -f $row.Tokens } else { '-' }
-            $verdictCell = if ($row.Verdict) { $row.Verdict } else { '-' }
-            [void]$lines.Add("| $($row.Task) | $verdictCell | $($row.Accepted) | $hoursCell | $tokensCell |")
+        if ($rows.Count) {
+            [void]$lines.Add('## Задачи')
+            [void]$lines.Add('')
+            [void]$lines.Add('| задача | вердикт | приёмка | часы | токены |')
+            [void]$lines.Add('|---|---|---|---|---|')
+            $passCount = 0; $failCount = 0; $sumHours = 0.0; $anyHours = $false
+            foreach ($row in ($rows | Sort-Object Task)) {
+                if ($row.Verdict -eq 'PASS') { $passCount++ } elseif ($row.Verdict) { $failCount++ }
+                $hoursCell = if ($null -ne $row.Hours) { $anyHours = $true; $sumHours += $row.Hours; '{0:N1}' -f $row.Hours } else { '-' }
+                $tokensCell = if ($row.Tokens -gt 0) { '{0:N0}' -f $row.Tokens } else { '-' }
+                $verdictCell = if ($row.Verdict) { $row.Verdict } else { '-' }
+                [void]$lines.Add("| $($row.Task) | $verdictCell | $($row.Accepted) | $hoursCell | $tokensCell |")
+            }
+            [void]$lines.Add('')
+        } else {
+            $passCount = 0; $failCount = 0; $sumHours = 0.0; $anyHours = $false
         }
-        [void]$lines.Add('')
+
+        if ($stuckRows.Count) {
+            [void]$lines.Add('## Не закрыто по итогу ночного цикла')
+            [void]$lines.Add('')
+            [void]$lines.Add('| задача | причина |')
+            [void]$lines.Add('|---|---|')
+            foreach ($sr in ($stuckRows | Sort-Object Task)) {
+                [void]$lines.Add("| $($sr.Task) | $($sr.Reason) |")
+            }
+            [void]$lines.Add('')
+        }
+
         [void]$lines.Add('## Итог за месяц')
         [void]$lines.Add('')
         [void]$lines.Add("- задач с вердиктом: $($rows.Count) (PASS $passCount, FAIL $failCount)")
         [void]$lines.Add("- прогонов графа в периоде: $($runs.Count)")
+        [void]$lines.Add("- незакрыто по итогу ночного цикла: $($stuckRows.Count)")
         [void]$lines.Add("- часов по журналу графа: $(if ($anyHours) { '{0:N1}' -f $sumHours } else { 'не измерено (задачи шли циклом, не графом)' })")
         [void]$lines.Add("- токенов: $('{0:N0}' -f $totalTokensAllRuns)")
         if ($pricing) {
@@ -169,8 +212,8 @@ if ($exportArgIdx -ge 0 -or $exportMonth) {
 
     Write-BcfTitle "ОТЧЁТ ЗА МЕСЯЦ  $exportMonth" (Split-Path $project -Leaf)
     Write-BcfOk (Get-BcfRelPath -Path $reportPath -Project $project)
-    if ($rows.Count) { Write-BcfNote "задач: $($rows.Count), прогонов графа: $($runs.Count)" }
-    else { Write-BcfWarn 'за месяц не найдено ни вердиктов, ни прогонов графа — отчёт честно пуст' }
+    if (-not $reportEmpty) { Write-BcfNote "задач: $($rows.Count), прогонов графа: $($runs.Count), не закрыто ночным циклом: $($stuckRows.Count)" }
+    else { Write-BcfWarn 'за месяц не найдено ни вердиктов, ни прогонов графа, ни ночного прогона — отчёт честно пуст' }
     Write-Host ''
     exit 0
 }
