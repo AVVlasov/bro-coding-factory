@@ -49,6 +49,30 @@ function Get-BcfHomeRoot {
     return (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent)
 }
 
+# Bash Git for Windows по git --exec-path — работает независимо от того, КУДА его
+# поставили: exec-path у git-core всегда лежит внутри установки Git, и bash.exe
+# гарантированно рядом. Известные каталоги (ProgramFiles и т.п.) ловят только
+# стандартные пути установщика; portable-git, scoop, диск не C: — мимо них.
+#
+# Раскладка Git for Windows: <root>\mingw64\libexec\git-core — это и есть exec-path,
+# bash лежит в <root>\bin\bash.exe (шим) либо <root>\usr\bin\bash.exe (настоящий).
+# Проверено на этой машине: exec-path = C:\Program Files\Git\mingw64\libexec\git-core,
+# оба bash.exe на месте.
+function Get-BcfGitForWindowsBash {
+    $execPath = ''
+    try { $execPath = (& git --exec-path 2>$null | Out-String).Trim() } catch { }
+    if (-not $execPath) { return '' }
+
+    # git-core -> libexec -> mingw64 -> корень установки Git.
+    $root = Split-Path (Split-Path (Split-Path $execPath -Parent) -Parent) -Parent
+    if (-not $root) { return '' }
+    foreach ($rel in @('bin\bash.exe', 'usr\bin\bash.exe')) {
+        $c = Join-Path $root $rel
+        if (Test-Path $c) { return $c }
+    }
+    return ''
+}
+
 # Какой bash звать под Windows.
 #
 # `bash` из PATH — НЕ тот, о котором думает автор хука. Первым там обычно стоит
@@ -58,9 +82,23 @@ function Get-BcfHomeRoot {
 # навсегда, не напечатав ни строки. Если дистрибутива нет вовсе, он возвращает ненулевой
 # код, и хук выглядит провалившимся, хотя не запускался.
 #
-# Порядок: BCF_BASH (явная воля владельца) → Git Bash → любой bash из PATH, кроме WSL.
+# Порядок: BCF_BASH (явная воля владельца) → git --exec-path (Git for Windows, любое
+# место установки) → известные каталоги (ProgramFiles и т.п.) → любой bash из PATH,
+# кроме WSL.
+#
+# BCF_BASH_FORCE_NOT_FOUND=1 — имитация «bash нигде нет» для тестов install/init. Не
+# заменить обычным сокрытием ProgramFiles/ProgramFiles(x86): для НОВОГО процесса Windows
+# сама переподставляет эти две переменные по факту системных путей при создании процесса
+# — родительский override пропадает ровно на границе CreateProcess, а не раньше (проверено
+# 2026-09-05: тот же скрипт в этом же процессе видит переопределение, а дочерний pwsh —
+# уже нет). Тот же приём, что BCF_GRAPH_FAKE_AGENT для графа: явный, поимённый, не
+# перепутать со случайным состоянием окружения.
 function Get-BcfBash {
+    if ($env:BCF_BASH_FORCE_NOT_FOUND -eq '1') { return '' }
     if ($env:BCF_BASH -and (Test-Path $env:BCF_BASH)) { return $env:BCF_BASH }
+
+    $viaExecPath = Get-BcfGitForWindowsBash
+    if ($viaExecPath) { return $viaExecPath }
 
     foreach ($c in @(
         (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),

@@ -39,6 +39,7 @@ $projName = Split-Path $project -Leaf
 
 $written = @()
 $skipped = @()
+$refused = @()
 
 function Copy-BcfTemplate {
     param(
@@ -57,6 +58,7 @@ function Copy-BcfTemplate {
         $t = $t -replace '\{\{PROJECT_NAME\}\}', $projName
         $t = $t -replace '\{\{PROJECT_ROOT\}\}', ($project -replace '\\', '/')
         $t = $t -replace '\{\{BCF_HOME\}\}', ((Get-BcfHome) -replace '\\', '/')
+        $t = $t -replace '\{\{BASH_PATH\}\}', ($bashPath -replace '\\', '/')
         Set-Content -LiteralPath $To -Value $t -Encoding UTF8 -NoNewline
     } else {
         Copy-Item -LiteralPath $From -Destination $To -Force
@@ -76,6 +78,46 @@ function Copy-BcfTree {
 Write-BcfTitle "УСТАНОВКА ОБВЯЗКИ  $projName" `
                "$(if ($dry) { 'сухой прогон — ничего не пишется' } elseif ($force) { 'РЕЖИМ ПЕРЕЗАПИСИ' } else { 'существующие файлы не трогаем' })"
 
+# --- bash для settings.json -------------------------------------------------------------
+#
+# Claude Code исполняет command хука буквально. Голый 'bash' на Windows чаще всего находит
+# ЛАУНЧЕР WSL (C:\Windows\System32\bash.exe) раньше настоящего Git Bash: на неинициализиро-
+# ванном дистрибутиве первый же хук уходит в интерактивную настройку и виснет на stdin, а
+# без дистрибутива — падает с ненулевым кодом. Поэтому settings.json пишется с ПОЛНЫМ путём
+# к bash, а не с именем команды. Резолв — тем же правилом, что у остального харнесса
+# (Get-BcfBash: BCF_BASH → git --exec-path → известные каталоги → PATH без WSL).
+#
+# Проверяем ТОЛЬКО когда settings.json реально будет записан: повторный install без
+# --force его не трогает, и требовать bash ради файлов, которые и так не запишутся, —
+# значит однажды заблокировать безобидное обновление hooks/skills на машине, где Git Bash
+# временно не резолвится.
+#
+# НЕ НАШЁЛ — НЕ ЗНАЧИТ «ОСТАНОВИТЬ ВЕСЬ INSTALL». `bcf init` вызывает install как подпроцесс
+# и следующим шагом читает config/harness.json (init-write.ps1) — упади install целиком,
+# и init свалился бы необработанным исключением на файле, которого больше не пишут по
+# другой, не связанной с bash причине. Поэтому отказ точечный: settings.json остаётся
+# незаписанным (заготовка не спрятана и не тронута, если уже была), всё остальное ставится
+# как обычно, а команда завершается ненулевым кодом — молчаливо-частичная установка хуже
+# явного отказа с причиной.
+$settingsPath = Join-Path $project '.claude\settings.json'
+$willWriteSettings = (-not $only -or $only -eq 'claude') -and ((-not (Test-Path $settingsPath)) -or $force)
+$bashPath = ''
+$bashRefused = $false
+if ($willWriteSettings) {
+    . (Join-Path (Get-BcfHarness) 'lib\bcf-context.ps1')
+    $bashPath = Get-BcfBash
+    if (-not $bashPath) {
+        $bashRefused = $true
+        Write-BcfFail 'settings.json НЕ будет записан: настоящий Git Bash не найден'
+        Write-BcfNote 'голый "bash" на Windows чаще ловит лаунчер WSL — хук либо зависает на неинициализиро-'
+        Write-BcfNote 'ванном дистрибутиве, либо падает молча, и это выглядит как поломка обвязки, а не bash.'
+        Write-BcfNote 'поставь Git for Windows: https://git-scm.com/download/win — bash найдётся сам через git --exec-path.'
+        Write-BcfNote 'уже стоит не в обычном месте — укажи путь явно: $env:BCF_BASH = "C:\путь\к\bash.exe"'
+        Write-BcfNote 'остальное поставится как обычно; довести настройку: bcf install --only claude (после того как bash найдётся).'
+        Write-Host ''
+    }
+}
+
 # --- .claude: хуки, скилы, команды, субагенты, settings -------------------------------
 if (-not $only -or $only -eq 'claude') {
     Copy-BcfTree -From (Join-Path $templates 'claude\hooks')    -To (Join-Path $project '.claude\hooks') -Substitute
@@ -84,7 +126,11 @@ if (-not $only -or $only -eq 'claude') {
     # Роли живут в ОДНОМ месте: .claude/agents. Их читает и Claude Code как субагентов,
     # и обвязка при верификации — держать две копии значит однажды править не ту.
     Copy-BcfTree -From (Join-Path $templates 'agents')          -To (Join-Path $project '.claude\agents')
-    Copy-BcfTemplate -From (Join-Path $templates 'claude\settings.json') -To (Join-Path $project '.claude\settings.json')
+    if ($bashRefused) {
+        $script:refused += $settingsPath.Substring($project.Length).TrimStart('\', '/')
+    } else {
+        Copy-BcfTemplate -From (Join-Path $templates 'claude\settings.json') -To $settingsPath -Substitute
+    }
 }
 
 # --- config: конфиги обвязки ----------------------------------------------------------
@@ -168,6 +214,12 @@ if ($skipped.Count) {
     Write-BcfNote 'Перезаписать целиком: bcf install --force (правки в этих файлах будут потеряны).'
 }
 
+if ($refused.Count) {
+    Write-Host ''
+    Write-BcfLine "  НЕ ЗАПИСАНО: bash не найден  $($refused.Count)" 'Red'
+    foreach ($r in $refused) { Write-BcfFail "    $r" }
+}
+
 if ($dry) {
     Write-Host ''
     Write-BcfWarn 'Сухой прогон: на диск ничего не записано.'
@@ -211,4 +263,6 @@ Write-Host '    bcf doctor         живая проба всех ролей —
 Write-Host '    bcf tasks          что уже есть в бэклоге'
 Write-Host '    bcf run queue      первая волна'
 Write-Host ''
+
+if ($refused.Count) { exit 2 }
 exit 0

@@ -39,6 +39,10 @@ if ($dry) {
 # 1. Обвязка ставится тем же кодом, что и `bcf install` — двух реализаций «что положить в
 #    проект» быть не должно, они разъедутся на первом же изменении шаблонов.
 $installOut = & pwsh -NoProfile -File (Join-Path $BcfRoot 'bin\bcf.ps1') install --project $root 2>&1 | Out-String
+# install отказывается писать settings.json с голым 'bash', когда Git Bash не найден —
+# сам install при этом не падает целиком (config/ и остальное всё равно ставится), но
+# ЭТУ причину обязан увидеть человек здесь, а не только в коде возврата init.
+$installExit = $LASTEXITCODE
 
 # 2. Конфиг: дописываем выясненное разбором и опросом.
 $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
@@ -181,6 +185,14 @@ foreach ($w in $writtenFiles) {
     Write-BcfLine "    $act  $pth" $(if ($act -eq 'A') { 'Green' } else { 'Cyan' })
 }
 Write-BcfLine '    A  .bcf/  (прогоны, заявки на файлы, журналы — в git не попадает)' 'Green'
+
+if ($installExit -ne 0) {
+    Write-Host ''
+    Write-BcfWarn 'bcf install (запись .claude) закончился отказом — часть обвязки не поставлена:'
+    foreach ($line in ($installOut -split "`r?`n")) {
+        if ($line -match 'bash' -and $line.Trim()) { Write-BcfDim ('  ' + $line.Trim()) }
+    }
+}
 
 if ($kept.Count) {
     Write-Host ''

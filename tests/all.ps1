@@ -19,7 +19,8 @@ $suites = @(
     @{ Name = 'java-хуки';        File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'java-hooks.tests.ps1' },
     @{ Name = 'исполнитель';      File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'executor-field.tests.ps1' },
     @{ Name = 'честность вердикта'; File = Join-Path $PSScriptRoot '..', 'harness', 'tests', 'verdict-honesty.tests.ps1' },
-    @{ Name = 'общая память';       File = Join-Path $PSScriptRoot 'memory-team.tests.ps1' }
+    @{ Name = 'общая память';       File = Join-Path $PSScriptRoot 'memory-team.tests.ps1' },
+    @{ Name = 'установка и секреты'; File = Join-Path $PSScriptRoot 'install-secrets.tests.ps1' }
 )
 
 $results = @()

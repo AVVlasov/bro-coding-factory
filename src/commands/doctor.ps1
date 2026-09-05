@@ -13,6 +13,24 @@
 . (Join-Path $BcfRoot 'src\lib\backends.ps1')
 . (Join-Path $BcfRoot 'src\lib\detect.ps1')
 
+# ФАБРИКА ПОКА ТОЛЬКО ПОД WINDOWS. Поиск настоящего bash для settings.json (по
+# git --exec-path и известным каталогам установки Git, 'C:\Program Files\Git\...') и
+# разделитель '\' в путях зашиты по всему харнессу — на Linux/macOS install молча
+# подставил бы в settings.json несуществующий путь или пустоту, а хуки звались бы
+# напрямую без интерпретатора. Пока этот слой путей не переписан, честнее отказать
+# сразу, чем изображать живую пробу на окружении, где половина проверок значения не
+# имеет.
+#
+# BCF_SIMULATE_NOT_WINDOWS=1 — тестовый шов: $IsWindows у PowerShell константа
+# («Cannot overwrite variable IsWindows because it is read-only»), настоящий Linux/macOS
+# для проверки этой ветки под рукой не всегда есть. Тот же приём, что BCF_BASH_FORCE_NOT_FOUND.
+if ($IsWindows -eq $false -or $env:BCF_SIMULATE_NOT_WINDOWS -eq '1') {
+    Write-BcfFail 'doctor поддерживает только Windows: резолв bash и пути обвязки зашиты под неё.'
+    Write-BcfNote 'поиск bash идёт по Git for Windows (git --exec-path, ProgramFiles\Git\...), путь к хукам собирается через ''\''.'
+    Write-BcfNote 'на Linux/macOS это даст не диагностику, а неверный вердикт — слой путей ещё не переписан под них.'
+    exit 1
+}
+
 $noProbe   = $script:BcfArgs -contains '--no-probe'
 $runChecks = $script:BcfArgs -contains '--checks'
 $project   = $script:BcfProject
