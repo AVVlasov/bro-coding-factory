@@ -453,8 +453,16 @@ function _GraphTaskStatus {
         # закоммичена. Переписать её здесь ещё раз значило бы оставить после прогона
         # грязное дерево ради одного изменившегося поля времени — а грязное дерево
         # отменяет перемотку на старте следующей ночи.
+        #
+        # ВЛАДЕНИЕ ДОСКОЙ. Доски может не быть вовсе, или она может принадлежать
+        # ЧУЖОМУ прогону — ночной очереди, второму участнику команды. Граф, чьи узлы не
+        # называют задач (bcf run review, bcf run research), на этой доске не значится:
+        # ни разу не позвал Update-TaskStatus и не заводил её через Reset-TaskStatusBoard,
+        # поэтому «run» в файле — не его. Закрыть чужую доску или завести свою пустую
+        # поверх чужой значит стереть очередь, которую ведёт кто-то другой.
         $cur = Read-TaskStatus -Root $script:GraphCtx.Root
-        if ($cur -and [bool]$cur.complete -and ([string]$cur.run) -eq $script:GraphCtx.RunId) { return }
+        if (-not $cur -or ([string]$cur.run) -ne $script:GraphCtx.RunId) { return }
+        if ([bool]$cur.complete) { return }
         Complete-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId | Out-Null
         return
     }

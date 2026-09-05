@@ -350,6 +350,24 @@ It 'смена состояния двигает since, повтор того ж
     Assert-True ((Read-TaskStatus -Root $b).tasks.'TASK-01'.since -ne $first) 'since не двинулся на смене состояния'
 }
 
+It 'SINCE ОСТАЁТСЯ ISO В ФАЙЛЕ ПОСЛЕ ВТОРОЙ ЗАПИСИ ТОГО ЖЕ СОСТОЯНИЯ' {
+    # ConvertFrom-Json сам разбирает ISO-строку since в [datetime]: первая запись честная,
+    # а вторая (перечитала доску, взяла старое since как есть и записала заново) печатает
+    # его форматом ЛОКАЛИ — «09/05/2026 16:48:42», без часового пояса и без долей секунды.
+    # Сравнение через объекты этого не ловит: и до, и после разбора оно проходит через тот
+    # же ConvertFrom-Json, поэтому проверяем ТЕКСТ САМОГО ФАЙЛА.
+    $b = New-Member -Name 'board-since-iso' -Remote ''
+    Update-TaskStatus -Root $b -Run 'r' -Task 'TASK-01' -State 'у фабрики' -Node 'работа-TASK-01' | Out-Null
+    Start-Sleep -Milliseconds 30
+    Update-TaskStatus -Root $b -Run 'r' -Task 'TASK-01' -State 'у фабрики' -Node 'работа-TASK-01' | Out-Null
+    $raw = Get-Content -Raw -LiteralPath (Get-TaskStatusPath -Root $b)
+    $sinceValues = @([regex]::Matches($raw, '"since":\s*"([^"]*)"') | ForEach-Object { $_.Groups[1].Value })
+    Assert-True ($sinceValues.Count -gt 0) "в файле нет ни одного since:`n$raw"
+    foreach ($v in $sinceValues) {
+        Assert-Match $v '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' "since стал форматом локали после второй записи: «$v»"
+    }
+}
+
 It 'КОНЕЦ ПРОГОНА ВОЗВРАЩАЕТ НЕЗАКРЫТЫЕ ЗАДАЧИ В ОЧЕРЕДЬ' {
     # Оборванный прогон не имеет права оставить задачу навсегда занятой: со стороны это
     # неотличимо от работающей, и второй участник её не возьмёт.
@@ -417,6 +435,44 @@ function Get-FakeAgentReply {
     } finally {
         Remove-Item Env:\BCF_GRAPH_FAKE_AGENT -ErrorAction SilentlyContinue
     }
+}
+
+It 'ГРАФ БЕЗ СВОИХ ЗАДАЧ В ОЧЕРЕДИ НЕ ТРОГАЕТ ЧУЖУЮ ДОСКУ' {
+    # Ночная очередь закрыла доску и уехала. Следующим запускается граф без единой задачи
+    # в узлах (bcf run review) — раньше run-finish ЛЮБОГО графа стирал доску заново:
+    # tasks становился {}, needs_human пустел, а run подменялся приёмочным.
+    $b = New-Member -Name 'board-foreign' -Remote ''
+    Reset-TaskStatusBoard -Root $b -Run 'run_night' -Queued @('TASK-01', 'TASK-02', 'TASK-03') | Out-Null
+    Complete-TaskStatus -Root $b -Run 'run_night' -NeedsHuman @('TASK-01') -GateBlocked @() | Out-Null
+    Publish-TaskStatus -Root $b -Message 'фабрика: доска задач (run_night)' | Out-Null
+
+    $fake = Join-Path $sandboxRoot 'fake-agent-review.ps1'
+    Set-Content -LiteralPath $fake -Encoding UTF8 -Value @'
+function Get-FakeAgentReply {
+    param([string]$Prompt, [string]$Label)
+    return @{ Text = "ответ узла $Label"; Tokens = 3 }
+}
+'@
+    $env:BCF_GRAPH_FAKE_AGENT = $fake
+    try {
+        . (Join-Path $root 'harness\lib\agent-sandbox.ps1')
+        . (Join-Path $root 'harness\lib\fleet.ps1')
+        . (Join-Path $root 'harness\lib\graph-runtime.ps1')
+        Initialize-GraphRun -Root $b -Meta @{ name = 'приёмка'; description = 'т' } -MaxConcurrency 1 | Out-Null
+        Invoke-Node -Prompt 'посмотри риски' -Label 'роутер-риск' -Role critic | Out-Null
+        Complete-GraphRun -Result @{ ok = $true } | Out-Null
+    } finally {
+        Remove-Item Env:\BCF_GRAPH_FAKE_AGENT -ErrorAction SilentlyContinue
+    }
+
+    $after = Read-TaskStatus -Root $b
+    Assert-Eq $after.run 'run_night' 'run на доске подменился чужим приёмочным прогоном'
+    Assert-True $after.complete 'доска ночного прогона стала незакрытой'
+    Assert-Eq @($after.tasks.PSObject.Properties).Count 3 `
+        "доска ночной очереди стёрлась: осталось задач $(@($after.tasks.PSObject.Properties).Count)"
+    Assert-Eq @($after.needs_human)[0] 'TASK-01' 'needs_human ночного прогона пропал'
+    $dirty = @(& git -C $b status --porcelain 2>$null | Where-Object { $_ -notmatch '^\?\?' })
+    Assert-Eq $dirty.Count 0 "граф без своих задач оставил доску некоммиченной грязью: $($dirty -join '; ')"
 }
 
 It 'доска отслеживается git и коммитится одним файлом' {
@@ -586,6 +642,48 @@ It 'строка задачи дописывается в tasks/index.md' {
     # Реестр не должен попасть в очередь: она берёт только TASK-NN-*.md.
     Assert-NoMatch (& pwsh -NoProfile -File $bcf tasks --project $d 2>&1 | Out-String) 'index' `
         'реестр читается как задача'
+}
+
+# --- 7. -DryPlan ничего не создаёт ---------------------------------------------------------
+Write-Host ''
+Write-Host '7. run-all -DryPlan: ни fetch, ни ветки волны, ни коммита' -ForegroundColor White
+
+It '-DRYPLAN НЕ СОЗДАЁТ НИЧЕГО: НИ FETCH, НИ ВЕТКИ ВОЛНЫ, НИ КОММИТА ДОСКИ' {
+    # docs/CLI.md: «--dry-plan не создаёт НИЧЕГО: ни рабочих деревьев, ни заявок на файлы».
+    # Шина команды заводила ветку волны и коммитила доску ДО проверки самого флага — сухой
+    # план с заполненным publish.remote уводил HEAD на bcf/wave/<дата> и оставлял коммит
+    # «доска задач», хотя был обязан только показать план.
+    $o = New-Origin
+    $b = New-Member -Name 'dryplan' -Origin $o -Tasks @{ 'TASK-01-first' = (New-TaskFile 'TASK-01') }
+    $headBefore = Get-Sha -Repo $b -Ref 'HEAD'
+    $branchBefore = (& git -C $b rev-parse --abbrev-ref HEAD | Out-String).Trim()
+
+    $out = & pwsh -NoProfile -File (Join-Path $root 'harness\run-all.ps1') -ProjectRoot $b -DryPlan 2>&1 | Out-String
+    Assert-Match $out 'DRY-PLAN' "сухой план не отчитался о себе:`n$out"
+
+    Assert-Eq (Get-Sha -Repo $b -Ref 'HEAD') $headBefore 'DryPlan сдвинул HEAD — появился новый коммит'
+    Assert-Eq ((& git -C $b rev-parse --abbrev-ref HEAD | Out-String).Trim()) $branchBefore `
+        'DryPlan увёл рабочее дерево с исходной ветки на ветку волны'
+    $waves = @(& git -C $b branch --list 'bcf/wave/*' 2>$null | Where-Object { $_ })
+    Assert-Eq $waves.Count 0 "DryPlan завёл ветку волны: $($waves -join ', ')"
+    $dirty = @(& git -C $b status --porcelain 2>$null | Where-Object { $_ -notmatch '^\?\?' })
+    Assert-Eq $dirty.Count 0 "DryPlan оставил отслеживаемую грязь: $($dirty -join '; ')"
+}
+
+It 'контроль: без DryPlan шина команды по-прежнему заводит ветку волны' {
+    # Без этой проверки предыдущая доказывала бы только «DryPlan ничего не пишет в лог»,
+    # а не то, что обычный прогон по-прежнему заводит волну — то есть что мы не выключили
+    # шину команды вовсе, подгоняя её под сухой план. Тот же путь, что вызывает run-all.ps1
+    # до ветвления по -DryPlan (harness/lib/team-bus.ps1), проверен здесь напрямую.
+    $o = New-Origin
+    $b = New-Member -Name 'wetplan' -Origin $o -Tasks @{ 'TASK-01-first' = (New-TaskFile 'TASK-01') }
+    $t = Start-TeamRun -Root $b
+    Assert-True $t.Ok $t.Reason
+    Assert-Match $t.Wave '^bcf/wave/\d{4}-\d{2}-\d{2}-\d{4}$' 'реальный прогон перестал заводить ветку волны'
+    Reset-TaskStatusBoard -Root $b -Run 'r' -Queued @('TASK-01') | Out-Null
+    Publish-TaskStatus -Root $b -Message 'фабрика: доска задач (r)' | Out-Null
+    $tracked = @(& git -C $b ls-files 'tasks/STATUS.json' 2>$null | Where-Object { $_ })
+    Assert-Eq $tracked.Count 1 'реальный прогон перестал коммитить доску'
 }
 
 # --- Итог ---------------------------------------------------------------------------------

@@ -345,10 +345,16 @@ function _LoadTaskStatus {
     $st.complete = [bool]$o.complete
     if ($o.tasks) {
         foreach ($p in $o.tasks.PSObject.Properties) {
+            # ConvertFrom-Json сам разбирает ISO-строку since в [datetime], и голое
+            # [string] печатает её ФОРМАТОМ ЛОКАЛИ («09/05/2026 16:48:42», без часового
+            # пояса и долей секунды) — контракт файла требует ISO, поэтому дату при
+            # перечитывании форматируем явно обратно тем же 'o', которым она писалась.
+            $sinceVal = $p.Value.since
+            $since = if ($sinceVal -is [datetime]) { $sinceVal.ToString('o') } else { [string]$sinceVal }
             $st.tasks[$p.Name] = [ordered]@{
                 state = [string]$p.Value.state
                 node  = [string]$p.Value.node
-                since = [string]$p.Value.since
+                since = $since
             }
         }
     }

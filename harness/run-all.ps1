@@ -316,23 +316,30 @@ Log "Очередь: $((($queue | ForEach-Object { $_.Task }) -join ', '))"
 # Заполнен — прогон обязан начаться с чужой работы, а не со своей: fetch и перемотка ветки
 # интеграции. Разошедшиеся линии работы прогон НЕ сводит и не стартует вовсе — свести их
 # имеет право человек, и лучше он сделает это утром, чем фабрика ночью и молча.
+#
+# -DryPlan НЕ СОЗДАЁТ НИЧЕГО (docs/CLI.md): ни fetch, ни ветки волны, ни коммита доски.
+# Тот же условие, что уже стоит в queue.graph.ps1 и в scheduler.ps1 — иначе сухой план
+# сам оставляет за собой git-состояние, которое обязан был только показать.
 . (Join-Path $PSScriptRoot 'lib\team-bus.ps1')
 $runId = 'run_' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-$team = Start-TeamRun -Root $root
-if (-not $team.Ok) {
-  Log "ПРОГОН НЕ СТАРТОВАЛ: $($team.Reason)"
-  exit 2
-}
-Log $team.Reason
+$team = @{ Ok = $true; Wave = ''; Remote = ''; Branch = ''; Reason = 'сухой план: ветка волны не заводится' }
+if (-not $DryPlan) {
+  $team = Start-TeamRun -Root $root
+  if (-not $team.Ok) {
+    Log "ПРОГОН НЕ СТАРТОВАЛ: $($team.Reason)"
+    exit 2
+  }
+  Log $team.Reason
 
-# Доска задач заводится ДО первого запуска и показывает очередь целиком: наблюдателю
-# нужна разница между «остальные ждут» и «остальных нет».
-Reset-TaskStatusBoard -Root $root -Run $runId `
-  -Queued @($queue | Where-Object { -not (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) `
-  -Closed @($queue | Where-Object {      (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) | Out-Null
-# Коммитим сразу: доска меняется весь прогон, и некоммиченной она делает дерево грязным —
-# то есть отменяет и слияние задачи, и перемотку на старте следующего прогона.
-Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($runId)" | Out-Null
+  # Доска задач заводится ДО первого запуска и показывает очередь целиком: наблюдателю
+  # нужна разница между «остальные ждут» и «остальных нет».
+  Reset-TaskStatusBoard -Root $root -Run $runId `
+    -Queued @($queue | Where-Object { -not (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) `
+    -Closed @($queue | Where-Object {      (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) | Out-Null
+  # Коммитим сразу: доска меняется весь прогон, и некоммиченной она делает дерево грязным —
+  # то есть отменяет и слияние задачи, и перемотку на старте следующего прогона.
+  Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($runId)" | Out-Null
+}
 
 # --- Параллельный режим (MX-04). При TaskConcurrency <= 1 работает старый
 # последовательный путь ниже — он проверен, его не трогаем. ---
