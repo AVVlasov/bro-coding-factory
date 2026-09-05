@@ -338,7 +338,17 @@ if (-not $Yes -and -not $DryPlan) {
 . (Join-Path $PSScriptRoot 'lib\claims.ps1')
 . (Join-Path $PSScriptRoot 'lib\worktree.ps1')
 . (Join-Path $PSScriptRoot 'lib\graph-runtime.ps1')
-    . (Join-Path $PSScriptRoot 'lib\graph-memory.ps1')
+. (Join-Path $PSScriptRoot 'lib\graph-memory.ps1')
+. (Join-Path $PSScriptRoot 'lib\critics.ps1')
+
+# ЧЕМ И ПО КАКОМУ ГРАФУ ПОЛУЧЕН ВЕРДИКТ — часть самого вердикта.
+#
+# Вердикт задачи пишет verify.ps1 в дочернем процессе, и до сих пор в нём не было ни слова
+# о том, какой версией фабрики и каким графом он получен. Разбор чужого прогона начинался
+# с вопроса «на чём это вообще гонялось», и ответа не было ни в одном файле прогона. Путь
+# к скрипту графа уезжает потомкам переменной окружения, а хэш от него считает
+# Get-BcfProvenanceLines там, где вердикт пишется.
+$env:BCF_GRAPH_FILE = $scriptPath
 
 # --- ПРЕФЛАЙТ ОКРУЖЕНИЯ ---
 #

@@ -84,6 +84,10 @@ if (-not $only -or $only -eq 'claude') {
     # Роли живут в ОДНОМ месте: .claude/agents. Их читает и Claude Code как субагентов,
     # и обвязка при верификации — держать две копии значит однажды править не ту.
     Copy-BcfTree -From (Join-Path $templates 'agents')          -To (Join-Path $project '.claude\agents')
+    # Тексты критиков приёмки ложатся туда же, рядом с тестерами: .claude/agents/critics/.
+    # Пока они жили строками внутри графа, проект не мог поправить ни одного вопроса —
+    # приёмка чужого продукта шла ракурсами, написанными под другой продукт.
+    Copy-BcfTree -From (Join-Path $templates 'claude\agents')   -To (Join-Path $project '.claude\agents')
     Copy-BcfTemplate -From (Join-Path $templates 'claude\settings.json') -To (Join-Path $project '.claude\settings.json')
 }
 

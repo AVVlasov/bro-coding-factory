@@ -103,31 +103,32 @@ Set-GraphVar scopeWord $(if ($scopeProduct) { 'ПРОДУКТ ЦЕЛИКОМ (н
 # именно непохожесть, а не количество, отличает рой от четырёх копий одного мнения.
 #
 # Ракурсы ЗАВИСЯТ ОТ ПРОДУКТА: «работа с чужой памятью» бессмысленна для веб-сервиса,
-# «границы слоёв» звучат по-разному в монолите и в микросервисах. Проект переопределяет
-# их в config/review-lenses.json — массив объектов {key, ask}. Дефолт ниже намеренно
-# общий: он ловит то, что ломается в любом коде, и не притворяется, что знает предметную
-# область.
-$LENSES = @(
-    @{ key = 'корректность'; ask = 'Ошибки логики: краевые значения (пусто, ноль, один элемент, переполнение), состояние гонки, повторный вход, порядок операций, который меняет результат. Нужен КОНКРЕТНЫЙ вход, дающий неверный выход.' }
-    @{ key = 'отказы';       ask = 'Обработка ошибок: проглоченное исключение, пустой catch, тихий фолбэк на значение по умолчанию, невыверенный внешний ответ, ресурс без освобождения на пути ошибки, частично применённое изменение без отката.' }
-    @{ key = 'границы';      ask = 'Границы слоёв и контракты: не протекли ли знания одного слоя в другой (UI знает про хранилище, ядро печатает пользователю), совместимо ли изменение с уже существующими вызывающими, стабильны ли коды/форматы ошибок.' }
-    @{ key = 'гейты';        ask = 'Честность тестов: ассерт на константу, замокан ровно тот объект, который и проверяется, тест без ассертов, тест на моке там, где важна реальная интеграция. Тест, не проверяющий поведение, хуже отсутствующего.' }
-    # Пятый ракурс добавлен по разбору clinic-scheduler (2026-08-09). Четыре ракурса выше —
-    # все код-уровневые: они спрашивают «правилен ли написанный код». За пять кругов приёмки
-    # они нашли 30+ дефектов стыков и НИ РАЗУ не сказали «оператор не может записать
-    # пациента» — потому что этого вопроса им никто не задавал. Дефект вида «функции нет
-    # вовсе» или «кнопка есть, но она заглушка» не виден в диффе как ошибка: диффа просто
-    # нет. Этот ракурс смотрит на продукт со стороны пользователя, а не со стороны правки.
-    @{ key = 'сценарий';     ask = 'Работа пользователя, а не правильность кода. Возьми сквозной путь, ради которого существует затронутый экран или модуль (config/journeys.json, PRD, макеты — в таком порядке), и пройди его по коду шаг за шагом. Ищи: шаг, у которого нет UI; кнопку без обработчика или с disabled навсегда; действие, не доходящее до сервера; экран, который берёт данные не за тот период/не того владельца; заголовок, противоречащий содержимому; захардкоженное значение, выданное за настоящие данные; ложное утверждение в тексте («передано в МИС» без интеграции). Находка обязана называть шаг пути и то, что человек НЕ может сделать.' }
-)
-try {
-    $lensFile = Join-Path $root 'config\review-lenses.json'
-    if (Test-Path $lensFile) {
-        $lj = Get-Content -Raw -LiteralPath $lensFile | ConvertFrom-Json
-        $custom = @($lj | Where-Object { $_.key -and $_.ask } | ForEach-Object { @{ key = [string]$_.key; ask = [string]$_.ask } })
-        if ($custom.Count) { $LENSES = $custom; Write-GraphLog "ракурсы ревью: $($custom.Count) из config/review-lenses.json" }
+# «границы слоёв» звучат по-разному в монолите и в микросервисах. Поэтому и состав
+# ракурсов (config/review-lenses.json), и текст каждого (.claude/agents/critics/<id>.md)
+# живут в ПРОЕКТЕ, а движок только спрашивает. Файла в проекте нет — берётся шаблон
+# фабрики, и об этом пишется строка в журнал: подмена текста молча читается как
+# «проект настроен под себя».
+$lensSet = Get-BcfLenses -Root $root -Kind review
+foreach ($n in @($lensSet.Notes)) { Write-GraphLog "! ракурсы: $n" }
+
+$LENSES = @()
+foreach ($lens in @($lensSet.Lenses)) {
+    $ct = Get-BcfCriticText -Lens $lens -Root $root
+    if ($ct.Note) { Write-GraphLog "! $($ct.Note)" }
+    if (-not $ct.Text) { continue }
+    # Текст читается ОДИН раз на прогон и едет полем Text: раундов поиска несколько, и
+    # перечитывать файл (а с ним и предупреждать про шаблон фабрики) на каждом — шум.
+    $LENSES += [pscustomobject]@{
+        Id = [string]$lens.Id; Owner = [string]$lens.Owner; Blocking = [bool]$lens.Blocking
+        Text = $ct.Text; Source = $ct.Source
     }
-} catch { Write-GraphLog "config/review-lenses.json не разобран — беру ракурсы по умолчанию" }
+}
+if (-not $LENSES.Count) {
+    Write-GraphLog "ни у одного ракурса нет текста — ни в проекте, ни в шаблонах фабрики; смотреть нечем"
+    return @{ findings = 0; reason = 'ракурсы не заданы' }
+}
+Write-GraphLog ("ракурсы ревью: $($LENSES.Count) из $(if ($lensSet.FromProject) { 'config/review-lenses.json' } else { 'умолчания фабрики' })" +
+                ", блокирующих $(@($LENSES | Where-Object { $_.Blocking }).Count)")
 
 $seen = @{}          # ключ находки → уже видели (включая ОТКЛОНЁННЫЕ — иначе цикл не сойдётся)
 $confirmed = @()
@@ -150,9 +151,9 @@ $REFUTE_SCHEMA = @{
     type = 'object'; required = @('refuted', 'why'); additionalProperties = $false
     properties = @{ refuted = @{ type = 'boolean' }; why = @{ type = 'string' } }
 }
-# Схемы кладутся в захват ДО первого веера: ветки живут в чужих runspace и видят
-# только то, что было положено сюда заранее.
-Set-GraphVar findSchema   $FIND_SCHEMA
+# Схема кладётся в захват ДО первого веера: ветки живут в чужих runspace и видят только
+# то, что было положено сюда заранее. Схему искателей кладёт туда же общая сборка ракурсов
+# (harness/lib/critics.ps1) — здесь остался барьер опровергателей, у него схема своя.
 Set-GraphVar refuteSchema $REFUTE_SCHEMA
 
 # ---------------------------------------------------------------------------
@@ -199,13 +200,13 @@ if ($route -and $route.risk -eq 'низкий' -and $loc -le 150) { $heavy = $fa
 if ($scopeProduct) { $heavy = $true }
 # Лёгкий маршрут отбирал ракурсы по ключам @('память','гейты'). Ключа 'память' в наборе
 # по умолчанию нет — он остался от набора другого проекта. Фильтр молча оставлял ОДИН
-# ракурс вместо двух, и лёгкое ревью полгода было вдвое слабее заявленного. Отбор по
-# позиции вместо отбора по имени: он не может тихо схлопнуться, что бы ни лежало в
-# config/review-lenses.json. 'сценарий' в лёгком наборе обязателен — именно дешёвые с
+# ракурс вместо двух, и лёгкое ревью полгода было вдвое слабее заявленного. Поэтому здесь
+# отбор по имени ПЛЮС фолбэк по позиции: набор не может тихо схлопнуться, что бы ни лежало
+# в config/review-lenses.json. 'journey' в лёгком наборе обязателен — именно дешёвые с
 # виду правки чаще всего и оставляют пользователя без пути.
-$LITE_KEYS = @('гейты', 'сценарий')
+$LITE_KEYS = @('gates', 'journey')
 $LENSES_USED = if ($heavy) { $LENSES } else {
-    $lite = @($LENSES | Where-Object { $_.key -in $LITE_KEYS })
+    $lite = @($LENSES | Where-Object { $_.Id -in $LITE_KEYS })
     if ($lite.Count -lt 2) { $lite = @($LENSES | Select-Object -First ([Math]::Min(2, $LENSES.Count))) }
     $lite
 }
@@ -224,13 +225,11 @@ while ($dryRounds -lt $MAX_DRY) {
     Set-GraphVar round $round
     Set-GraphVar known (@($seen.Keys) -join ' | ')
 
-    $batches = @(Invoke-Barrier -Thunks @($LENSES_USED | ForEach-Object {
-        $lens = $_
-        [scriptblock]::Create(@"
-            Invoke-Node -Role critic -Recall -Label 'искатель-$($lens.key)-р$round' -Schema (Get-GraphVar findSchema) -Prompt @'
-Ты ищешь дефекты в изменённом коде. Твой РАКУРС — только этот, остальные смотрят другие:
-
-$($lens.ask)
+    # Промпты собирает общая функция — та же, что у приёмки. Текст ракурса уже прочитан
+    # выше (он не меняется между раундами), поэтому сюда он приходит полем Ask.
+    $built = Build-BcfCriticPrompts -Lenses $LENSES_USED -Root $root `
+                -Header 'Ты ищешь дефекты в изменённом коде. Твой РАКУРС — только этот, остальные смотрят другие:' `
+                -Tail @"
 
 Область: $(Get-GraphVar scopeWord)
 Файлы: $(Get-GraphVar files)
@@ -241,18 +240,30 @@ $(Get-GraphVar known)
 
 Читай сам код, а не только диф.
 Каждая находка — с точным файлом и строкой. Не нашёл нового — верни пустой список.
-'@
-"@)
-    }))
+"@
+    $LENSES_ROUND = @($built.Lenses)
+    $batches = @(Invoke-BcfCriticBarrier -Lenses $LENSES_ROUND -Prompts @($built.Prompts) `
+                    -LabelPrefix 'искатель' -LabelSuffix "р$round" -Schema $FIND_SCHEMA)
 
     # Дедуп по ВСЕМУ увиденному.
+    #
+    # РАКУРС ЕДЕТ ВМЕСТЕ С НАХОДКОЙ. Без него в отчёте стоит «нашёл искатель», спросить по
+    # находке некого, и главное — нечем отличить находку блокирующего ракурса от находки
+    # совещательного, то есть вердикт считать не по чему. Порядок ответов барьера совпадает
+    # с порядком ракурсов — на этом соответствие и держится.
     $fresh = @()
-    foreach ($b in @($batches | Where-Object { $_ })) {
+    for ($bi = 0; $bi -lt @($batches).Count; $bi++) {
+        $b = @($batches)[$bi]
+        if (-not $b -or ($b -is [string]) -or (-not $b.PSObject.Properties['findings'])) { continue }
+        $lens = $LENSES_ROUND[$bi]
         foreach ($f in @($b.findings)) {
             if (-not $f -or -not $f.file) { continue }
             $key = "$($f.file):$($f.line):$(($f.title -replace '\s+', ' ').ToLower())"
             if ($seen.ContainsKey($key)) { continue }
             $seen[$key] = $true
+            $f | Add-Member -NotePropertyName 'lens'     -NotePropertyValue ([string]$lens.Id) -Force
+            $f | Add-Member -NotePropertyName 'owner'    -NotePropertyValue ([string]$lens.Owner) -Force
+            $f | Add-Member -NotePropertyName 'blocking' -NotePropertyValue ([bool]$lens.Blocking) -Force
             $fresh += $f
         }
     }
@@ -329,12 +340,27 @@ if (-not $confirmed.Count) {
     return @{ findings = @(); seen = $seen.Count; rounds = $round }
 }
 
-$listing = (@($confirmed | ForEach-Object { "- [$($_.severity)] $($_.file):$($_.line) — $($_.title)`n  $($_.why)" }) -join "`n")
+# Блокирующие и совещательные разведены: вердикт прогона считается по блокирующим, а
+# совещательные печатаются целиком и названы совещательными — иначе человек читает их как
+# требования и чинит то, о чём его не просили.
+$confirmedBlocking = @($confirmed | Where-Object { $_.blocking })
+$confirmedAdvisory = @($confirmed | Where-Object { -not $_.blocking })
+function _ReviewLine($f) {
+    $who = if ($f.owner) { ", отвечает $($f.owner)" } else { '' }
+    return "- [$($f.severity)] $($f.file):$($f.line) — $($f.title) (ракурс $($f.lens)$who)`n  $($f.why)"
+}
+$listing = (@($confirmedBlocking | ForEach-Object { _ReviewLine $_ }) -join "`n")
+if (-not $confirmedBlocking.Count) { $listing = '- (блокирующих находок нет)' }
+$listingAdvisory = if ($confirmedAdvisory.Count) {
+    "`n## Совещательные ракурсы (на вердикт не влияют)`n`n" +
+    (@($confirmedAdvisory | ForEach-Object { _ReviewLine $_ }) -join "`n") + "`n"
+} else { '' }
 $summary = Invoke-Node -Role planner -Label 'сведение' -Prompt @"
 Ниже находки, пережившие состязательную проверку (каждую пытались опровергнуть с трёх
 разных углов, и опровержение не набрало большинства).
 
 $listing
+$listingAdvisory
 
 Сведи их в один отчёт: сгруппируй по смыслу, отсортируй по реальному риску, слей
 дубликаты, сказанные разными словами. Для каждой — что чинить, одной строкой.
@@ -343,10 +369,16 @@ $listing
 
 Set-Content -LiteralPath $reportFile -Encoding UTF8 -Value (
     "# Ревью графом`n`n" +
-    "**Просмотрено находок:** $($seen.Count)`n**Подтверждено проверкой:** $($confirmed.Count)`n**Раундов поиска:** $round`n`n" +
-    "## Сведение`n`n$summary`n`n## Находки как есть`n`n$listing`n")
+    "**Просмотрено находок:** $($seen.Count)`n**Подтверждено проверкой:** $($confirmed.Count) " +
+    "(блокирующих $($confirmedBlocking.Count), совещательных $($confirmedAdvisory.Count))`n" +
+    "**Раундов поиска:** $round`n`n" +
+    "## Сведение`n`n$summary`n`n## Находки как есть`n`n$listing`n$listingAdvisory")
 
-Write-GraphLog "отчёт: .bcf/REVIEW-graph.md — подтверждено $($confirmed.Count) из $($seen.Count) просмотренных"
-return @{ findings = $confirmed.Count; seen = $seen.Count; rounds = $round; report = '.bcf/REVIEW-graph.md' }
+Write-GraphLog ("отчёт: .bcf/REVIEW-graph.md — подтверждено $($confirmed.Count) из $($seen.Count) просмотренных " +
+                "(блокирующих $($confirmedBlocking.Count), совещательных $($confirmedAdvisory.Count))")
+# `findings` читает graph.ps1 и по нему решает вердикт прогона — значит туда идут только
+# блокирующие ракурсы. Совещательные видны отдельным полем и в отчёте.
+return @{ findings = $confirmedBlocking.Count; advisory = $confirmedAdvisory.Count
+          seen = $seen.Count; rounds = $round; report = '.bcf/REVIEW-graph.md' }
 
 
