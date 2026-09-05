@@ -15,6 +15,7 @@
 # ПОЧЕМУ: дальше человек идёт смотреть вердикты, файлы и коллизии руками.
 
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
+. (Join-Path (Get-BcfHarness) 'lib\team-bus.ps1')
 
 $project = $script:BcfProject
 
@@ -86,6 +87,20 @@ switch ($sub) {
     foreach ($t in (Get-AllTasks)) {
         if ($t.Id -match '-(\d+)$') { $max = [math]::Max($max, [int]$Matches[1]) }
     }
+
+    # И НОМЕРА, ЗАНЯТЫЕ НА ДРУГОЙ МАШИНЕ.
+    #
+    # Локальных файлов недостаточно: у второго участника команды их шесть, у первого
+    # девять, и седьмая давно в работе. Номер, выбранный по своему каталогу, совпадает с
+    # чужим, а обнаруживается это на слиянии — двумя разными задачами под одним именем,
+    # каждая со своим вердиктом. Смотрим дерево ветки интеграции на remote (без сетевого
+    # вызова: свежесть refs/remotes даёт прогон, который начинается с fetch).
+    $remoteMax = 0
+    try { $remoteMax = Get-BcfRemoteTaskMax -Root $project -Prefix $prefix -TasksRel $tasksRel } catch { }
+    if ($remoteMax -gt $max) {
+        Write-BcfNote "номера до $prefix-$('{0:D2}' -f $remoteMax) заняты на ветке интеграции — беру следующий за ними"
+        $max = $remoteMax
+    }
     $num = '{0:D2}' -f ($max + 1)
     $slug = ($title.ToLower() -replace '[^\p{L}\p{Nd}]+', '-').Trim('-')
     # Транслитерация нужна для имени файла: кириллица в пути ломает часть инструментов,
@@ -114,8 +129,12 @@ switch ($sub) {
     if ($forWhom) { $tpl = $tpl -replace '(?m)^Исполнитель:.*$', "Исполнитель: $forWhom" }
     Set-Content -LiteralPath $path -Value $tpl -Encoding UTF8
 
+    $rel = ($path.Substring($project.Length).TrimStart('\', '/')) -replace '\\', '/'
+    Add-BcfTaskIndexEntry -Root $project -TaskId $id -Title $title -RelPath $rel | Out-Null
+
     Write-BcfTitle "СОЗДАНА ЗАДАЧА  $id" $title
-    Write-BcfOk ($path.Substring($project.Length).TrimStart('\', '/'))
+    Write-BcfOk $rel
+    Write-BcfOk "$tasksRel/index.md (строка реестра)"
     if ($forWhom) {
         Write-Host ''
         Write-BcfWarn "исполнитель: $forWhom — фабрика эту задачу не возьмёт"

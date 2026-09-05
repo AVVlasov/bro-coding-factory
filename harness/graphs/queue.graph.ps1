@@ -43,6 +43,33 @@ try {
     if ($cj._default) { $mergeChecks = @($cj._default | Where-Object { $_ -is [string] -and $_.Trim() }) }
 } catch { }
 
+# --- ШИНА КОМАНДЫ: чем прогон начинается ------------------------------------------------
+#
+# Функции приезжают вместе с рантаймом (harness/lib/team-bus.ps1). Пока publish.remote
+# пуст, здесь не происходит ничего. Заполнен — прогон начинается с чужой работы: fetch и
+# перемотка ветки интеграции, дальше волна уходит своей веткой. Разошедшиеся ветки прогон
+# не сводит и не стартует: это решение человека, а не ночного прогона.
+$team = @{ Ok = $true; Wave = ''; Remote = ''; Branch = ''; Reason = 'сухой план: ветка волны не заводится' }
+if (-not $script:GraphCtx.DryPlan) {
+    $team = Start-TeamRun -Root $root
+    if (-not $team.Ok) {
+        Write-GraphLog "прогон не стартовал: $($team.Reason)"
+        return @{ complete = $false; ok = $false; reason = $team.Reason }
+    }
+    Write-GraphLog $team.Reason
+}
+
+# Состояние задачи на общей доске tasks/STATUS.json. Узлы её обновляют сами (рантайм
+# делает это из журнала), а «закрыта» и «заблокирована» ставит тот, кто это решил.
+function Set-QueueBoard {
+    param([string]$Task, [string]$State, [string]$Node = '')
+    if (-not $script:GraphCtx -or $script:GraphCtx.DryPlan) { return }
+    try {
+        Update-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId `
+            -Task $Task -State $State -Node $Node | Out-Null
+    } catch { }
+}
+
 # ---------------------------------------------------------------------------
 Set-Phase 'Разметка'
 # ---------------------------------------------------------------------------
@@ -182,6 +209,15 @@ $passed = @()
 $stuck = @()
 foreach ($t in $tasks) { if ($t.Pass) { $done[$t.Id] = $true; $passed += $t.Id } }
 
+# Доска показывает очередь целиком с самого начала: без этого со стороны видна одна
+# задача — та, что идёт, — и «остальные ждут» неотличимо от «остальных нет».
+if (-not $script:GraphCtx.DryPlan) {
+    Reset-TaskStatusBoard -Root $root -Run $script:GraphCtx.RunId `
+        -Queued @($tasks | Where-Object { -not $_.Pass } | ForEach-Object { $_.Id }) `
+        -Closed @($tasks | Where-Object {      $_.Pass } | ForEach-Object { $_.Id }) | Out-Null
+    Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($($script:GraphCtx.RunId))" | Out-Null
+}
+
 # Задача без объявленных файлов к работе НЕ допускается — и отказ выдаётся здесь, до
 # первого потраченного токена. Допуск на старте держится на декларации владения: без неё
 # проверить, что задача не залезет в чужой файл, нечем, и расползание скоупа обнаружится
@@ -193,6 +229,7 @@ foreach ($t in $tasks) {
     $done[$t.Id] = $true
     $stuck += [pscustomobject]@{ Task = $t.Id
         Reason = 'файлы не объявлены: в задаче нет списка в секции «## Файлы», поэтому владение неизвестно и допуск не работает' }
+    Set-QueueBoard -Task $t.Id -State 'заблокирована' -Node 'допуск'
     Write-GraphLog "✗ $($t.Id): файлы не объявлены — к работе не допущена"
 }
 
@@ -477,9 +514,11 @@ while ($true) {
         $done[$r.Task] = $true
         if ($r.Ok) {
             $passed += $r.Task
+            Set-QueueBoard -Task $r.Task -State 'закрыта' -Node "интеграция-$($r.Task)"
             Write-GraphLog "✓ $($r.Task) слита$(if ($r.Arbitrated) { ' (через арбитра)' })"
         } else {
             $stuck += [pscustomobject]@{ Task = $r.Task; Reason = $r.Reason }
+            Set-QueueBoard -Task $r.Task -State 'заблокирована' -Node "интеграция-$($r.Task)"
             Write-GraphLog "✗ $($r.Task): $($r.Reason)"
 
             # ПРОВАЛ — САМЫЙ ЦЕННЫЙ МАТЕРИАЛ, И ИМЕННО ОН РАНЬШЕ ПРОПАДАЛ. Цикл писал
@@ -526,6 +565,7 @@ while ($true) {
         $done[$t.Id] = $true
         $stuck += [pscustomobject]@{ Task = $t.Id
             Reason = 'ветка конвейера упала и ничего не вернула — см. журнал прогона (событие «ветка упала»)' }
+        Set-QueueBoard -Task $t.Id -State 'заблокирована' -Node "работа-$($t.Id)"
         Write-GraphLog "✗ $($t.Id): ветка конвейера упала без результата"
     }
 }
@@ -535,6 +575,7 @@ foreach ($t in $tasks) {
     if ($done.ContainsKey($t.Id)) { continue }
     $pend = @($t.Preds | Where-Object { -not (Get-Verdict $_) })
     $stuck += [pscustomobject]@{ Task = $t.Id; Reason = "gate-block: предшественник $($pend -join ', ') не закрыт (не запускался)" }
+    Set-QueueBoard -Task $t.Id -State 'заблокирована' -Node 'gate'
 }
 
 # ---------------------------------------------------------------------------
@@ -783,6 +824,16 @@ $reviewFile = if ($script:GraphCtx.DryPlan) {
     Join-Path $root '.bcf\REVIEW.md'
 }
 $statusFile = if ($script:GraphCtx.DryPlan) { Join-Path $script:GraphCtx.Dir 'run-all.status.dry.json' } else { '' }
+
+# Доска закрывается и уезжает вместе с волной ДО отчёта: отказ отправки обязан попасть в
+# сам отчёт затыком, а не остаться строкой в журнале, которую утром никто не откроет.
+if (-not $script:GraphCtx.DryPlan) {
+    $fin = Complete-TeamRun -Root $root -Run $script:GraphCtx.RunId -Team $team -Stuck @($stuck)
+    if (-not $fin.Publish.Ok) { Write-GraphLog "волна не опубликована: $($fin.Publish.Reason)" }
+    elseif ($fin.Publish.Kind -eq 'pushed') { Write-GraphLog $fin.Publish.Reason }
+    $stuck = @($fin.Stuck)
+}
+
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $tasks.Count -Root $root `
     -ReviewFile $reviewFile -StatusFile $statusFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `
     -AcceptanceP1 $findP1.Count

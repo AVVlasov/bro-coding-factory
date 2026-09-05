@@ -15,6 +15,9 @@
 #      слитое дерево — поэтому после слияния гоняем их ещё раз.
 
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
+# Доска задач: параллельный планировщик — второе место (после графа), где со стороны
+# видно, чем фабрика занята прямо сейчас.
+. (Join-Path $PSScriptRoot 'team-bus.ps1')
 
 # ---------------------------------------------------------------------------
 # ПРОВЕРКА НА СЛИТОМ ДЕРЕВЕ: ТРИ ИСХОДА, А НЕ ДВА
@@ -221,10 +224,22 @@ function Invoke-ParallelQueue {
         # прежде чем её убьют. Должно быть заметно больше самой долгой легитимной паузы
         # (итерация агента + verify), иначе сторож начнёт резать работающие задачи.
         [int]$TaskIdleKillSec = 2400,
+        # Id прогона для доски задач (tasks/STATUS.json). Пусто = доска не ведётся: у
+        # сухого плана и у вызова из чужой обвязки прогона как события нет.
+        [string]$Run = '',
         [switch]$DryPlan
     )
 
     $log = { param($m) & $LogFn $m }
+
+    # Состояние задачи на общей доске. Отдельная функция, потому что мест, откуда задача
+    # уходит из работы, здесь семь, и «забыть в одном из них» означает задачу, которая со
+    # стороны навсегда осталась у фабрики.
+    $board = {
+        param($task, $state, $node)
+        if (-not $Run -or $DryPlan) { return }
+        try { Update-TaskStatus -Root $Root -Run $Run -Task $task -State $state -Node $node | Out-Null } catch { }
+    }
 
     $pending = [System.Collections.ArrayList]::new()
     foreach ($t in $Tasks) { [void]$pending.Add($t) }
@@ -239,6 +254,7 @@ function Invoke-ParallelQueue {
     foreach ($t in @($pending)) {
         if (& $IsPass $t $Root) {
             & $log "$t — уже verdict: PASS, пропуск."
+            & $board $t 'закрыта' ''
             $passed += $t; [void]$doneSet.Add($t); $pending.Remove($t)
         }
     }
@@ -296,10 +312,12 @@ function Invoke-ParallelQueue {
             }
 
             # 3. Worktree + запуск.
+            & $board $task 'у фабрики' "работа-$task"
             $wt = New-TaskWorktree -Root $Root -Task $task
             if (-not $wt) {
                 & $log "$task — не удалось создать worktree, задача пропущена."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = 'worktree не создан' }
+                & $board $task 'заблокирована' "работа-$task"
                 [void]$doneSet.Add($task)
                 continue
             }
@@ -340,6 +358,7 @@ function Invoke-ParallelQueue {
             foreach ($t in @($pending)) {
                 $pend = @(& $GatePreds $t | Where-Object { -not (& $IsPass $_ $Root) })
                 $stuck += [pscustomobject]@{ Task = $t; Reason = "gate-block: предшественник $($pend -join ', ') не закрыт (не запускался)" }
+                & $board $t 'заблокирована' 'gate'
                 $pending.Remove($t)
             }
             break
@@ -382,6 +401,7 @@ function Invoke-ParallelQueue {
             if (-not $isPass) {
                 & $log "$task — не закрыта в worktree, слияния не будет."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = 'не достиг PASS (лимит/затык)' }
+                & $board $task 'заблокирована' "работа-$task"
                 Remove-TaskClaim -TaskId $task -Root $Root
                 Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
                 [void]$doneSet.Add($task)
@@ -449,6 +469,7 @@ function Invoke-ParallelQueue {
                 }
                 & $log "$task — СЛИЯНИЕ НЕ УДАЛОСЬ: $why. Ветка сохранена."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = "слияние не удалось — $why" }
+                & $board $task 'заблокирована' "слияние-$task"
                 Remove-TaskClaim -TaskId $task -Root $Root
                 Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
                 [void]$doneSet.Add($task)
@@ -479,11 +500,13 @@ function Invoke-ParallelQueue {
                 if (-not $undo.Ok) { $reason = "$reason; откат не удался — $($undo.Message)" }
                 & $log "$task — слияние откатано: $reason."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
+                & $board $task 'заблокирована' "слитое-$task"
                 $kind = if ($checkFail.Result.Kind -eq 'red') { 'semantic' } else { 'gate-not-runnable' }
                 Register-TaskConflict -Pair @($task, '(слитое дерево)') -Files @() -Kind $kind
             } else {
                 & $log "$task — слита в основную ветку."
                 $passed += $task
+                & $board $task 'закрыта' "слияние-$task"
             }
             Remove-TaskClaim -TaskId $task -Root $Root
             Remove-TaskWorktree -Root $Root -Task $task

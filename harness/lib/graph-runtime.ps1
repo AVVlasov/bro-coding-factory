@@ -38,6 +38,10 @@
 
 Set-StrictMode -Off
 
+# Доска задач (tasks/STATUS.json) обновляется из журнала, поэтому шина команды нужна
+# самому рантайму, а не только оркестраторам.
+. (Join-Path $PSScriptRoot 'team-bus.ps1')
+
 $script:GraphCtx = $null
 
 # ---------------------------------------------------------------------------
@@ -425,9 +429,41 @@ function _GraphJournal {
     } catch { $mtx = $null }
     try {
         Add-Content -LiteralPath $script:GraphCtx.Journal -Value $line -Encoding UTF8
+        # Доска задач обновляется ЗДЕСЬ, а не в каждом месте, откуда запускается узел.
+        # Вызов на каждой площадке — это обещание, которое однажды забудут выполнить на
+        # новом узле, и со стороны это выглядит как «задача исчезла».
+        _GraphTaskStatus $Record
     } catch { } finally {
         if ($mtx) { try { $mtx.ReleaseMutex() } catch { }; $mtx.Dispose() }
     }
+}
+
+# Перевод события журнала в состояние задачи на доске.
+#
+# Узел, чья метка называет задачу, означает «задача у фабрики» — и на старте, и на
+# финише: закончившийся узел не закрывает задачу, её закрывает слияние. Дальше состояние
+# ставит оркестратор явно («закрыта», «заблокирована»), а run-finish возвращает всё
+# оставшееся «у фабрики» в очередь.
+function _GraphTaskStatus {
+    param([hashtable]$Record)
+    if (-not $script:GraphCtx -or $script:GraphCtx.DryPlan) { return }
+    $ev = [string]$Record['event']
+    if ($ev -eq 'run-finish') {
+        # Доску мог уже закрыть сам граф (Complete-TeamRun), и она в этот момент уже
+        # закоммичена. Переписать её здесь ещё раз значило бы оставить после прогона
+        # грязное дерево ради одного изменившегося поля времени — а грязное дерево
+        # отменяет перемотку на старте следующей ночи.
+        $cur = Read-TaskStatus -Root $script:GraphCtx.Root
+        if ($cur -and [bool]$cur.complete -and ([string]$cur.run) -eq $script:GraphCtx.RunId) { return }
+        Complete-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId | Out-Null
+        return
+    }
+    if ($ev -ne 'node-start' -and $ev -ne 'node-finish') { return }
+    if ($Record['dry']) { return }
+    $task = Get-BcfTaskIdFromLabel ([string]$Record['label'])
+    if (-not $task) { return }
+    Update-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId `
+        -Task $task -State 'у фабрики' -Node ([string]$Record['label']) | Out-Null
 }
 
 function Write-GraphLog {
