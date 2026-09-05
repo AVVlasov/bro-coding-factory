@@ -482,7 +482,7 @@ $reportRunner = Join-Path $box 'run-report.ps1'
 Set-Content -LiteralPath $reportRunner -Encoding UTF8 -Value @'
 param([string]$RunAll, [string]$Root, [string]$Review, [string]$Status, [int]$P1, [string]$GraphFile, [string]$Result,
       [string]$PassedIds = 'TASK-01', [string]$StuckIds = '', [string]$Ts = '2026-09-05 00:00:00',
-      [switch]$BreakRequirements)
+      [switch]$BreakRequirements, [switch]$AcceptanceSkipped)
 $ErrorActionPreference = 'Stop'
 $env:BCF_REPORT_LIB_ONLY = '1'
 $env:BCF_PROJECT_ROOT = $Root
@@ -495,7 +495,7 @@ if ($BreakRequirements) { function Get-TaskRequirements { throw 'каталог 
 $passed = @($PassedIds -split ',' | Where-Object { $_ })
 $stuck  = @($StuckIds  -split ',' | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Task = $_; Reason = 'stuck' } })
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total ($passed.Count + $stuck.Count) -Root $Root `
-    -ReviewFile $Review -StatusFile $Status -Ts $Ts -AcceptanceP1 $P1
+    -ReviewFile $Review -StatusFile $Status -Ts $Ts -AcceptanceP1 $P1 -AcceptanceSkipped:$AcceptanceSkipped
 ([ordered]@{
     complete = [bool]$rep.complete
     review   = (Get-Content -Raw -LiteralPath $Review)
@@ -505,7 +505,7 @@ $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total ($passed.Count + $
 
 function Invoke-Report {
     param([int]$P1 = 0, [string]$GraphFile = '', [string]$PassedIds = 'TASK-01', [string]$StuckIds = '',
-          [string]$Ts = '2026-09-05 00:00:00', [switch]$BreakRequirements)
+          [string]$Ts = '2026-09-05 00:00:00', [switch]$BreakRequirements, [switch]$Skipped)
     $tag = [guid]::NewGuid().ToString('N').Substring(0, 6)
     $result = Join-Path $box "result-$tag.json"
     $argv = @('-RunAll', $runAll, '-Root', $reportProj,
@@ -513,6 +513,7 @@ function Invoke-Report {
               '-P1', $P1, '-GraphFile', $GraphFile, '-Result', $result,
               '-PassedIds', $PassedIds, '-StuckIds', $StuckIds, '-Ts', $Ts)
     if ($BreakRequirements) { $argv += '-BreakRequirements' }
+    if ($Skipped) { $argv += '-AcceptanceSkipped' }
     & pwsh -NoProfile -NonInteractive -File $reportRunner @argv *> $null
     if (-not (Test-Path -LiteralPath $result)) { throw "Emit-RunAllReport не отработал (нет $result)" }
     $r = Get-Content -Raw -LiteralPath $result | ConvertFrom-Json
@@ -775,6 +776,258 @@ It 'совещательная находка ревью печатается с
     # И владелец ракурса едет вместе с находкой: иначе спросить по ней некого.
     Assert-Match $r.report 'отвечает лидер java' 'владелец блокирующего ракурса потерян'
     Assert-Match $r.prompt 'подпись мимо макета' 'узел сведения совещательных находок не видит'
+}
+
+# --- 4г. Ракурсов с текстом нет: приёмка не выполнялась, и прогон это говорит ---------------
+#
+# ПУТЬ, КОТОРОГО НЕ БЫЛО, ПОКА ТЕКСТЫ ЛЕЖАЛИ В ГРАФЕ. Вопросы критиков стояли строками
+# внутри queue.graph.ps1, и приёмка запускалась всегда. С переездом текстов в проект
+# появился набор ракурсов, у которых текста нет нигде: запись внешней рассылки правил
+# {"id":"java","owner":"лидер java","blocking":true,"file":".claude/agents/testers/java.md"}
+# при отсутствующем файле тестера даёт ноль промптов. Дальше молчание шло по всей цепочке:
+# $measure оставался $null, criticsRun и criticsFailed становились нулями, в отчёт уезжало
+# «P1 приёмки: 0», и прогон объявлял COMPLETE, ни разу никого не спросив. Оба конца цепочки
+# при этом выглядят исправно — ровно поэтому проверка стоит на всей цепочке целиком.
+#
+# Кусок графа вырезается разборщиком БОЛЬШИЙ, чем в 4б: от свода приёмки ($measure = $null,
+# то есть включая чтение config/review-lenses.json и сборку промптов) до return, который
+# читает graph.ps1. Позитивная половина — та же фикстура с текстом ракурса на месте: она
+# обязана давать COMPLETE, иначе красный цвет негативной половины не значит ничего.
+Write-Host ''
+Write-Host '4г. Ракурсов с текстом нет — прогон не называет себя готовым' -ForegroundColor White
+
+It 'отчёт при невыполненной приёмке не печатает COMPLETE' {
+    $r = Invoke-Report -P1 0 -Skipped
+    Assert-False $r.complete "приёмка не выполнялась, а отчёт объявил готовность:`n$($r.review)"
+    Assert-Match $r.review 'ПРИЁМКА НЕ ВЫПОЛНЯЛАСЬ'
+    Assert-True $r.statusObj.acceptance_skipped 'в машиночитаемом статусе нет признака невыполненной приёмки'
+}
+
+# Фикстуры. Обе зелёные во всём остальном: сквозной сценарий проходит, очередь закрыта,
+# задача одна. Разница ровно одна — есть ли в проекте текст того ракурса, который назван
+# в config/review-lenses.json.
+function New-LensProject {
+    param([string]$Name, [string]$CriticText = '')
+    $p = New-Project $Name
+    Set-Content -LiteralPath (Join-Path $p 'proof.txt') -Value 'доказательство' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $p 'config\journeys.json') -Encoding UTF8 -Value @'
+{ "command": "Write-Output 'J-01 зелёный'",
+  "journeys": [ { "id": "J-01", "title": "человек заводит запись", "proof": "proof.txt" } ] }
+'@
+    Set-Content -LiteralPath (Join-Path $p 'tasks\TASK-01-card.md') -Encoding UTF8 -Value @'
+# TASK-01 — карточка приёма
+
+**Требование:** 3.1.1
+
+## Файлы
+
+- `src/app.ts`
+'@
+    # Запись ровно того формата, который пишет внешняя рассылка правил: со ссылкой на файл
+    # тестера и лишним полем rules. Файла тестера в проекте нет, шаблона java.md в фабрике
+    # нет тоже — ракурс остаётся без текста.
+    Set-Lenses $p '[{"id":"java","owner":"лидер java","blocking":true,"file":".claude/agents/testers/java.md","rules":7}]'
+    if ($CriticText) { Set-Critic $p 'java' $CriticText }
+    return $p
+}
+
+$noLensProj  = New-LensProject 'nolens'
+$hasLensProj = New-LensProject 'haslens' "---`nname: java`n---`n`nМАРКЕР-ЯЗЫКОВОГО-РАКУРСА. Смотри на слитое дерево глазами лидера java."
+
+$noLensRunner = Join-Path $box 'run-acceptance-block.ps1'
+Set-Content -LiteralPath $noLensRunner -Encoding UTF8 -Value @'
+param([string]$FactoryHome, [string]$Graph, [string]$Root, [string]$Result, [string]$Fake = '')
+$ErrorActionPreference = 'Stop'
+$env:BCF_HOME = $FactoryHome
+$env:BCF_PROJECT_ROOT = $Root
+$env:BCF_MEMORY_DISABLED = '1'
+Remove-Item Env:\BCF_TEST_TRACE -ErrorAction SilentlyContinue
+if ($Fake) { $env:BCF_GRAPH_FAKE_AGENT = $Fake }
+
+. (Join-Path $FactoryHome 'harness\lib\bcf-context.ps1')
+. (Join-Path $FactoryHome 'harness\lib\agent-sandbox.ps1')
+. (Join-Path $FactoryHome 'harness\lib\fleet.ps1')
+. (Join-Path $FactoryHome 'harness\lib\claims.ps1')
+. (Join-Path $FactoryHome 'harness\lib\worktree.ps1')
+. (Join-Path $FactoryHome 'harness\lib\graph-runtime.ps1')
+. (Join-Path $FactoryHome 'harness\lib\graph-memory.ps1')
+. (Join-Path $FactoryHome 'harness\lib\critics.ps1')
+
+# Прогон настоящий: журнал, барьер и узлы те же, что в бою; подставной только исполнитель.
+$ctx = Initialize-GraphRun -Root $Root -Meta @{ name = 'приёмка'; description = 'проверка' } -MaxConcurrency 2
+
+$criticSchema = @{
+    type = 'object'; required = @('summary', 'findings')
+    properties = @{
+        summary  = @{ type = 'string' }
+        findings = @{ type = 'array'; items = @{
+            type = 'object'; required = @('severity', 'what', 'file')
+            properties = @{ severity = @{ type = 'string'; enum = @('P1', 'P2', 'P3') }
+                            what = @{ type = 'string' }; file = @{ type = 'string' }; line = @{ type = 'integer' } } } }
+    }
+}
+$gateFacts  = ''
+$criticTail = ''
+$passed = @('TASK-01')
+$stuck  = @()
+$tasks  = @('TASK-01')
+$root   = $Root
+
+# Кусок графа: от свода приёмки (чтение ракурсов и сборка промптов) до return, который
+# читает graph.ps1. Всё, что решает «выполнялась ли приёмка», исполняется кодом графа.
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Graph, [ref]$null, [ref]$null)
+$from = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+              $n.Left.Extent.Text -eq '$measure' -and $n.Right.Extent.Text -eq '$null' }, $true))[0]
+$ret = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and
+              $n.Extent.Text -match 'criticsRun' }, $true))[-1]
+if (-not $from) { throw 'в графе очереди нет свода приёмки ($measure = $null)' }
+if (-not $ret)  { throw 'в графе очереди нет return с полем criticsRun' }
+if ($ret.Extent.EndOffset -le $from.Extent.StartOffset) { throw 'блок приёмки в графе идёт задом наперёд' }
+$src = Get-Content -Raw -LiteralPath $Graph
+$region = $src.Substring($from.Extent.StartOffset, $ret.Extent.EndOffset - $from.Extent.StartOffset)
+
+$emitted = @(& ([scriptblock]::Create($region)))
+$out = @($emitted | Where-Object { $_ -is [hashtable] -and $_.ContainsKey('criticsRun') })[-1]
+if (-not $out) { throw 'вырезанный кусок графа не вернул итог прогона' }
+
+([ordered]@{
+    returned        = $out
+    complete        = [bool]$out.complete
+    criticsRun      = [int]$out.criticsRun
+    criticsExpected = [bool]$out.criticsExpected
+    review          = (Get-Content -Raw -LiteralPath (Join-Path $Root '.bcf\REVIEW.md'))
+    status          = (Get-Content -Raw -LiteralPath (Join-Path $Root '.bcf\run-all.status.json'))
+    journal         = (Get-Content -Raw -LiteralPath $ctx.Journal)
+} | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $Result -Encoding UTF8
+'@
+
+$script:acceptanceRuns = @{}
+function Invoke-AcceptanceBlock {
+    param([Parameter(Mandatory)][ValidateSet('пусто', 'есть-текст')][string]$Mode)
+    if ($script:acceptanceRuns.ContainsKey($Mode)) { return $script:acceptanceRuns[$Mode] }
+    $proj = if ($Mode -eq 'пусто') { $noLensProj } else { $hasLensProj }
+    $tag = [guid]::NewGuid().ToString('N').Substring(0, 6)
+    $result = Join-Path $box "acceptance-$tag.json"
+    & pwsh -NoProfile -NonInteractive -File $noLensRunner -FactoryHome $root `
+        -Graph (Join-Path $root 'harness\graphs\queue.graph.ps1') -Root $proj -Result $result -Fake $fakeAgent *> $null
+    if (-not (Test-Path -LiteralPath $result)) { throw "блок приёмки графа не отработал в режиме «$Mode» (нет $result)" }
+    $r = Get-Content -Raw -LiteralPath $result | ConvertFrom-Json
+    $r | Add-Member -NotePropertyName statusObj -NotePropertyValue ($r.status | ConvertFrom-Json)
+    $script:acceptanceRuns[$Mode] = $r
+    return $r
+}
+
+It 'ракурс без текста нигде — приёмка не выполнялась, и прогон не COMPLETE' {
+    $r = Invoke-AcceptanceBlock -Mode 'пусто'
+    Assert-Eq $r.criticsRun 0 'ракурс без текста всё-таки кого-то спросил'
+    Assert-True $r.criticsExpected 'граф не сказал наверх, что приёмка ожидалась'
+    Assert-False $r.complete "приёмку не выполнял никто, а прогон объявил готовность:`n$($r.review)"
+    Assert-Match $r.review 'ПРИЁМКА НЕ ВЫПОЛНЯЛАСЬ'
+    Assert-True $r.statusObj.acceptance_skipped 'в run-all.status.json нет признака невыполненной приёмки'
+    Assert-NoMatch $r.review 'Статус:\*\* COMPLETE' 'отчёт назвал готовым прогон, где не смотрел никто'
+}
+
+It 'о пропущенном ракурсе и о невыполненной приёмке сказано в журнале' {
+    # Две разные строки: первая объясняет ПОЧЕМУ (у ракурса java нет текста), вторая
+    # называет последствие (смотреть было некому). Без второй читатель журнала видит
+    # предупреждение о ракурсе и зелёный итог рядом.
+    $r = Invoke-AcceptanceBlock -Mode 'пусто'
+    Assert-Match $r.journal 'ракурс java.*ракурс пропущен' 'журнал молчит о ракурсе без текста'
+    Assert-Match $r.journal 'приёмка НЕ ВЫПОЛНЯЛАСЬ' 'журнал не назвал невыполненную приёмку'
+}
+
+It 'та же фикстура с текстом ракурса приёмку выполняет и объявляет COMPLETE' {
+    # Позитивная половина. Без неё «не COMPLETE» доказывало бы что угодно: сломанную
+    # фикстуру, красный сценарий, незакрытую очередь.
+    $r = Invoke-AcceptanceBlock -Mode 'есть-текст'
+    Assert-Eq $r.criticsRun 1 'ракурс с текстом в проекте не запустился'
+    Assert-True $r.criticsExpected
+    Assert-True $r.complete "приёмка прошла чисто, а прогон не объявил готовность:`n$($r.review)"
+    Assert-Match $r.review 'Статус:\*\* COMPLETE'
+    Assert-False $r.statusObj.acceptance_skipped 'выполненная приёмка помечена как невыполненная'
+}
+
+# ВЕРДИКТ ПЕЧАТАЕТ graph.ps1, А НЕ ГРАФ. Поля criticsExpected и criticsRun едут наверх, и
+# слово, которое увидит человек, выбирает цепочка вердикта в harness/graph.ps1. Пока эта
+# цепочка не исполнялась, «ок» поверх невыполненной приёмки не красил ни одну сюиту.
+# Цепочка вырезается из файла и гоняется на ТОМ ЖЕ объекте, который вернул граф выше.
+$verdictWordRunner = Join-Path $box 'run-verdict-word.ps1'
+Set-Content -LiteralPath $verdictWordRunner -Encoding UTF8 -Value @'
+# $OutFile, а не $Result: имена переменных в PowerShell нечувствительны к регистру, и
+# $result — имя, под которым цепочка вердикта в graph.ps1 читает возврат графа. Параметр
+# $Result здесь молча перетирался разобранным объектом, и вырезанный кусок отрабатывал
+# в пустоту.
+param([string]$GraphPs1, [string]$Returned, [string]$OutFile)
+$ErrorActionPreference = 'Stop'
+
+# Ровно то, что граф вернул наверх: объект читается из файла, а не собирается тестом.
+$result = Get-Content -Raw -LiteralPath $Returned | ConvertFrom-Json
+$failed = $false
+$ctx = [pscustomobject]@{ DryPlan = $false }
+
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($GraphPs1, [ref]$null, [ref]$null)
+$from = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+              $n.Left.Extent.Text -eq '$verdict' }, $true))[0]
+$to = @($ast.FindAll({
+    param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+              $n.Left.Extent.Text -eq '$journalRel' }, $true))[0]
+if (-not $from) { throw 'в graph.ps1 не найдено начало цепочки вердикта ($verdict)' }
+if (-not $to)   { throw 'в graph.ps1 не найден конец цепочки вердикта ($journalRel)' }
+$src = Get-Content -Raw -LiteralPath $GraphPs1
+$region = $src.Substring($from.Extent.StartOffset, $to.Extent.StartOffset - $from.Extent.StartOffset)
+
+. ([scriptblock]::Create($region))
+
+([ordered]@{ verdict = $verdict; code = $code; detail = $detail } | ConvertTo-Json) |
+    Set-Content -LiteralPath $OutFile -Encoding UTF8
+'@
+
+function Invoke-VerdictWord {
+    param([Parameter(Mandatory)]$Returned)
+    $tag = [guid]::NewGuid().ToString('N').Substring(0, 6)
+    $ret = Join-Path $box "returned-$tag.json"
+    $result = Join-Path $box "word-$tag.json"
+    ($Returned | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $ret -Encoding UTF8
+    & pwsh -NoProfile -NonInteractive -File $verdictWordRunner -GraphPs1 (Join-Path $root 'harness\graph.ps1') `
+        -Returned $ret -OutFile $result *> $null
+    if (-not (Test-Path -LiteralPath $result)) { throw 'цепочка вердикта graph.ps1 не отработала' }
+    return (Get-Content -Raw -LiteralPath $result | ConvertFrom-Json)
+}
+
+It 'прогон без единого смотревшего ракурса не называется «ок»' {
+    $v = Invoke-VerdictWord -Returned (Invoke-AcceptanceBlock -Mode 'пусто').returned
+    Assert-Eq $v.verdict 'ПРИЁМКА НЕ ВЫПОЛНЕНА' 'вердикт назвал зелёным прогон, где приёмку не выполнял никто'
+    Assert-Eq $v.code 1 'невыполненная приёмка ушла нулевым кодом возврата'
+    Assert-Match $v.detail 'ракурс' 'вердикт не объяснил, чего не хватило'
+}
+
+It 'прогон с выполненной приёмкой остаётся «ок»' {
+    # Негативная половина той же цепочки: новое условие не имеет права красить всё подряд.
+    $v = Invoke-VerdictWord -Returned (Invoke-AcceptanceBlock -Mode 'есть-текст').returned
+    Assert-Eq $v.verdict 'ок' "чистая приёмка уронила вердикт: $($v.detail)"
+    Assert-Eq $v.code 0
+}
+
+It 'ревью без единого ракурса с текстом тоже поднимает наверх два поля' {
+    # Тот же дефект жил во втором графе: return с одним полем findings читался graph.ps1 как
+    # «посмотрели и не нашли». Читается разборщиком, а не грепом: берутся именно поля
+    # возвращаемого объекта на пути «ракурсов с текстом нет».
+    $graph = Join-Path $root 'harness\graphs\review.graph.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($graph, [ref]$null, [ref]$null)
+    $ret = @($ast.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.ReturnStatementAst] -and
+                  $n.Extent.Text -match 'ракурсы не заданы' }, $true))[0]
+    Assert-True $ret 'в графе ревью нет возврата на пути «ракурсов с текстом нет»'
+    $text = $ret.Extent.Text
+    Assert-Match $text 'criticsExpected\s*=\s*\$true' 'ревью не говорит наверх, что ракурсы ожидались'
+    Assert-Match $text 'criticsRun\s*=\s*0' 'ревью не говорит наверх, что не смотрел никто'
+    # И тот же объект, пропущенный через цепочку вердикта graph.ps1, зелёным не звучит.
+    $v = Invoke-VerdictWord -Returned ([pscustomobject]@{ findings = 0; criticsExpected = $true; criticsRun = 0
+                                                          criticsReason = 'ракурсы ревью не заданы' })
+    Assert-Eq $v.verdict 'ПРИЁМКА НЕ ВЫПОЛНЕНА' 'ревью без ракурсов прошло как зелёный прогон'
 }
 
 # --- 5. Номера требований заказчика --------------------------------------------------------
