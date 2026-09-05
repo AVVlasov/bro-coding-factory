@@ -39,17 +39,53 @@ function Get-BcfStateDir {
 
 # Чьим именем харнесс коммитит.
 #
-# Пустой массив = у репозитория настроены user.name и user.email, и подменять их нельзя:
-# коммит заявки или отката должен читаться как коммит участника, а не как коммит
-# инструмента. Подставляем своё имя только там, где иначе git откажется коммитить вовсе —
-# на голой фикстуре и на машине без глобальной настройки.
+# ПОРЯДОК: `author.name`/`author.email` из config/harness.json (явная воля владельца
+# проекта — тот, кем должны подписываться коммиты фабрики, независимо от того, что
+# настроено в самом git) → user.name/user.email репозитория (пустой массив: коммит
+# заявки, слияния или отката читается как коммит участника, а не инструмента) →
+# `bcf`/`bcf@local` там, где иначе git откажется коммитить вовсе — на голой фикстуре и
+# на машине без глобальной настройки.
 function Get-BcfGitIdentityArgs {
     param([Parameter(Mandatory)][string]$Root)
+    $cfgN = ''; $cfgE = ''
+    try {
+        $cfgFile = Join-Path $Root 'config\harness.json'
+        if (Test-Path $cfgFile) {
+            $cfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+            if ($cfg.author -and $cfg.author.name)  { $cfgN = "$($cfg.author.name)".Trim() }
+            if ($cfg.author -and $cfg.author.email) { $cfgE = "$($cfg.author.email)".Trim() }
+        }
+    } catch { }
+    if ($cfgN -and $cfgE) { return @('-c', "user.name=$cfgN", '-c', "user.email=$cfgE") }
+
     $n = ''; $e = ''
     try { $n = (& git -C $Root config user.name 2>$null | Out-String).Trim() } catch { }
     try { $e = (& git -C $Root config user.email 2>$null | Out-String).Trim() } catch { }
     if ($n -and $e) { return @() }
     return @('-c', 'user.name=bcf', '-c', 'user.email=bcf@local')
+}
+
+# Версия фабрики — печатается в каждый вердикт (factory_version:), чтобы разбор дефекта
+# видел, каким движком задача была проверена. Не полагаемся на src/lib/paths.ps1
+# (CLI-слой): harness обязан работать и без него, при ручном запуске verify.ps1.
+function Get-BcfFactoryVersion {
+    $f = Join-Path (Get-BcfHomeRoot) 'VERSION'
+    if (Test-Path -LiteralPath $f) { return (Get-Content -Raw -LiteralPath $f).Trim() }
+    return '0.0.0-dev'
+}
+
+# Короткий отпечаток содержимого файла — 12 hex-символов sha256, тот же формат, что уже
+# используют межпроцессные замки доски задач. Пустая строка — файла нет, путь пуст или
+# не прочитался: вызывающий решает, что это значит для него самого (для графа — «прогон
+# шёл не по графу, хэшировать нечего»).
+function Get-BcfFileHash {
+    param([AllowEmptyString()][string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+        return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLower().Substring(0, 12)
+    } catch { return '' }
 }
 
 # Корень движка (фабрика/harness). Нужен, когда узел графа или планировщик запускает

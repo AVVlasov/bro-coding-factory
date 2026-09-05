@@ -203,6 +203,11 @@ Set-GraphVar generated   $generated
 Set-GraphVar mergeChecks $mergeChecks
 Set-GraphVar perTaskMax  $perTaskMax
 Set-GraphVar root        $root
+# Модель и бэкенд ЦИКЛА (не graph.roles.worker: коммит кодовой работы делает
+# harness/loop.ps1 внутри Invoke-CommandNode, а он берёт agent.command/models.code, а не
+# роли графа) — только для трейлеров коммита «работа агента».
+Set-GraphVar codeModel   $(if ($cfg.models -and $cfg.models.code) { [string]$cfg.models.code } else { '' })
+Set-GraphVar codeBackend $(if ($cfg.agent -and $cfg.agent.adapter) { [string]$cfg.agent.adapter } else { '' })
 
 $done = @{}
 $passed = @()
@@ -315,7 +320,10 @@ while ($true) {
             # Ветка с коммитом стоит ничего, а восстановить из неё можно всё; обратное
             # неверно. Слияние по-прежнему делается только по PASS.
             & git -C $wt add -A 2>&1 | Out-Null
-            & git -C $wt -c user.name=ralph -c user.email=ralph@local commit -m "${task}: работа агента" 2>&1 | Out-Null
+            $wid = Get-BcfGitIdentityArgs -Root $wt
+            $wmsg = New-BcfCommitMessage -Subject "${task}: работа агента" -Task $task -RunId (Get-GraphRunId) `
+                        -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
+            & git -C $wt @wid commit -m $wmsg 2>&1 | Out-Null
 
             $vf = Join-Path $wt "tasks\.verdicts\$task.md"
             $isPass = (Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
@@ -401,7 +409,8 @@ while ($true) {
                 # коммит, каким бы он ни был: в общую ветку между слиянием и проверками
                 # успевает приехать чужая работа.
                 $beforeMerge = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
-                $m = Merge-TaskWorktree -Root $root -Task $task -GeneratedFiles (Get-GraphVar generated) -KeepConflictForArbiter
+                $m = Merge-TaskWorktree -Root $root -Task $task -GeneratedFiles (Get-GraphVar generated) -KeepConflictForArbiter `
+                        -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
 
                 if (-not $m.Ok -and $m.Kind -eq 'conflict-open') {
                     # АРБИТР. Ему намеренно не дают роль автора ни одной из сторон:
@@ -420,7 +429,9 @@ while ($true) {
   и напиши в конце ответа строку: НЕСОВМЕСТИМО: <в чём именно>.
 "@
                     Invoke-Node -Prompt $ap -Label "арбитр-$task" -Role arbiter -Recall -RecallScope 'merge' -WorkDir $root -TimeoutSec 1800 | Out-Null
-                    $c = Complete-ArbitratedMerge -Root $root -Task $task
+                    $arb = Resolve-GraphRole -Role 'arbiter'
+                    $c = Complete-ArbitratedMerge -Root $root -Task $task `
+                             -RunId (Get-GraphRunId) -Role 'arbiter' -Model $arb.Model -Backend $arb.Backend
                     if ($c.Ok) { $m = @{ Ok = $true; Kind = 'arbitrated'; Conflicts = @(); Message = $c.Message } }
                     else {
                         Undo-ArbitratedMerge -Root $root
@@ -429,6 +440,14 @@ while ($true) {
                 }
 
                 if (-not $m.Ok) {
+                    # CORE/NFR без файла приёмки — не «слияние не удалось» (это про
+                    # git-механику), а решение, которого ждёт человек. Текст обязан быть
+                    # ровно этой фразой: по ней needs_human и доска задач узнают затык,
+                    # который чинится не починкой кода, а `bcf task accept`.
+                    if ($m.Kind -eq 'needs-acceptance') {
+                        Write-GraphLog "$task — verdict PASS, но класс требует приёмки лидера: $($m.Message)"
+                        return @{ Task = $task; Ok = $false; Reason = $m.Message }
+                    }
                     $why = if ($m.Conflicts.Count) { "конфликт не сведён: $($m.Conflicts -join ', ')" }
                            elseif ($m.Kind -eq 'dirty-tree') { $m.Message }
                            else { "git отверг слияние: $((($m.Message -split "`r?`n") | Select-Object -First 2) -join ' ')" }

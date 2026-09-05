@@ -1,9 +1,10 @@
-# bcf task — работа с задачами: создать, объяснить, почему не идёт.
+# bcf task — работа с задачами: создать, объяснить, почему не идёт, принять.
 #
 #   bcf task new "<что сделать>"   создать файл задачи по шаблону
 #   bcf task new "<...>" --for Иван   то же, но задачу ведёт человек: фабрика её не берёт
 #   bcf task why <ID>              почему эта задача не может пойти в работу
 #   bcf task show <ID>             файл задачи, вердикт, разведка — одним экраном
+#   bcf task accept <ID> --as <имя> [--lens <ракурс>] [--note "..."]   приёмка лидером
 #
 # ЗАЧЕМ. Создание задачи — САМОЕ ЧАСТОЕ ежедневное действие: очередь не берётся из
 # воздуха. Делать это руками значит каждый раз вспоминать формат имени, обязательные
@@ -13,6 +14,12 @@
 #
 # `why` отвечает на второй по частоте вопрос. «Ждёт TASK-02» в списке — это ЧТО, а не
 # ПОЧЕМУ: дальше человек идёт смотреть вердикты, файлы и коллизии руками.
+#
+# `accept` — четвёртое действие с задачей, отдельное от трёх остальных: verdict: PASS
+# доказывает, что гейты зелёные, а не то, что задача решает нужную проблему верным
+# способом. Классы CORE и NFR (`Класс:` в шапке задачи, без строки — CORE) без файла
+# приёмки не продвигаются в integration.branch — см. Test-BcfTaskAcceptanceGate в
+# harness/lib/claims.ps1 и её вызов из Merge-TaskWorktree.
 
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
 . (Join-Path (Get-BcfHarness) 'lib\team-bus.ps1')
@@ -25,6 +32,9 @@ $project = $script:BcfProject
 # молча уезжает в чужой список, — тот же класс дефектов, что уже ловил тест про --project.
 $argv = @($script:BcfArgs)
 $forWhom = ''
+$asLeader = ''
+$lens = ''
+$note = ''
 $clean = @()
 for ($i = 0; $i -lt $argv.Count; $i++) {
     $a = [string]$argv[$i]
@@ -37,6 +47,33 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
             exit 2
         }
         $forWhom = $v
+        continue
+    }
+    if ($a -match '^--as=(.+)$') { $asLeader = $Matches[1]; continue }
+    if ($a -eq '--as') {
+        $i++
+        $v = if ($i -lt $argv.Count) { [string]$argv[$i] } else { '' }
+        if (-not $v -or $v.StartsWith('-')) {
+            Write-BcfFail 'у флага --as нет значения: bcf task accept TASK-03 --as Иван'
+            exit 2
+        }
+        $asLeader = $v
+        continue
+    }
+    if ($a -match '^--lens=(.+)$') { $lens = $Matches[1]; continue }
+    if ($a -eq '--lens') {
+        $i++
+        $v = if ($i -lt $argv.Count) { [string]$argv[$i] } else { '' }
+        if (-not $v -or $v.StartsWith('-')) { Write-BcfFail 'у флага --lens нет значения'; exit 2 }
+        $lens = $v
+        continue
+    }
+    if ($a -match '^--note=(.+)$') { $note = $Matches[1]; continue }
+    if ($a -eq '--note') {
+        $i++
+        $v = if ($i -lt $argv.Count) { [string]$argv[$i] } else { '' }
+        if (-not $v -or $v.StartsWith('-')) { Write-BcfFail 'у флага --note нет значения'; exit 2 }
+        $note = $v
         continue
     }
     $clean += $a
@@ -151,6 +188,50 @@ switch ($sub) {
     Write-Host ''
     Write-BcfNote "открыть: $path"
     Write-BcfNote "проверить: bcf task why $id"
+    Write-Host ''
+    exit 0
+}
+
+'accept' {
+    $id = ($rest | Select-Object -First 1)
+    if (-not $id) { Write-BcfFail 'нужен id: bcf task accept TASK-03 --as Иван'; exit 2 }
+    $id = $id.ToUpper()
+    if (-not $asLeader) { Write-BcfFail 'нужно имя лидера: bcf task accept TASK-03 --as Иван'; exit 2 }
+
+    $t = @(Get-AllTasks | Where-Object { $_.Id -eq $id }) | Select-Object -First 1
+    if (-not $t) { Write-BcfFail "задача $id не найдена в $tasksRel/"; exit 2 }
+    if (-not (Test-Path -LiteralPath $t.Verdict)) {
+        Write-BcfFail "у $id ещё нет вердикта ($verdictsRel/$id.md) — приёмка не на чем основана"
+        Write-BcfNote "сначала прогон: bcf run loop $id или bcf run queue"
+        exit 2
+    }
+
+    # sha самого файла вердикта, а не diff-отпечатка внутри него: приёмка привязывается к
+    # ТЕКСТУ, который лидер прочитал, — если вердикт перепишется (новый прогон, другой
+    # verdict/remediation), sha разойдётся, и это будет видно при следующем чтении.
+    $sha = (& git -C $project hash-object -- $t.Verdict 2>$null | Out-String).Trim()
+    if (-not $sha) { $sha = 'нет-git' }
+
+    $when = (Get-Date -Format 'o')
+    $body = ConvertTo-BcfAcceptanceText -TaskId $id -Leader $asLeader -Lens $lens -Note $note -VerdictSha $sha -When $when
+    $accDir = Get-BcfAcceptanceDir -Root $project
+    New-Item -ItemType Directory -Force -Path $accDir | Out-Null
+    $accPath = Join-Path $accDir "$id.md"
+    Set-Content -LiteralPath $accPath -Value $body -Encoding UTF8
+
+    $rel = ($accPath.Substring($project.Length).TrimStart('\', '/')) -replace '\\', '/'
+    $pub = Publish-BcfClaimChange -Root $project -Paths @($rel) -Message "${id}: приёмка — $asLeader"
+
+    Write-BcfTitle "ПРИЁМКА $id" $asLeader
+    Write-BcfOk $rel
+    Write-BcfNote "вердикт: $sha"
+    if ($lens) { Write-BcfNote "ракурс: $lens" }
+    if ($note) { Write-BcfNote "заметка: $note" }
+    if (-not $pub.Ok) {
+        Write-Host ''
+        Write-BcfWarn "файл записан, но не закоммичен: $($pub.Reason)"
+        Write-BcfNote 'закоммить руками — иначе приёмку не увидит второй участник команды.'
+    }
     Write-Host ''
     exit 0
 }
@@ -283,6 +364,22 @@ switch ($sub) {
         Write-BcfLine '  ВЕРДИКТ' 'White'
         Get-Content -LiteralPath $t.Verdict -TotalCount 20 | ForEach-Object { Write-BcfDim $_ }
     }
+
+    $class = Get-BcfTaskClass -TaskId $id -Root $project
+    if (Test-BcfTaskNeedsAcceptance -Class $class) {
+        Write-Host ''
+        Write-BcfLine "  ПРИЁМКА (класс $class)" 'White'
+        $accPath = Get-BcfAcceptancePath -TaskId $id -Root $project
+        if (Test-Path -LiteralPath $accPath) {
+            $acc = ConvertFrom-BcfAcceptanceText -Body (Get-Content -Raw -LiteralPath $accPath)
+            Write-BcfOk "принято: $($acc.Leader), $($acc.When)"
+            if ($acc.Lens) { Write-BcfDim "ракурс: $($acc.Lens)" }
+        } elseif ($t.Pass) {
+            Write-BcfWarn "ждёт приёмки лидера — bcf task accept $id --as <имя>"
+        } else {
+            Write-BcfDim 'приёмка потребуется после verdict: PASS'
+        }
+    }
     $research = Join-Path $tasksDir "$id.research.md"
     if (Test-Path $research) {
         Write-Host ''
@@ -294,7 +391,7 @@ switch ($sub) {
 
 default {
     Write-BcfFail $(if ($sub) { "неизвестная подкоманда: $sub" } else { 'нужна подкоманда' })
-    Write-BcfNote 'доступно: new "<название>" [--for <имя>] | why <ID> | show <ID>'
+    Write-BcfNote 'доступно: new "<название>" [--for <имя>] | why <ID> | show <ID> | accept <ID> --as <имя>'
     exit 2
 }
 }

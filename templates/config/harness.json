@@ -39,8 +39,15 @@
     "tasks": "tasks",
     "verdicts": "tasks/.verdicts",
     "claims": "tasks/.claims",
+    "acceptance": "tasks/.acceptance",
     "currentFocus": "tasks/CURRENT-FOCUS.md",
     "bugs": "tasks/.bugs"
+  },
+
+  "author": {
+    "$comment": "Кем подписываются коммиты, которые делает сама фабрика (слияния, вердикты, заявки, доска задач, приёмка). Пусто = user.name/user.email репозитория, а на голой фикстуре без них — bcf/bcf@local.",
+    "name": "",
+    "email": ""
   },
 
   "team": {

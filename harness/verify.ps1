@@ -67,6 +67,15 @@ Set-Location $root
 # обвязки и корень проекта через окружение: Start-Process наследует переменные процесса.
 # Без этого проверка TASK-46 падала не по делу — pwsh печатал usage-баннер вместо запуска.
 $env:BCF_HARNESS_ROOT = Get-BcfHarnessRoot
+
+# Версия фабрики и хэш файла графа — печатаются в КАЖДЫЙ вердикт (factory_version:,
+# graph_hash:), чтобы разбор дефекта видел, каким движком и по какому графу задача была
+# проверена, не поднимая журнал прогона (он живёт в .bcf/ и не переживает уборку
+# состояния — коммит с вердиктом переживает). graph_hash пуст для прогонов вне графа
+# (`bcf run loop`/`night`): гейт применялся не к файлу графа, а к линейному циклу.
+$FactoryVersion = Get-BcfFactoryVersion
+$GraphHash = Get-BcfFileHash -Path $env:BCF_GRAPH_FILE
+$GraphHashLine = if ($GraphHash) { $GraphHash } else { '-' }
 if (-not $env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT = $root }
 
 # --- Harness config (config/harness.json + config/agents.json) — источник специфики. ---
@@ -1238,6 +1247,8 @@ date: $today
 diff_fingerprint: $fp
 diff_base: $diffBase$(if ($explicitBase) { ' (задана человеком: приёмка уже приземлившейся работы)' })
 verified_by: harness/verify.ps1 — Фазы C-E (всё через opencode; кодинг/тестеры/судья — $Model, vision — $VisionModel, судья — $JudgeModel)
+factory_version: $FactoryVersion
+graph_hash: $GraphHashLine
 plan:
   testers: $($testers -join ', ')
   checks: $checksLine

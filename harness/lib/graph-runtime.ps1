@@ -83,6 +83,21 @@ function Initialize-GraphRun {
         $RunId = 'g_' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '_' + ([guid]::NewGuid().ToString('N').Substring(0, 6))
     }
 
+    # Файл графа, который в самом деле ведёт этот прогон (harness/graphs/queue.graph.ps1
+    # и т. п.) — печатается в каждый вердикт строкой graph_hash. $PSCommandPath внутри
+    # ЭТОЙ функции лексически указывает на graph-runtime.ps1 (файл, где функция описана),
+    # а не на вызывающий скрипт графа — это надо взять из стека вызовов. Кадр [1] это тот,
+    # кто физически вызвал Initialize-GraphRun: скрипт графа дот-сорсится в graph.ps1
+    # (harness/graph.ps1: `. $scriptPath`), и call stack по нему не путается, в отличие
+    # от $PSScriptRoot/$PSCommandPath.
+    $graphFile = ''
+    try {
+        $frames = @(Get-PSCallStack)
+        if ($frames.Count -gt 1 -and $frames[1].ScriptName -and $frames[1].ScriptName -match '\.graph\.ps1$') {
+            $graphFile = $frames[1].ScriptName
+        }
+    } catch { }
+
     $graphDir = Join-Path $Root ".bcf\graph\$RunId"
     if (-not (Test-Path $graphDir)) { New-Item -ItemType Directory -Force -Path $graphDir | Out-Null }
 
@@ -104,6 +119,7 @@ function Initialize-GraphRun {
     $script:GraphCtx = @{
         Root           = $Root
         RunId          = $RunId
+        GraphFile      = $graphFile
         Dir            = $graphDir
         Journal        = (Join-Path $graphDir 'journal.jsonl')
         Meta           = $Meta
@@ -141,6 +157,12 @@ function Initialize-GraphRun {
     if (-not $ReadOnly) {
         _GraphJournal @{ event = 'run-start'; runId = $RunId; name = $Meta.name; doctor = [bool]$Meta.doctor; resumeFrom = $ResumeFromRunId
                          concurrency = $MaxConcurrency; budget = $TokenBudget; dryPlan = [bool]$DryPlan }
+        # Наследуется дочерними процессами (Start-Process внутри Invoke-CommandNode,
+        # дальше — `& pwsh` внутри loop.ps1 до verify.ps1): так verify.ps1, запущенный на
+        # три уровня процессов ниже, узнаёт, каким графом он вызван, и печатает graph_hash
+        # в вердикт. Прогон вне графа (ralph loop/night без queue/review) эту переменную
+        # не трогает вовсе — она либо не выставлена, либо пуста от прошлого вызова.
+        $env:BCF_GRAPH_FILE = $graphFile
     }
     return $script:GraphCtx
 }

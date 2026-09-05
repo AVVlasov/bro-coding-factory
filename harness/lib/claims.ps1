@@ -267,6 +267,151 @@ function Test-TaskIsHuman {
     return [bool]($ex -and -not (Test-BcfExecutorIsFactory $ex))
 }
 
+# --- Класс задачи и приёмка лидером направления -----------------------------------------
+#
+# ЗАЧЕМ. verdict: PASS доказывает только то, что гейты задачи зелёные — то же самое, что
+# уже написано у Get-BcfExecutorFromText про исполнителя, только уровнем выше: не «фабрика
+# или человек ведёт задачу», а «может ли задача уехать в integration.branch сама, доказав
+# себя тестами, или нужен человек, который посмотрит на неё глазами». CORE (продуктовая
+# логика) и NFR (нефункциональные требования — безопасность, миграции, инфраструктура)
+# без такого взгляда не продвигаются: тесты доказывают то, что написано в них, а не то,
+# что задача решает нужную проблему правильным способом. GEN (генерируемое: доки, шаблоны,
+# перенос) минует приёмку — там сама природа работы такая, что смотреть особо не на что.
+#
+# Формат — строка «Класс: CORE|NFR|GEN» В ШАПКЕ задачи, тем же способом, что и
+# «Исполнитель:»/«Блокер:»: между заголовком «# TASK-NN» и первой секцией «## ». Без
+# строки класс — CORE: молчание не означает «эта работа не важна», это означало бы
+# обратное тому, что нужно, — задача без объявленного класса получила бы самый мягкий
+# режим по умолчанию.
+$script:BcfTaskClasses = @('CORE', 'NFR', 'GEN')
+
+function Get-BcfTaskClassFromText {
+    param([string]$Body)
+    $header = Get-BcfTaskHeader -Body $Body
+    if (-not $header) { return 'CORE' }
+    $m = [regex]::Match($header, '(?im)^[ \t]*(?:[-*][ \t]+)?\*{0,2}[ \t]*Класс[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if (-not $m.Success) { return 'CORE' }
+    $v = $m.Groups[1].Value.Trim().Trim('*').Trim().Trim('`').Trim().ToUpperInvariant()
+    if ($script:BcfTaskClasses -contains $v) { return $v }
+    return 'CORE'
+}
+
+# $null, если у задачи вообще нет файла — отличие важно: гейт приёмки ниже обязан молчать
+# про задачу, которой не существует, а не объявлять её CORE и требовать приёмку на пустом
+# месте (это сломало бы каждый юнит-тест Merge-TaskWorktree, который зовёт её без единого
+# файла задачи в фикстуре).
+function Get-BcfTaskClass {
+    param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
+    $tasksDir = Get-BcfTasksDir -Root $Root
+    $tf = Get-ChildItem $tasksDir -Filter "$TaskId-*.md" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $tf) { return $null }
+    $body = Get-Content -Raw -LiteralPath $tf.FullName -ErrorAction SilentlyContinue
+    return (Get-BcfTaskClassFromText -Body ([string]$body))
+}
+
+$script:AcceptanceDirCache = @{}
+
+# Каталог приёмок — из конфига, как каталог задач и заявок: проект вправе назвать его
+# иначе. Файл `tasks/.acceptance/<TASK>.md` едет в git тем же способом, что вердикт и
+# заявка — приёмку лидера обязана видеть вся команда, а не только тот, у кого она стояла
+# перед глазами.
+function Get-BcfAcceptanceDir {
+    param([string]$Root = '')
+    if (-not $Root) { $Root = Get-BcfProjectRoot }
+    if ($script:AcceptanceDirCache.ContainsKey($Root)) { return $script:AcceptanceDirCache[$Root] }
+    $rel = 'tasks/.acceptance'
+    try {
+        $cfgFile = Join-Path $Root 'config\harness.json'
+        if (Test-Path $cfgFile) {
+            $cfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
+            if ($cfg.paths -and $cfg.paths.acceptance) { $rel = [string]$cfg.paths.acceptance }
+        }
+    } catch { }
+    $dir = Join-Path $Root ($rel -replace '/', '\')
+    $script:AcceptanceDirCache[$Root] = $dir
+    return $dir
+}
+
+function Get-BcfAcceptancePath {
+    param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
+    return (Join-Path (Get-BcfAcceptanceDir -Root $Root) "$TaskId.md")
+}
+
+function Test-BcfTaskAccepted {
+    param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
+    return (Test-Path -LiteralPath (Get-BcfAcceptancePath -TaskId $TaskId -Root $Root))
+}
+
+function Test-BcfTaskNeedsAcceptance {
+    param([string]$Class)
+    return ($Class -eq 'CORE' -or $Class -eq 'NFR')
+}
+
+# ГЕЙТ ПРОДВИЖЕНИЯ. Возвращает @{ Ok; Class; Required; Reason }. Ok=$false ровно тогда,
+# когда класс требует приёмки и файла приёмки нет — это единственный отказ, вызывающий
+# (Merge-TaskWorktree) обязан читать как «сливать нельзя».
+#
+# БЕЗ ФАЙЛА ЗАДАЧИ ГЕЙТ НЕ ПРИМЕНИМ, И ЭТО НЕ ТО ЖЕ САМОЕ, ЧТО «КЛАСС CORE». Юнит-тесты
+# git-механики слияния (merge-integration.tests.ps1) зовут Merge-TaskWorktree по имени
+# ветки без единого файла задачи в фикстуре — если бы отсутствие файла тоже читалось как
+# CORE без приёмки, слияние перестало бы проходить везде, где сейчас проходит, и тесты
+# газовой механики стали бы тестами совсем другого гейта.
+function Test-BcfTaskAcceptanceGate {
+    param([Parameter(Mandatory)][string]$TaskId, [Parameter(Mandatory)][string]$Root)
+    $class = Get-BcfTaskClass -TaskId $TaskId -Root $Root
+    if ($null -eq $class) {
+        return @{ Ok = $true; Class = ''; Required = $false; Reason = 'файла задачи нет — гейт приёмки неприменим' }
+    }
+    if (-not (Test-BcfTaskNeedsAcceptance -Class $class)) {
+        return @{ Ok = $true; Class = $class; Required = $false; Reason = "класс $class приёмки не требует" }
+    }
+    if (Test-BcfTaskAccepted -TaskId $TaskId -Root $Root) {
+        return @{ Ok = $true; Class = $class; Required = $true; Reason = "класс $class принят лидером" }
+    }
+    return @{ Ok = $false; Class = $class; Required = $true; Reason = 'ждёт приёмки лидера' }
+}
+
+function ConvertTo-BcfAcceptanceText {
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string]$Leader,
+        [string]$Lens = '',
+        [string]$Note = '',
+        [Parameter(Mandatory)][string]$VerdictSha,
+        [string]$When = ''
+    )
+    if (-not $When) { $When = (Get-Date -Format 'o') }
+    $lines = @(
+        "# Приёмка $TaskId",
+        '',
+        "Лидер: $Leader",
+        "Когда: $When",
+        "Ракурс: $Lens",
+        "Заметка: $Note",
+        '',
+        "Вердикт: $VerdictSha",
+        ''
+    )
+    return ($lines -join "`n")
+}
+
+function ConvertFrom-BcfAcceptanceText {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return $null }
+    $leader = ''; $when = ''; $lens = ''; $note = ''; $sha = ''
+    $ml = [regex]::Match($Body, '(?im)^[ \t]*\*{0,2}[ \t]*Лидер[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if ($ml.Success) { $leader = $ml.Groups[1].Value.Trim() }
+    $mw = [regex]::Match($Body, '(?im)^[ \t]*\*{0,2}[ \t]*Когда[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if ($mw.Success) { $when = $mw.Groups[1].Value.Trim() }
+    $mr = [regex]::Match($Body, '(?im)^[ \t]*\*{0,2}[ \t]*Ракурс[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if ($mr.Success) { $lens = $mr.Groups[1].Value.Trim() }
+    $mn = [regex]::Match($Body, '(?im)^[ \t]*\*{0,2}[ \t]*Заметка[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if ($mn.Success) { $note = $mn.Groups[1].Value.Trim() }
+    $mv = [regex]::Match($Body, '(?im)^[ \t]*\*{0,2}[ \t]*Вердикт[ \t]*\*{0,2}[ \t]*:[ \t]*(.*?)[ \t]*$')
+    if ($mv.Success) { $sha = $mv.Groups[1].Value.Trim() }
+    return [pscustomobject]@{ Leader = $leader; When = $when; Lens = $lens; Note = $note; VerdictSha = $sha }
+}
+
 # --- Связность из истории: какие файлы ходят в коммитах вместе с данными ---
 #
 # Декларация врёт: агент правит scan.rs, а ломает main.rs, который его зовёт.

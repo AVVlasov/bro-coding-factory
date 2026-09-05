@@ -1,16 +1,180 @@
-# bcf report — итог одним экраном.
+# bcf report — итог одним экраном или выгрузка за месяц.
 #
 #   bcf report            последний прогон (граф или ночной цикл — что было позже)
 #   bcf report --last     то же явно
 #   bcf report <runId>    конкретный прогон графа
+#   bcf report --export <yyyy-MM>   docs/reports/<yyyy-MM>.md для заказчика
 #
 # ПРАВИЛО ЭТОГО ОТЧЁТА: «готово» звучит ТОЛЬКО при полностью закрытой очереди. Раньше
 # прогон всегда заканчивался словом «готово» — даже когда закрыто 13 задач из 19, и
 # человек, и вызывающий агент принимали неполный прогон за успешный.
+#
+# --export НЕ ПРИДУМЫВАЕТ ДАННЫЕ ЗА МЕСЯЦ, КОТОРОГО НЕ БЫЛО. Три источника, и каждый —
+# то же самое, что уже показывают bcf tasks / bcf cost, просто собранное по датам:
+# tasks/.verdicts/*.md (поле date:, независимо от того, цикл их написал или граф),
+# tasks/.acceptance/*.md (приёмка лидера) и журналы графа .bcf/graph/*/journal.jsonl
+# (часы и токены по узлам, названным именем задачи). Месяц без единого вердикта в этом
+# окне даёт честно пустой отчёт, а не строку из прошлого месяца, принятую за текущий.
 
 . (Join-Path $BcfRoot 'src\lib\journal.ps1')
 
 $project = $script:BcfProject
+
+# --- bcf report --export <yyyy-MM> -------------------------------------------------------
+$exportArgIdx = [array]::IndexOf(@($script:BcfArgs), '--export')
+$exportMonth = ''
+if ($exportArgIdx -ge 0) {
+    $exportMonth = if ($exportArgIdx + 1 -lt @($script:BcfArgs).Count) { [string]@($script:BcfArgs)[$exportArgIdx + 1] } else { '' }
+}
+foreach ($a in @($script:BcfArgs)) { if ($a -match '^--export=(.+)$') { $exportMonth = $Matches[1] } }
+
+if ($exportArgIdx -ge 0 -or $exportMonth) {
+    if ($exportMonth -notmatch '^\d{4}-\d{2}$') {
+        Write-BcfFail 'нужен месяц в формате yyyy-MM: bcf report --export 2026-09'
+        exit 2
+    }
+    . (Join-Path $BcfRoot 'src\lib\pricing.ps1')
+    . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
+    . (Join-Path (Get-BcfHarness) 'lib\team-bus.ps1')
+
+    $monthStart = [datetime]::ParseExact($exportMonth, 'yyyy-MM', [Globalization.CultureInfo]::InvariantCulture)
+    $monthEnd = $monthStart.AddMonths(1)
+
+    $cfg = $null
+    try { $cfg = Get-BcfHarnessConfig -Project $project } catch { }
+    $tasksRel = if ($cfg -and $cfg.paths -and $cfg.paths.tasks) { [string]$cfg.paths.tasks } else { 'tasks' }
+    $verdictsRel = if ($cfg -and $cfg.paths -and $cfg.paths.verdicts) { [string]$cfg.paths.verdicts } else { "$tasksRel/.verdicts" }
+    $verdictsDir = Join-Path $project ($verdictsRel -replace '/', '\')
+
+    # 1. Вердикты датой в этом месяце — тот же файл, что читает `bcf tasks`, только
+    # отфильтрованный полем date:, которое пишет verify.ps1 в каждый вердикт.
+    function Get-BcfVerdictSummary {
+        param([string]$Path)
+        $raw = Get-Content -Raw -LiteralPath $Path -ErrorAction SilentlyContinue
+        if (-not $raw) { return $null }
+        $verdict = ''; $date = ''
+        $mv = [regex]::Match($raw, '(?m)^verdict:\s*(\S+)')
+        if ($mv.Success) { $verdict = $mv.Groups[1].Value }
+        $md = [regex]::Match($raw, '(?m)^date:\s*(\d{4}-\d{2}-\d{2})')
+        if ($md.Success) { $date = $md.Groups[1].Value }
+        return [pscustomobject]@{ Verdict = $verdict; Date = $date }
+    }
+
+    $rows = @()
+    if (Test-Path $verdictsDir) {
+        foreach ($f in (Get-ChildItem $verdictsDir -Filter '*.md' -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $sum = Get-BcfVerdictSummary -Path $f.FullName
+            if (-not $sum -or -not $sum.Date) { continue }
+            $d = $null
+            try { $d = [datetime]::ParseExact($sum.Date, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+            if ($d -lt $monthStart -or $d -ge $monthEnd) { continue }
+            $rows += [pscustomobject]@{ Task = $f.BaseName; Verdict = $sum.Verdict; Date = $sum.Date; Accepted = ''; Hours = $null; Tokens = 0.0 }
+        }
+    }
+
+    # 2. Приёмка лидера — по тем же задачам.
+    foreach ($row in $rows) {
+        $accPath = Get-BcfAcceptancePath -TaskId $row.Task -Root $project
+        if (Test-Path -LiteralPath $accPath) {
+            $acc = ConvertFrom-BcfAcceptanceText -Body (Get-Content -Raw -LiteralPath $accPath -ErrorAction SilentlyContinue)
+            $accDate = ($acc.When -split 'T')[0]
+            $row.Accepted = "$($acc.Leader), $accDate".Trim(', ')
+        } else {
+            $row.Accepted = if (Test-BcfTaskNeedsAcceptance -Class (Get-BcfTaskClass -TaskId $row.Task -Root $project)) { 'ждёт приёмки' } else { '-' }
+        }
+    }
+
+    # 3. Часы и токены — из журналов графа, попавших в этот месяц. Задача, сделанная
+    # циклом (`bcf run loop`/`night`), в журнале графа не появляется вовсе: столбцы
+    # остаются "-", а не выдуманным нулём — ноль читается как «бесплатно и мгновенно».
+    $runs = @(Get-BcfRuns -Project $project | Where-Object { $_.Started -ge $monthStart -and $_.Started -lt $monthEnd })
+    $hoursByTask = @{}; $tokensByTask = @{}; $tokensByModel = @{}
+    foreach ($r in $runs) {
+        foreach ($n in $r.Nodes) {
+            $tid = Get-BcfTaskIdFromLabel -Label $n.Label
+            if ($tid) {
+                if (-not $hoursByTask.ContainsKey($tid))  { $hoursByTask[$tid] = 0.0 }
+                if (-not $tokensByTask.ContainsKey($tid)) { $tokensByTask[$tid] = 0.0 }
+                if ($n.Started -and $n.Finished) { $hoursByTask[$tid] += ($n.Finished - $n.Started).TotalHours }
+                $tokensByTask[$tid] += [double]$n.Tokens
+            }
+            if ($n.Model) {
+                if (-not $tokensByModel.ContainsKey($n.Model)) { $tokensByModel[$n.Model] = 0.0 }
+                $tokensByModel[$n.Model] += [double]$n.Tokens
+            }
+        }
+    }
+    foreach ($row in $rows) {
+        if ($hoursByTask.ContainsKey($row.Task))  { $row.Hours  = $hoursByTask[$row.Task] }
+        if ($tokensByTask.ContainsKey($row.Task)) { $row.Tokens = $tokensByTask[$row.Task] }
+    }
+
+    # Деньги — теми же функциями, что `bcf cost`: тариф по модели, честное «неизвестно»
+    # вместо нуля там, где бэкенд не сообщает токены или тарифа для модели нет.
+    $pricing = Get-BcfPricing -Project $project
+    $totalCost = 0.0; $anyUnknownCost = $false; $totalTokensAllRuns = 0.0
+    foreach ($m in $tokensByModel.Keys) {
+        $totalTokensAllRuns += $tokensByModel[$m]
+        $c = Get-BcfNodeCost -Pricing $pricing -Model $m -Tokens $tokensByModel[$m]
+        if ($null -eq $c) { $anyUnknownCost = $true } else { $totalCost += $c }
+    }
+
+    $reportsDir = Join-Path $project 'docs\reports'
+    New-Item -ItemType Directory -Force -Path $reportsDir | Out-Null
+    $reportPath = Join-Path $reportsDir "$exportMonth.md"
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add("# Отчёт фабрики — $exportMonth")
+    [void]$lines.Add('')
+    [void]$lines.Add("Сгенерировано ``bcf report --export $exportMonth`` — $(Get-Date -Format 'yyyy-MM-dd HH:mm').")
+    [void]$lines.Add('')
+
+    if (-not $rows.Count) {
+        [void]$lines.Add("За $exportMonth не найдено ни одного вердикта (``$verdictsRel/*.md``, поле ``date:``)")
+        [void]$lines.Add('и ни одного прогона графа (`.bcf/graph/*/journal.jsonl`) — фабрика в этом месяце')
+        [void]$lines.Add('либо не работала над проектом, либо работала до того, как в нём завели ' + '`config/harness.json`.')
+        [void]$lines.Add('')
+        [void]$lines.Add('Отчёт умышленно пуст: строка из другого месяца была бы неправдой о этом.')
+    } else {
+        [void]$lines.Add('## Задачи')
+        [void]$lines.Add('')
+        [void]$lines.Add('| задача | вердикт | приёмка | часы | токены |')
+        [void]$lines.Add('|---|---|---|---|---|')
+        $passCount = 0; $failCount = 0; $sumHours = 0.0; $anyHours = $false
+        foreach ($row in ($rows | Sort-Object Task)) {
+            if ($row.Verdict -eq 'PASS') { $passCount++ } elseif ($row.Verdict) { $failCount++ }
+            $hoursCell = if ($null -ne $row.Hours) { $anyHours = $true; $sumHours += $row.Hours; '{0:N1}' -f $row.Hours } else { '-' }
+            $tokensCell = if ($row.Tokens -gt 0) { '{0:N0}' -f $row.Tokens } else { '-' }
+            $verdictCell = if ($row.Verdict) { $row.Verdict } else { '-' }
+            [void]$lines.Add("| $($row.Task) | $verdictCell | $($row.Accepted) | $hoursCell | $tokensCell |")
+        }
+        [void]$lines.Add('')
+        [void]$lines.Add('## Итог за месяц')
+        [void]$lines.Add('')
+        [void]$lines.Add("- задач с вердиктом: $($rows.Count) (PASS $passCount, FAIL $failCount)")
+        [void]$lines.Add("- прогонов графа в периоде: $($runs.Count)")
+        [void]$lines.Add("- часов по журналу графа: $(if ($anyHours) { '{0:N1}' -f $sumHours } else { 'не измерено (задачи шли циклом, не графом)' })")
+        [void]$lines.Add("- токенов: $('{0:N0}' -f $totalTokensAllRuns)")
+        if ($pricing) {
+            $costLine = "- стоимость: $(Format-BcfMoney $totalCost $pricing.Currency) (тарифы от $($pricing.Updated))"
+            if ($anyUnknownCost) { $costLine += ' — часть моделей без тарифа не вошла в сумму' }
+            [void]$lines.Add($costLine)
+        } else {
+            [void]$lines.Add('- стоимость: тарифы не заданы (config/pricing.json) — только токены')
+        }
+    }
+    [void]$lines.Add('')
+
+    Set-Content -LiteralPath $reportPath -Value ($lines -join "`n") -Encoding UTF8
+
+    Write-BcfTitle "ОТЧЁТ ЗА МЕСЯЦ  $exportMonth" (Split-Path $project -Leaf)
+    Write-BcfOk (Get-BcfRelPath -Path $reportPath -Project $project)
+    if ($rows.Count) { Write-BcfNote "задач: $($rows.Count), прогонов графа: $($runs.Count)" }
+    else { Write-BcfWarn 'за месяц не найдено ни вердиктов, ни прогонов графа — отчёт честно пуст' }
+    Write-Host ''
+    exit 0
+}
+
 $runId = @($script:BcfArgs | Where-Object { $_ -notlike '-*' }) | Select-Object -First 1
 
 # Итог ночного прогона ищем и в новом каталоге, и в старом: проект, водивший харнесс

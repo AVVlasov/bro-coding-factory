@@ -9,6 +9,65 @@
 # claims.ps1 (допуск на старте). См. wiki/research/2026-07-26-parallel-agents-file-conflicts.md.
 
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
+# Гейт приёмки (Test-BcfTaskAcceptanceGate) и класс задачи живут в claims.ps1 — тот же
+# файл, что уже определяет «Исполнитель:»/«Блокер:» тем же способом чтения шапки задачи.
+# Подключаем здесь, а не полагаемся на порядок дот-сорсинга у вызывающего: тесты этого
+# файла (harness/tests/merge-integration.tests.ps1) дот-сорсят ТОЛЬКО worktree.ps1.
+. (Join-Path $PSScriptRoot 'claims.ps1')
+
+# --- ТРЕЙЛЕРЫ КОММИТОВ ПРОГОНА -----------------------------------------------------------
+#
+# ЗАЧЕМ. Коммит «TASK-07: работа агента» сам по себе не говорит, КАКОЙ прогон его сделал,
+# какой ролью узла и на какой модели/бэкенде: журнал прогона (.bcf/graph/<runId>/) живёт
+# рядом с состоянием и не переживает уборку `.bcf/`, а коммит в git остаётся навсегда.
+# Пять полей — минимум, достаточный чтобы восстановить обстоятельства коммита БЕЗ
+# журнала, когда разбор дефекта идёт спустя месяцы по одному только `git log`.
+function Format-BcfCommitTrailers {
+    param(
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '',
+        [string]$Model = '', [string]$Backend = ''
+    )
+    return @(
+        "Task: $Task"
+        "Run-Id: $RunId"
+        "Role: $Role"
+        "Model: $Model"
+        "Backend: $Backend"
+    ) -join "`n"
+}
+
+function New-BcfCommitMessage {
+    param(
+        [Parameter(Mandatory)][string]$Subject,
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '',
+        [string]$Model = '', [string]$Backend = ''
+    )
+    $trailers = Format-BcfCommitTrailers -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+    return "$Subject`n`n$trailers"
+}
+
+# Проверка ОБРАТНАЯ построению: сообщение обязано нести все пять трейлеров строкой
+# «Ключ: значение» — значение может быть пустым (бэкенд без роли, модель не сообщена),
+# важно само наличие ключа. Разбор дефекта, идущий по `git log`, не имеет права
+# наткнуться на коммит прогона без опознавательных полей — тогда узнать, чем он сделан,
+# можно только гадая.
+function Test-BcfCommitTrailers {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    $required = @('Task', 'Run-Id', 'Role', 'Model', 'Backend')
+    $missing = @()
+    foreach ($k in $required) {
+        if ($Message -notmatch "(?m)^$([regex]::Escape($k)):[ \t]?") { $missing += $k }
+    }
+    return @{ Ok = ($missing.Count -eq 0); Missing = @($missing) }
+}
+
+# То же самое, но на НАСТОЯЩЕМ коммите git, по sha — доказывает, что конкретный коммит
+# прогона несёт трейлеры, а не только что билдер их умеет строить.
+function Test-BcfCommitHasTrailers {
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Sha)
+    $msg = (& git -C $Root log -1 --format=%B $Sha 2>$null | Out-String)
+    return (Test-BcfCommitTrailers -Message $msg)
+}
 
 function Get-WorktreeRoot {
     param([Parameter(Mandatory)][string]$Root)
@@ -335,9 +394,23 @@ function Merge-TaskWorktree {
         # Не откатывать конфликтное слияние: оставить маркеры в дереве, чтобы их свёл
         # агент-арбитр. Вызывающий обязан затем позвать Complete-ArbitratedMerge
         # либо Undo-ArbitratedMerge — иначе дерево останется в состоянии MERGING.
-        [switch]$KeepConflictForArbiter
+        [switch]$KeepConflictForArbiter,
+        # Метаданные прогона — только для трейлеров коммита слияния. Пусто = коммит
+        # прежним `--no-edit`, без трейлеров: юнит-тесты этой функции зовут её без
+        # единого понятия о прогоне, и их поведение не должно от этого меняться.
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     $branch = "bcf/task/$Task"
+
+    # ПРИЁМКА ЛИДЕРОМ — ПЕРЕД ЛЮБЫМ КАСАНИЕМ GIT. CORE и NFR без файла приёмки
+    # (`tasks/.acceptance/<TASK>.md`) не продвигаются в текущую ветку интеграции: тесты
+    # доказывают, что написано в них, а не то, что задача решает нужную проблему
+    # правильным способом. GEN и задачи без класса (или вовсе без файла — гейт им не
+    # писан, см. Test-BcfTaskAcceptanceGate) идут дальше как раньше.
+    $gate = Test-BcfTaskAcceptanceGate -TaskId $Task -Root $Root
+    if (-not $gate.Ok) {
+        return @{ Ok = $false; Conflicts = @(); Kind = 'needs-acceptance'; Message = $gate.Reason }
+    }
 
     # Слияние в ГРЯЗНОЕ дерево git отвергает целиком: «Your local changes … would be
     # overwritten by merge». Конфликтных файлов при этом НЕТ (нет состояния U), и
@@ -425,7 +498,14 @@ function Merge-TaskWorktree {
         }
     }
 
-    $out = (& git -C $Root merge --no-ff --no-edit $branch 2>&1 | Out-String)
+    if ($RunId) {
+        $id = Get-BcfGitIdentityArgs -Root $Root
+        $msg = New-BcfCommitMessage -Subject "${Task}: слияние работы задачи" `
+                   -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        $out = (& git -C $Root @id merge --no-ff -m $msg $branch 2>&1 | Out-String)
+    } else {
+        $out = (& git -C $Root merge --no-ff --no-edit $branch 2>&1 | Out-String)
+    }
     if ($LASTEXITCODE -eq 0) {
         return @{ Ok = $true; Conflicts = @(); Kind = 'ok'; Message = $out.Trim() }
     }
@@ -452,7 +532,11 @@ function Merge-TaskWorktree {
 function Complete-ArbitratedMerge {
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$Task
+        [Parameter(Mandatory)][string]$Task,
+        # Метаданные прогона — только для трейлеров коммита. Пусто = коммит принимает
+        # готовое сообщение слияния (`--no-edit`) без трейлеров: сведение конфликта,
+        # позванное не из графа (руками, из другого оркестратора), не обязано их знать.
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     $left = @(& git -C $Root diff --name-only --diff-filter=U 2>$null |
               ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -474,7 +558,18 @@ function Complete-ArbitratedMerge {
         return @{ Ok = $false; Message = "в сведённых файлах остались маркеры конфликта: $($withMarkers -join ', ')" }
     }
     & git -C $Root add -A 2>&1 | Out-Null
-    $out = (& git -C $Root -c user.name=ralph -c user.email=ralph@local commit --no-edit 2>&1 | Out-String)
+    # Идентичность — из конфига проекта (author.*), иначе из git-конфига репозитория,
+    # только на голой фикстуре — bcf/bcf@local. Раньше здесь стояло намертво вшитое
+    # user.name=ralph — коммит арбитра подписывался ботом, даже когда владелец назвал
+    # себя в config/harness.json.
+    $id = Get-BcfGitIdentityArgs -Root $Root
+    if ($RunId) {
+        $msg = New-BcfCommitMessage -Subject "${Task}: слияние конфликта сведено арбитром" `
+                   -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        $out = (& git -C $Root @id commit -m $msg 2>&1 | Out-String)
+    } else {
+        $out = (& git -C $Root @id commit --no-edit 2>&1 | Out-String)
+    }
     if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Message = $out.Trim() } }
     return @{ Ok = $true; Message = $out.Trim() }
 }
