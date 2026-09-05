@@ -1,0 +1,659 @@
+# critics-in-project.tests.ps1 — ракурсы приёмки принадлежат проекту, а не движку.
+#
+#   pwsh tests/critics-in-project.tests.ps1
+#
+# ЧТО ЗДЕСЬ ДОКАЗЫВАЕТСЯ И ПОЧЕМУ ИМЕННО ЭТО.
+#
+# 1. Текст критика читается ИЗ ПРОЕКТА и доезжает до промпта узла. Пока тексты лежали
+#    строками внутри графа, приёмка чужого продукта шла вопросами, написанными под другой
+#    продукт: критик отвечал «указанные требования неприменимы» и сжигал треть круга.
+#    Проверяется не наличие файла, а то, что его текст оказался в промпте настоящего узла —
+#    через подставного исполнителя (BCF_GRAPH_FAKE_AGENT), то есть на настоящем барьере.
+#
+# 2. Подмена текста шаблоном фабрики ГРОМКАЯ. Молчаливый фолбэк читается как «проект
+#    настроен под себя», и разбор чужой приёмки начинается с поиска текста, которого в
+#    проекте нет. Негативная половина теста важнее позитивной: у ракурса, чей файл в
+#    проекте есть, предупреждения быть НЕ ДОЛЖНО.
+#
+# 3. Блокирующий ракурс роняет вердикт, совещательный — нет. Пока все ракурсы весили
+#    одинаково, ракурс, заведённый «посмотреть», ронял прогон наравне с требованием
+#    заказчика — и его переставали заводить. Проверяется на настоящем Emit-RunAllReport:
+#    слово COMPLETE и поле acceptance_p1, а не на счётчике внутри теста.
+#
+# 4. Номера требований заказчика разбираются из задачи. Зона чтения сужена намеренно, и
+#    негативные случаи (номер в блоке кода, строка под секцией) здесь главные: широкий
+#    разбор превратил бы столбец требований в мусор — задача с командой `pkg@3.1.1`
+#    объявила бы себя закрывающей требование 3.1.1.
+#
+# 5. Вердикт называет, чем он получен: версия фабрики и хэш файла графа.
+#
+# Ни одного обращения к модели: исполнитель узла подменён, отчёт считается headless.
+
+$ErrorActionPreference = 'Continue'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+$root = Split-Path $PSScriptRoot -Parent          # корень фабрики
+$bcf  = Join-Path $root 'bin\bcf.ps1'
+$runAll = Join-Path $root 'harness\run-all.ps1'
+$box = Join-Path ([IO.Path]::GetTempPath()) ("bcf-critics-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Force -Path $box | Out-Null
+
+# Фабрика и проект называются ЯВНО. Иначе тест читает шаблоны той установки, которая
+# прописана в окружении машины, и краснеет (или зеленеет) по чужим файлам.
+$env:BCF_HOME = $root
+$env:BCF_PROJECT_ROOT = $box
+$env:BCF_MEMORY_DISABLED = '1'
+
+. (Join-Path $root 'harness\lib\bcf-context.ps1')
+. (Join-Path $root 'harness\lib\agent-sandbox.ps1')
+. (Join-Path $root 'harness\lib\fleet.ps1')
+. (Join-Path $root 'harness\lib\claims.ps1')
+. (Join-Path $root 'harness\lib\worktree.ps1')
+. (Join-Path $root 'harness\lib\graph-runtime.ps1')
+. (Join-Path $root 'harness\lib\graph-memory.ps1')
+. (Join-Path $root 'harness\lib\critics.ps1')
+. (Join-Path $root 'harness\lib\requirement.ps1')
+
+$script:pass = 0
+$script:fail = 0
+
+function It {
+    param([string]$Name, [scriptblock]$Body)
+    try {
+        & $Body
+        $script:pass++
+        Write-Host "  ok   $Name" -ForegroundColor Green
+    } catch {
+        $script:fail++
+        Write-Host "  ПРОВАЛ  $Name" -ForegroundColor Red
+        Write-Host "      $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+}
+function Assert-True  { param($Cond, [string]$Msg = 'ожидалось истинное')  if (-not $Cond) { throw $Msg } }
+function Assert-False { param($Cond, [string]$Msg = 'ожидалось ложное')    if ($Cond) { throw $Msg } }
+function Assert-Eq {
+    param($Actual, $Expected, [string]$Msg = '')
+    if ("$Actual" -ne "$Expected") { throw ($(if ($Msg) { "$Msg. " } else { '' }) + "ждал «$Expected», получил «$Actual»") }
+}
+function Assert-Match {
+    param([string]$Text, [string]$Pattern, [string]$Msg = '')
+    if ($Text -notmatch $Pattern) {
+        throw ($(if ($Msg) { "$Msg. " } else { '' }) + "не нашёл /$Pattern/ в:`n" +
+               (($Text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 15) -join "`n"))
+    }
+}
+function Assert-NoMatch {
+    param([string]$Text, [string]$Pattern, [string]$Msg = '')
+    if ($Text -match $Pattern) { throw ($(if ($Msg) { "$Msg. " } else { '' }) + "нашёл /$Pattern/, а не должен был") }
+}
+
+function New-Project {
+    param([string]$Name)
+    $p = Join-Path $box $Name
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'config') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'tasks') | Out-Null
+    '{ "limits": { "agentConcurrency": 4 }, "timeouts": { "stepSec": 60, "silentSec": 30 } }' |
+        Set-Content -LiteralPath (Join-Path $p 'config\harness.json') -Encoding UTF8
+    return $p
+}
+function Set-Lenses {
+    param([string]$Project, [string]$Json)
+    Set-Content -LiteralPath (Join-Path $Project 'config\review-lenses.json') -Value $Json -Encoding UTF8
+}
+function Set-Critic {
+    param([string]$Project, [string]$Id, [string]$Body)
+    $d = Join-Path $Project '.claude\agents\critics'
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    Set-Content -LiteralPath (Join-Path $d "$Id.md") -Value $Body -Encoding UTF8
+}
+
+Write-Host ''
+Write-Host "  РАКУРСЫ В ПРОЕКТЕ   песочница: $box" -ForegroundColor Cyan
+
+# --- 1. Состав ракурсов ------------------------------------------------------------------
+Write-Host ''
+Write-Host '1. Состав ракурсов: умолчание фабрики и запись проекта' -ForegroundColor White
+
+$p1 = New-Project 'lenses'
+
+It 'без конфига берутся ракурсы приёмки по умолчанию' {
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-False $s.FromProject 'ракурсы объявлены проектными, хотя конфига нет'
+    Assert-Eq @($s.Lenses).Count 4
+    Assert-Eq (@($s.Lenses | ForEach-Object { $_.Id }) -join ',') 'invariants,seams,gates,journey'
+    Assert-True (@($s.Lenses | Where-Object { $_.Blocking }).Count -eq 4) 'умолчание перестало быть блокирующим'
+}
+
+It 'у ревью свой набор по умолчанию' {
+    $s = Get-BcfLenses -Root $p1 -Kind review
+    Assert-Eq (@($s.Lenses | ForEach-Object { $_.Id }) -join ',') 'correctness,failures,boundaries,gates,journey'
+}
+
+It 'запись внешней рассылки правил разобрана, лишние поля не мешают' {
+    Set-Lenses $p1 '[{"id":"java","owner":"лидер java","blocking":true,"file":".claude/agents/testers/java.md","rules":7}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-True $s.FromProject 'конфиг проекта не прочитан'
+    Assert-Eq @($s.Lenses).Count 1
+    Assert-Eq $s.Lenses[0].Id 'java'
+    Assert-Eq $s.Lenses[0].Owner 'лидер java'
+    Assert-Eq $s.Lenses[0].Blocking 'True'
+    Assert-Eq $s.Lenses[0].File '.claude/agents/testers/java.md'
+}
+
+It 'без поля blocking ракурс считается блокирующим' {
+    # Обратный дефолт молча снимал бы ракурс с вердикта: находки печатаются, прогон зелёный.
+    Set-Lenses $p1 '[{"id":"java","owner":"лидер java"}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq $s.Lenses[0].Blocking 'True'
+}
+
+It 'blocking:false делает ракурс совещательным' {
+    Set-Lenses $p1 '[{"id":"java","blocking":false}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq $s.Lenses[0].Blocking 'False'
+}
+
+It 'blocking понимается и строкой' {
+    Set-Lenses $p1 '[{"id":"a","blocking":"false"},{"id":"b","blocking":"да"}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq $s.Lenses[0].Blocking 'False'
+    Assert-Eq $s.Lenses[1].Blocking 'True'
+}
+
+It 'обёртка {"lenses": [...]} читается наравне с массивом' {
+    Set-Lenses $p1 '{"$comment":"пояснение","lenses":[{"id":"java"},{"id":"ui"}]}'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq @($s.Lenses).Count 2
+}
+
+It 'битый JSON не выключает приёмку молча' {
+    Set-Lenses $p1 '{ это не json'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-False $s.FromProject
+    Assert-Eq @($s.Lenses).Count 4 'после битого конфига не осталось ни одного ракурса'
+    Assert-Match ($s.Notes -join ' ') 'не разобран' 'о битом конфиге не сказано ни слова'
+}
+
+It 'запись без id пропущена, и сказано почему' {
+    Set-Lenses $p1 '[{"owner":"никто"},{"id":"gates"}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq @($s.Lenses).Count 1
+    Assert-Match ($s.Notes -join ' ') 'без id'
+}
+
+It 'дубль id берётся один раз' {
+    Set-Lenses $p1 '[{"id":"gates","owner":"первый"},{"id":"gates","owner":"второй"}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq @($s.Lenses).Count 1
+    Assert-Eq $s.Lenses[0].Owner 'первый'
+    Assert-Match ($s.Notes -join ' ') 'дважды'
+}
+
+It 'kind сужает ракурс до одного графа, а без kind ракурс идёт в оба' {
+    # Каждый ракурс — отдельный вызов агента на каждый круг. Один файл на два графа без
+    # области сделал бы приёмку дороже, чем она была до появления конфига.
+    Set-Lenses $p1 '[{"id":"seams","kind":"acceptance"},{"id":"failures","kind":"review"},{"id":"gates"}]'
+    Assert-Eq ((Get-BcfLenses -Root $p1 -Kind acceptance).Lenses.Id -join ',') 'seams,gates'
+    Assert-Eq ((Get-BcfLenses -Root $p1 -Kind review).Lenses.Id -join ',') 'failures,gates'
+}
+
+It 'непонятая область не выбрасывает ракурс молча' {
+    Set-Lenses $p1 '[{"id":"gates","kind":"кудато"}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-Eq @($s.Lenses).Count 1 'ракурс исчез из-за опечатки в необязательном поле'
+    Assert-Match ($s.Notes -join ' ') 'область'
+}
+
+It 'в конфиге только чужой граф — берутся умолчания, и об этом сказано' {
+    Set-Lenses $p1 '[{"id":"failures","kind":"review"}]'
+    $s = Get-BcfLenses -Root $p1 -Kind acceptance
+    Assert-False $s.FromProject
+    Assert-Eq @($s.Lenses).Count 4
+    Assert-Match ($s.Notes -join ' ') 'ни одного ракурса'
+}
+
+It 'шаблон фабрики не делает приёмку дороже умолчания' {
+    # Этот шаблон кладёт в проект `bcf install`, и после установки он становится ЕДИНСТВЕННЫМ
+    # источником состава. Без областей все семь ракурсов уехали бы в оба графа: приёмка
+    # 4 → 7 вызовов на круг, и подорожала бы она молча.
+    $tpl = Join-Path $root 'templates\config\review-lenses.json'
+    $a = Get-BcfLenses -Root $p1 -Kind acceptance -ConfigFile $tpl
+    $r = Get-BcfLenses -Root $p1 -Kind review     -ConfigFile $tpl
+    Assert-Eq ($a.Lenses.Id -join ',') 'invariants,seams,gates,journey'
+    Assert-Eq ($r.Lenses.Id -join ',') 'correctness,failures,boundaries,gates,journey'
+    Assert-True $a.FromProject 'шаблон не прочитан как состав проекта'
+    Assert-Eq (@($a.Notes).Count) 0 "разбор шаблона фабрики жалуется: $($a.Notes -join '; ')"
+}
+
+It 'каждому ракурсу шаблона есть текст в фабрике' {
+    # Иначе установка кладёт в проект состав, половина которого пропускается на прогоне
+    # со строкой «ракурс пропущен» — и приёмка тише, чем объявлена.
+    $tpl = Join-Path $root 'templates\config\review-lenses.json'
+    foreach ($k in @('acceptance', 'review')) {
+        foreach ($lens in @((Get-BcfLenses -Root $p1 -Kind $k -ConfigFile $tpl).Lenses)) {
+            $f = Join-Path $root "templates\claude\agents\critics\$($lens.Id).md"
+            Assert-True (Test-Path -LiteralPath $f) "ракурс $($lens.Id) объявлен в шаблоне конфига, а текста в фабрике нет"
+        }
+    }
+}
+
+# --- 2. Текст ракурса --------------------------------------------------------------------
+Write-Host ''
+Write-Host '2. Текст ракурса: файл проекта, шаблон фабрики, подстановки' -ForegroundColor White
+
+$p2 = New-Project 'text'
+Set-Critic $p2 'gates' "---`nname: gates`ndescription: служебная шапка`n---`n`nМАРКЕР-ПРОЕКТА-ГЕЙТЫ: смотри только на честность тестов."
+
+It 'текст берётся из файла проекта, YAML-шапка в промпт не едет' {
+    $lens = [pscustomobject]@{ Id = 'gates'; Owner = ''; Blocking = $true; File = ''; Ask = '' }
+    $t = Get-BcfCriticText -Lens $lens -Root $p2
+    Assert-Eq $t.Source 'проект'
+    Assert-Match $t.Text 'МАРКЕР-ПРОЕКТА-ГЕЙТЫ'
+    Assert-NoMatch $t.Text 'description:' 'служебная шапка роли уехала в вопрос критику'
+    Assert-Eq $t.Note '' 'о файле проекта предупреждать не о чем'
+}
+
+It 'файла в проекте нет — берётся шаблон фабрики, и это сказано вслух' {
+    $lens = [pscustomobject]@{ Id = 'seams'; Owner = ''; Blocking = $true; File = ''; Ask = '' }
+    $t = Get-BcfCriticText -Lens $lens -Root $p2
+    Assert-Eq $t.Source 'фабрика'
+    Assert-Match $t.Text 'СЕМАНТИКА СКЛЕЙКИ'
+    Assert-Match $t.Note 'шаблона фабрики'
+}
+
+It 'поле file указывает, откуда брать текст' {
+    $d = Join-Path $p2 '.claude\agents\testers'
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'java.md') -Value 'МАРКЕР-ТЕСТЕРА-JAVA' -Encoding UTF8
+    $lens = [pscustomobject]@{ Id = 'java'; Owner = ''; Blocking = $true; File = '.claude/agents/testers/java.md'; Ask = '' }
+    $t = Get-BcfCriticText -Lens $lens -Root $p2
+    Assert-Match $t.Text 'МАРКЕР-ТЕСТЕРА-JAVA'
+    Assert-Eq $t.Note ''
+}
+
+It 'подстановка прогона попадает в текст ракурса' {
+    $lens = [pscustomobject]@{ Id = 'invariants'; Owner = ''; Blocking = $true; File = ''; Ask = '' }
+    $t = Get-BcfCriticText -Lens $lens -Root $p2 -Values @{ INVARIANT_SOURCES = '- CLAUDE.md проекта' }
+    Assert-Match $t.Text 'CLAUDE.md проекта'
+    Assert-NoMatch $t.Text '\{\{INVARIANT_SOURCES\}\}' 'подстановка осталась плейсхолдером'
+}
+
+It 'нет ни файла, ни шаблона — ракурс объявлен без текста, а не выдуман' {
+    $lens = [pscustomobject]@{ Id = 'нетакого'; Owner = ''; Blocking = $true; File = ''; Ask = '' }
+    $t = Get-BcfCriticText -Lens $lens -Root $p2
+    Assert-Eq $t.Text ''
+    Assert-Match $t.Note 'ракурс пропущен'
+}
+
+It 'текст из конфига (поле ask) — последний источник' {
+    $lens = [pscustomobject]@{ Id = 'нетакого'; Owner = ''; Blocking = $true; File = ''; Ask = 'вопрос прямо из конфига' }
+    $t = Get-BcfCriticText -Lens $lens -Root $p2
+    Assert-Eq $t.Source 'конфиг'
+    Assert-Match $t.Text 'прямо из конфига'
+}
+
+# --- 3. Промпт настоящего узла -----------------------------------------------------------
+Write-Host ''
+Write-Host '3. Критик из файла проекта попадает в промпт узла (подставной исполнитель)' -ForegroundColor White
+
+$fakeAgent = Join-Path $box 'fake-agent.ps1'
+@'
+function Get-FakeAgentReply {
+    param([string]$Prompt, [string]$Label)
+
+    # Промпт узла складывается на диск: только так видно, ЧТО реально доехало до агента.
+    if ($env:BCF_TEST_TRACE) {
+        $safe = ($Label -replace '[\\/:*?"<>|]', '_')
+        $mtx = New-Object System.Threading.Mutex($false, 'Global\bcf-critics-trace')
+        [void]$mtx.WaitOne(10000)
+        try { Set-Content -LiteralPath (Join-Path $env:BCF_TEST_TRACE "$safe.txt") -Value $Prompt -Encoding UTF8 }
+        finally { $mtx.ReleaseMutex(); $mtx.Dispose() }
+    }
+
+    if ($Prompt -match 'МОЛЧУ-В-ОТВЕТ') { return @{ Fail = 'подставной отказ' } }
+    if ($Prompt -match 'НАЙДИ-ДЕФЕКТ') {
+        return @{ Tokens = 7; Text = '{"summary":"смотрел код","findings":[{"severity":"P1","what":"оператор не может записать пациента","file":"src/app.ts","line":10}]}' }
+    }
+    return @{ Tokens = 5; Text = '{"summary":"смотрел код","findings":[]}' }
+}
+'@ | Set-Content -LiteralPath $fakeAgent -Encoding UTF8
+$env:BCF_GRAPH_FAKE_AGENT = $fakeAgent
+
+$criticSchema = @{
+    type = 'object'; required = @('summary', 'findings')
+    properties = @{
+        summary  = @{ type = 'string' }
+        findings = @{ type = 'array'; items = @{
+            type = 'object'; required = @('severity', 'what', 'file')
+            properties = @{ severity = @{ type = 'string'; enum = @('P1', 'P2', 'P3') }
+                            what = @{ type = 'string' }; file = @{ type = 'string' }; line = @{ type = 'integer' } } } }
+    }
+}
+
+$p3 = New-Project 'prompt'
+$trace = Join-Path $p3 'trace'
+New-Item -ItemType Directory -Force -Path $trace | Out-Null
+$env:BCF_TEST_TRACE = $trace
+Set-Critic $p3 'gates' "---`nname: gates`n---`n`nМАРКЕР-ПРОЕКТА-ГЕЙТЫ. Ищи тесты, которые ничего не проверяют."
+Set-Lenses $p3 '[{"id":"gates","owner":"лидер java","blocking":true},{"id":"seams","owner":"","blocking":false}]'
+
+$ctx3 = Initialize-GraphRun -Root $p3 -Meta @{ name = 'т'; description = 'т' } -MaxConcurrency 4
+$set3 = Get-BcfLenses -Root $p3 -Kind acceptance
+$built3 = Build-BcfCriticPrompts -Lenses $set3.Lenses -Root $p3 `
+            -Header 'На слитом дереве закрыты задачи: TASK-01.' -Tail 'ФАКТЫ-ОБВЯЗКИ: проверки уже выполнены.'
+$ans3 = @(Invoke-BcfCriticBarrier -Lenses $built3.Lenses -Prompts $built3.Prompts -LabelPrefix 'приёмка' -Schema $criticSchema)
+$journal3 = (Get-Content -Raw -LiteralPath $ctx3.Journal -Encoding UTF8)
+
+It 'текст критика из файла проекта доехал до промпта узла' {
+    $f = Join-Path $trace 'приёмка-gates-a1.txt'
+    Assert-True (Test-Path -LiteralPath $f) "узел приёмка-gates не запускался: в $trace нет его промпта"
+    Assert-Match (Get-Content -Raw -LiteralPath $f) 'МАРКЕР-ПРОЕКТА-ГЕЙТЫ' 'в промпт уехал не текст проекта'
+}
+
+It 'ракурсу без файла в проекте достался текст шаблона фабрики' {
+    $f = Join-Path $trace 'приёмка-seams-a1.txt'
+    Assert-True (Test-Path -LiteralPath $f)
+    Assert-Match (Get-Content -Raw -LiteralPath $f) 'СЕМАНТИКА СКЛЕЙКИ'
+}
+
+It 'подмена текста шаблоном фабрики записана в журнал прогона' {
+    Assert-Match $journal3 'seams.*шаблона фабрики' 'фолбэк на шаблон прошёл молча'
+}
+
+It 'у ракурса с файлом в проекте предупреждения нет' {
+    # Негативная половина: предупреждение «на всякий случай» обесценивает предупреждение.
+    Assert-NoMatch $journal3 'ракурс gates: в проекте нет' 'предупреждение выдано о файле, который в проекте есть'
+}
+
+It 'вес ракурса назван в самом промпте' {
+    Assert-Match (Get-Content -Raw -LiteralPath (Join-Path $trace 'приёмка-gates-a1.txt')) 'БЛОКИРУЮЩИЙ'
+    Assert-Match (Get-Content -Raw -LiteralPath (Join-Path $trace 'приёмка-seams-a1.txt')) 'совещательный'
+}
+
+It 'шапка и хвост прогона доехали вместе с ракурсом' {
+    $t = Get-Content -Raw -LiteralPath (Join-Path $trace 'приёмка-gates-a1.txt')
+    Assert-Match $t 'закрыты задачи: TASK-01'
+    Assert-Match $t 'ФАКТЫ-ОБВЯЗКИ'
+}
+
+It 'ответы вернулись по схеме, а не прозой' {
+    Assert-Eq @($ans3).Count 2
+    Assert-True ($null -ne $ans3[0].PSObject.Properties['findings']) 'схема до узла не доехала'
+}
+
+It 'несоответствие ракурсов и промптов — отказ, а не тихий сдвиг' {
+    # Соответствие «ракурс → ответ» держится на порядке: разъехавшись на один, оно повесит
+    # находки блокирующего ракурса на совещательный, и вердикт станет считаться не по тому.
+    $err = ''
+    try {
+        Invoke-BcfCriticBarrier -Lenses @($built3.Lenses) -Prompts @($built3.Prompts[0]) -LabelPrefix 'приёмка'
+    } catch { $err = $_.Exception.Message }
+    Assert-Match $err 'соответствие' 'сдвиг ракурсов прошёл молча'
+}
+
+It 'граф подключает библиотеку ракурсов и называет свой файл' {
+    # Оба графа зовут Get-BcfLenses и Invoke-BcfCriticBarrier; выпадет эта строка — оба
+    # упадут на первом же прогоне приёмки, а тест на текст ракурса этого не заметит.
+    $g = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\graph.ps1')
+    Assert-Match $g 'lib\\critics\.ps1' 'graph.ps1 не подключает harness/lib/critics.ps1'
+    Assert-Match $g 'BCF_GRAPH_FILE' 'граф не сообщает потомкам, каким файлом он гоняется'
+}
+
+# --- 4. Вес ракурса: блокирующий и совещательный ------------------------------------------
+Write-Host ''
+Write-Host '4. Блокирующий ракурс роняет вердикт, совещательный — нет' -ForegroundColor White
+
+function New-Answer {
+    param([string]$Severity = 'P1', [string]$What = 'оператор не может записать пациента')
+    return ('{"summary":"смотрел","findings":[{"severity":"' + $Severity + '","what":"' + $What + '","file":"src/app.ts","line":10}]}' | ConvertFrom-Json)
+}
+$empty = ('{"summary":"чисто","findings":[]}' | ConvertFrom-Json)
+$lensBlocking = [pscustomobject]@{ Id = 'gates';   Owner = 'лидер java'; Blocking = $true;  File = ''; Ask = '' }
+$lensAdvisory = [pscustomobject]@{ Id = 'journey'; Owner = 'аналитик';   Blocking = $false; File = ''; Ask = '' }
+
+It 'находка блокирующего ракурса считается блокирующей' {
+    $m = Measure-BcfAcceptance -Lenses @($lensBlocking, $lensAdvisory) -Answers @((New-Answer), $empty)
+    Assert-Eq $m.BlockingP1 1
+    Assert-Eq $m.AdvisoryP1 0
+    Assert-Eq @($m.Findings).Count 1
+    Assert-Eq $m.Findings[0].owner 'лидер java' 'владелец ракурса не доехал до находки'
+}
+
+It 'находка совещательного ракурса вердикт не трогает' {
+    $m = Measure-BcfAcceptance -Lenses @($lensBlocking, $lensAdvisory) -Answers @($empty, (New-Answer))
+    Assert-Eq $m.BlockingP1 0
+    Assert-Eq $m.AdvisoryP1 1
+    Assert-Eq @($m.Advisory).Count 1
+}
+
+It 'молчание блокирующего и молчание совещательного считаются раздельно' {
+    $m = Measure-BcfAcceptance -Lenses @($lensBlocking, $lensAdvisory) -Answers @($null, 'проза вместо JSON')
+    Assert-Eq $m.BlockingFailed 1
+    Assert-Eq $m.AdvisoryFailed 1
+    Assert-Eq @($m.Findings).Count 0 'из прозы получились находки'
+}
+
+It 'совещательная находка помечена в отчёте совещательной' {
+    $m = Measure-BcfAcceptance -Lenses @($lensBlocking, $lensAdvisory) -Answers @($empty, (New-Answer))
+    $body = Format-BcfAcceptanceReport -Measure $m -Merged 'TASK-01'
+    Assert-Match $body 'Совещательные ракурсы'
+    Assert-Match $body 'Блокирующих находок нет'
+    Assert-Match $body 'отвечает аналитик' 'владелец ракурса в отчёте не назван'
+}
+
+# Настоящий отчёт: слово COMPLETE и поле acceptance_p1 считает Emit-RunAllReport, а не тест.
+$reportProj = Join-Path $box 'report'
+New-Item -ItemType Directory -Force -Path (Join-Path $reportProj 'config') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $reportProj 'tasks') | Out-Null
+Set-Content -LiteralPath (Join-Path $reportProj 'proof.txt') -Value 'доказательство' -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $reportProj 'config\journeys.json') -Encoding UTF8 -Value @'
+{ "command": "Write-Output 'J-01 зелёный'",
+  "journeys": [ { "id": "J-01", "title": "человек заводит запись", "proof": "proof.txt" } ] }
+'@
+Set-Content -LiteralPath (Join-Path $reportProj 'tasks\TASK-01-card.md') -Encoding UTF8 -Value @'
+# TASK-01 — карточка приёма
+
+Требование: 3.1.1, ДКЦ1
+
+## Файлы
+
+- `src/app.ts`
+'@
+
+$reportRunner = Join-Path $box 'run-report.ps1'
+Set-Content -LiteralPath $reportRunner -Encoding UTF8 -Value @'
+param([string]$RunAll, [string]$Root, [string]$Review, [string]$Status, [int]$P1, [string]$GraphFile, [string]$Result)
+$ErrorActionPreference = 'Stop'
+$env:BCF_REPORT_LIB_ONLY = '1'
+$env:BCF_PROJECT_ROOT = $Root
+if ($GraphFile) { $env:BCF_GRAPH_FILE = $GraphFile } else { Remove-Item Env:\BCF_GRAPH_FILE -ErrorAction SilentlyContinue }
+. $RunAll -ProjectRoot $Root
+$rep = Emit-RunAllReport -Passed @('TASK-01') -Stuck @() -Total 1 -Root $Root `
+    -ReviewFile $Review -StatusFile $Status -Ts '2026-09-05 00:00:00' -AcceptanceP1 $P1
+([ordered]@{
+    complete = [bool]$rep.complete
+    review   = (Get-Content -Raw -LiteralPath $Review)
+    status   = (Get-Content -Raw -LiteralPath $Status)
+} | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $Result -Encoding UTF8
+'@
+
+function Invoke-Report {
+    param([int]$P1 = 0, [string]$GraphFile = '')
+    $tag = [guid]::NewGuid().ToString('N').Substring(0, 6)
+    $result = Join-Path $box "result-$tag.json"
+    & pwsh -NoProfile -NonInteractive -File $reportRunner -RunAll $runAll -Root $reportProj `
+        -Review (Join-Path $box "REVIEW-$tag.md") -Status (Join-Path $box "status-$tag.json") `
+        -P1 $P1 -GraphFile $GraphFile -Result $result *> $null
+    if (-not (Test-Path -LiteralPath $result)) { throw "Emit-RunAllReport не отработал (нет $result)" }
+    $r = Get-Content -Raw -LiteralPath $result | ConvertFrom-Json
+    $r | Add-Member -NotePropertyName statusObj -NotePropertyValue ($r.status | ConvertFrom-Json)
+    return $r
+}
+
+It 'P1 блокирующего ракурса отменяет COMPLETE' {
+    $r = Invoke-Report -P1 1
+    Assert-False $r.complete 'блокирующая находка не помешала объявить готовность'
+    Assert-Match $r.review 'ЕСТЬ P1 ПРИЁМКИ'
+    Assert-Eq $r.statusObj.acceptance_p1 1
+}
+
+It 'та же находка совещательного ракурса COMPLETE не отменяет' {
+    # Совещательный ракурс в вердикт не попадает — Emit-RunAllReport получает ноль P1.
+    $r = Invoke-Report -P1 0
+    Assert-True $r.complete "совещательная находка уронила вердикт:`n$($r.review)"
+    Assert-Match $r.review 'Статус:\*\* COMPLETE'
+}
+
+# --- 5. Номера требований заказчика --------------------------------------------------------
+Write-Host ''
+Write-Host '5. Номера требований: шапка, секция и то, что требованием НЕ является' -ForegroundColor White
+
+$taskHeader = @'
+# TASK-07 — карточка приёма
+
+Исполнитель: фабрика
+Требование: 3.1.1, ДКЦ1
+
+## Файлы
+
+- `src/app.ts`
+
+## Проверки
+
+```
+npm view pkg@9.9.9
+```
+'@
+
+$taskSection = @'
+# TASK-08 — расписание врача
+
+## Требования
+
+- **3.2.1** оператор видит расписание на неделю
+- **ДКЦ4** карточка открывается за два клика
+- обычный пункт без номера
+
+## Файлы
+
+- `src/schedule.ts`
+'@
+
+$taskNone = @'
+# TASK-09 — внутренний рефакторинг
+
+## Файлы
+
+- `src/util.ts`
+
+## Готовность
+
+1. Требование: 4.4.4 (строка ниже первой секции — не шапка)
+'@
+
+It 'строка в шапке: несколько номеров через запятую' {
+    $r = @(Get-BcfRequirementsFromText -Body $taskHeader)
+    Assert-Eq ($r -join ',') '3.1.1,ДКЦ1'
+}
+
+It 'номер из блока кода требованием не становится' {
+    # Без этого задача с командой `pkg@9.9.9` объявила бы себя закрывающей требование 9.9.9.
+    $r = @(Get-BcfRequirementsFromText -Body $taskHeader)
+    Assert-False ($r -contains '9.9.9') 'номер из блока кода уехал в требования'
+}
+
+It 'секция «## Требования»: жирные номера, остальное мимо' {
+    $r = @(Get-BcfRequirementsFromText -Body $taskSection)
+    Assert-Eq ($r -join ',') '3.2.1,ДКЦ4'
+}
+
+It 'задача без требований не выдумывает их' {
+    $r = @(Get-BcfRequirementsFromText -Body $taskNone)
+    Assert-Eq @($r).Count 0 "разобрано лишнее: $($r -join ',')"
+}
+
+It 'требования читаются из файла задачи по её id' {
+    $p5 = New-Project 'req'
+    Set-Content -LiteralPath (Join-Path $p5 'tasks\TASK-07-card.md') -Value $taskHeader -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $p5 'tasks\TASK-08-plan.md') -Value $taskSection -Encoding UTF8
+    Assert-Eq ((Get-TaskRequirements -TaskId 'TASK-07' -Root $p5) -join ',') '3.1.1,ДКЦ1'
+    Assert-Eq ((Get-TaskRequirements -TaskId 'TASK-08' -Root $p5) -join ',') '3.2.1,ДКЦ4'
+}
+
+It 'обратный разрез: требование → задачи, которые его закрывают' {
+    $tasks = @(
+        [pscustomobject]@{ Id = 'TASK-07'; Requirements = @('3.1.1', 'ДКЦ1') },
+        [pscustomobject]@{ Id = 'TASK-08'; Requirements = @('3.1.1') }
+    )
+    $ix = Get-BcfRequirementIndex -Tasks $tasks
+    Assert-Eq (@($ix['3.1.1']) -join ',') 'TASK-07,TASK-08'
+    Assert-Eq (@($ix['ДКЦ1']) -join ',') 'TASK-07'
+}
+
+It 'bcf tasks печатает колонку требований' {
+    $p6 = New-Project 'cli'
+    Set-Content -LiteralPath (Join-Path $p6 'tasks\TASK-07-card.md') -Value $taskHeader -Encoding UTF8
+    $out = & pwsh -NoProfile -File $bcf tasks --project $p6 2>&1 | Out-String
+    Assert-Match $out 'требования' 'в шапке таблицы нет колонки требований'
+    Assert-Match $out '3\.1\.1' 'номер требования не напечатан в строке задачи'
+    Assert-Match $out 'требований заказчика названо' 'счёт требований не показан'
+}
+
+It 'требования доезжают до отчёта прогона' {
+    $r = Invoke-Report -P1 0
+    Assert-Match $r.review 'Требования заказчика'
+    Assert-Match $r.review '3\.1\.1'
+}
+
+# --- 6. Чем получен вердикт ----------------------------------------------------------------
+Write-Host ''
+Write-Host '6. Вердикт называет версию фабрики и хэш файла графа' -ForegroundColor White
+
+It 'без графа так и сказано, а не пустая строка' {
+    $saved = $env:BCF_GRAPH_FILE
+    Remove-Item Env:\BCF_GRAPH_FILE -ErrorAction SilentlyContinue
+    try {
+        $lines = Get-BcfProvenanceLines
+        Assert-Match $lines[0] '^factory_version: \S'
+        Assert-Match $lines[1] 'graph_hash: нет'
+    } finally { if ($saved) { $env:BCF_GRAPH_FILE = $saved } }
+}
+
+It 'хэш считается по содержимому файла графа' {
+    $g = Join-Path $root 'harness\graphs\queue.graph.ps1'
+    $expected = (Get-FileHash -LiteralPath $g -Algorithm SHA256).Hash.ToLower().Substring(0, 12)
+    $lines = Get-BcfProvenanceLines -GraphFile $g
+    Assert-Match $lines[1] ([regex]::Escape($expected)) 'хэш в вердикте не совпадает с хэшем файла графа'
+    Assert-Match $lines[1] 'queue.graph.ps1'
+}
+
+It 'версия фабрики — из файла VERSION, а не выдумана' {
+    Assert-Eq (Get-BcfFactoryVersion) ((Get-Content -Raw -LiteralPath (Join-Path $root 'VERSION')).Trim())
+}
+
+It 'обе строки стоят в итоговом отчёте прогона' {
+    $g = Join-Path $root 'harness\graphs\queue.graph.ps1'
+    $r = Invoke-Report -P1 0 -GraphFile $g
+    Assert-Match $r.review 'factory_version:'
+    Assert-Match $r.review 'graph_hash:'
+    Assert-Eq $r.statusObj.factory_version ((Get-Content -Raw -LiteralPath (Join-Path $root 'VERSION')).Trim())
+    Assert-True ([string]$r.statusObj.graph_hash -match '^[0-9a-f]{12}$') "в статусе не хэш: «$($r.statusObj.graph_hash)»"
+}
+
+It 'вердикт задачи собирается с теми же строками' {
+    # Проводка: сам вердикт пишет verify.ps1 в конце полного прогона верификации, поэтому
+    # здесь проверяется, что строки провенанса стоят в его шапке, а не дописаны где-то ниже.
+    $src = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\verify.ps1')
+    Assert-Match $src '\$provenance = \(Get-BcfProvenanceLines\)' 'verify.ps1 не считает провенанс'
+    Assert-Match $src '(?s)verdict: \$verdict\r?\ndate: \$today\r?\n\$provenance' 'строк провенанса нет в шапке вердикта'
+}
+
+# --- Итог ----------------------------------------------------------------------------------
+Remove-Item Env:\BCF_GRAPH_FAKE_AGENT -ErrorAction SilentlyContinue
+Remove-Item Env:\BCF_TEST_TRACE -ErrorAction SilentlyContinue
+
+Write-Host ''
+Write-Host ("  ИТОГ: пройдено $script:pass, провалено $script:fail") -ForegroundColor $(if ($script:fail) { 'Red' } else { 'Green' })
+Write-Host ''
+if ($script:fail) { exit 1 }
+exit 0
