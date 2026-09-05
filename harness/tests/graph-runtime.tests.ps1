@@ -361,7 +361,7 @@ Check "активность: командный узел берёт послед
 # «↳ 94 lines :: <path>…STATE.json</path>» — узел якобы занят выводом длиной 94 строки.
 Set-Content -LiteralPath (Join-Path $ndir 'узел-res.cmd.out.txt') -Encoding UTF8 -Value @(
     '[20:27:35] → bash  Проверяю сборку  ::  cargo check --workspace',
-    '  ↳ 94 lines  ::  <path>D:\develop\bro-game-cheat\.bcf\state\STATE.json</path>')
+    '  ↳ 94 lines  ::  <path>C:\projects\demo\.bcf\state\STATE.json</path>')
 $a = _GraphNodeActivity ([pscustomobject]@{ Out = 'узел-res'; Kind = 'command' })
 Check "активность: хвост результата пропускается, показывается действие" `
     ($a.Text -match 'cargo check' -and $a.Text -notmatch '94 lines') "получено: '$($a.Text)'"
