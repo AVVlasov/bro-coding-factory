@@ -290,7 +290,7 @@ function Invoke-ParallelQueue {
             if ($DryPlan) {
                 # В режиме плана «запускаем» мгновенно: занимаем заявку, чтобы
                 # следующие задачи проверялись против неё, и сразу освобождаем.
-                Add-TaskClaim -TaskId $task -Root $Root -UseCoupling
+                Add-TaskClaim -TaskId $task -Root $Root -UseCoupling -Local
                 [void]$running.Add(@{ Task = $task; Dry = $true })
                 continue
             }
@@ -318,7 +318,7 @@ function Invoke-ParallelQueue {
 
         if ($DryPlan) {
             foreach ($r in @($running)) {
-                Remove-TaskClaim -TaskId $r.Task
+                Remove-TaskClaim -TaskId $r.Task -Root $Root -Local
                 $running.Remove($r)
                 [void]$doneSet.Add($r.Task)
                 $passed += $r.Task
@@ -382,7 +382,7 @@ function Invoke-ParallelQueue {
             if (-not $isPass) {
                 & $log "$task — не закрыта в worktree, слияния не будет."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = 'не достиг PASS (лимит/затык)' }
-                Remove-TaskClaim -TaskId $task
+                Remove-TaskClaim -TaskId $task -Root $Root
                 Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
                 [void]$doneSet.Add($task)
                 continue
@@ -432,6 +432,10 @@ function Invoke-ParallelQueue {
             & git -C $r.Worktree -c user.name=ralph -c user.email=ralph@local `
                 commit -m "${task}: работа агента (авто-коммит перед слиянием)" 2>&1 | Out-Null
 
+            # SHA до слияния запоминается ЗДЕСЬ, а не выводится потом из HEAD~1. Между
+            # слиянием и проверками проходят минуты, и в общую ветку успевает приехать
+            # чужой коммит: HEAD~1 снимет его, ничего не зная о том, чей он.
+            $beforeMerge = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
             $merge = Merge-TaskWorktree -Root $Root -Task $task -GeneratedFiles $GeneratedFiles
             if (-not $merge.Ok) {
                 # Причина важнее факта: «конфликт файлов», «git отверг слияние» и
@@ -440,12 +444,12 @@ function Invoke-ParallelQueue {
                        elseif ($merge.Kind -eq 'dirty-tree') { $merge.Message }
                        else { "git отверг слияние: $(($merge.Message -split "`r?`n" | Select-Object -First 2) -join ' ')" }
                 if ($merge.Conflicts.Count) {
-                    $others = @((Get-ActiveClaims) | ForEach-Object { $_.task } | Where-Object { $_ -ne $task })
+                    $others = @((Get-ActiveClaims -Root $Root) | ForEach-Object { $_.task } | Where-Object { $_ -ne $task })
                     foreach ($o in $others) { Register-TaskConflict -Pair @($task, $o) -Files $merge.Conflicts }
                 }
                 & $log "$task — СЛИЯНИЕ НЕ УДАЛОСЬ: $why. Ветка сохранена."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = "слияние не удалось — $why" }
-                Remove-TaskClaim -TaskId $task
+                Remove-TaskClaim -TaskId $task -Root $Root
                 Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
                 [void]$doneSet.Add($task)
                 continue
@@ -461,7 +465,9 @@ function Invoke-ParallelQueue {
                 if (-not $chk.Ok) { $mergeOk = $false; $checkFail = @{ Cmd = $cmd; Result = $chk }; break }
             }
             if (-not $mergeOk) {
-                & git -C $Root reset --hard HEAD~1 2>&1 | Out-Null
+                $mergeSha = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
+                $undo = Undo-FailedMerge -Root $Root -MergeSha $mergeSha -BeforeSha $beforeMerge
+                & $log "$task — откат слияния: $($undo.Message)"
                 # Причина названа по исходу: «не запустилась» и «красная» чинят разные люди.
                 $reason = if ($checkFail.Result.Kind -eq 'not-runnable') {
                     "гейт не смог запуститься: $($checkFail.Cmd) — $($checkFail.Result.Reason)"
@@ -470,6 +476,7 @@ function Invoke-ParallelQueue {
                 } else {
                     "семантический конфликт: проверки на слитом дереве красные ($($checkFail.Cmd) — $($checkFail.Result.Reason))"
                 }
+                if (-not $undo.Ok) { $reason = "$reason; откат не удался — $($undo.Message)" }
                 & $log "$task — слияние откатано: $reason."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
                 $kind = if ($checkFail.Result.Kind -eq 'red') { 'semantic' } else { 'gate-not-runnable' }
@@ -478,7 +485,7 @@ function Invoke-ParallelQueue {
                 & $log "$task — слита в основную ветку."
                 $passed += $task
             }
-            Remove-TaskClaim -TaskId $task
+            Remove-TaskClaim -TaskId $task -Root $Root
             Remove-TaskWorktree -Root $Root -Task $task
             [void]$doneSet.Add($task)
         }

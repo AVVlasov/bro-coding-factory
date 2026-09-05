@@ -37,6 +37,21 @@ function Get-BcfStateDir {
     return $d
 }
 
+# Чьим именем харнесс коммитит.
+#
+# Пустой массив = у репозитория настроены user.name и user.email, и подменять их нельзя:
+# коммит заявки или отката должен читаться как коммит участника, а не как коммит
+# инструмента. Подставляем своё имя только там, где иначе git откажется коммитить вовсе —
+# на голой фикстуре и на машине без глобальной настройки.
+function Get-BcfGitIdentityArgs {
+    param([Parameter(Mandatory)][string]$Root)
+    $n = ''; $e = ''
+    try { $n = (& git -C $Root config user.name 2>$null | Out-String).Trim() } catch { }
+    try { $e = (& git -C $Root config user.email 2>$null | Out-String).Trim() } catch { }
+    if ($n -and $e) { return @() }
+    return @('-c', 'user.name=bcf', '-c', 'user.email=bcf@local')
+}
+
 # Корень движка (фабрика/harness). Нужен, когда узел графа или планировщик запускает
 # другой скрипт харнесса: путь до него не выводится из корня проекта.
 function Get-BcfHarnessRoot {

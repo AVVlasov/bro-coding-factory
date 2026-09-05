@@ -102,6 +102,9 @@ fi
 # tasks/<ID>-*.md, so blocking tasks/ wholesale would break the loop it is meant to
 # protect. What is blocked is what DECIDES the verdict and what the harness writes:
 #   .verdicts/  — the verdict file (verify.ps1 writes it after the agent, PROMPT.md:1071)
+#   .claims/    — who took which task, on which branch, since when. It travels in git so
+#                 the rest of the team sees it; an agent editing it would be handing
+#                 itself a task somebody else is already working on
 #   .acceptance/, .inbox/, .bugs/ — acceptance signatures, critic drafts, bug ledger
 #   CURRENT-FOCUS.md — which task is active (loop.ps1 sets it; PROMPT.md:132 forbids the
 #                      agent from moving it, and prose is not a guard)
@@ -109,6 +112,7 @@ fi
 if [ -z "$blocked" ]; then
   case "$rel" in
     tasks/.verdicts/*)   blocked="tasks/.verdicts/ (the verdict — written by the harness)" ;;
+    tasks/.claims/*)     blocked="tasks/.claims/ (who took which task — written by the harness)" ;;
     tasks/.acceptance/*) blocked="tasks/.acceptance/ (human acceptance signatures)" ;;
     tasks/.inbox/*)      blocked="tasks/.inbox/ (critic findings)" ;;
     tasks/.bugs/*)       blocked="tasks/.bugs/ (bug ledger)" ;;

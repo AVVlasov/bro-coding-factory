@@ -170,14 +170,17 @@ Remove-Item -Recurse -Force $rw -ErrorAction SilentlyContinue
 # красные независимо от работы агента; без вердиктов закрытых задач цикл блокирует задачу
 # через секунду после старта («предшественник TASK-01 не имеет verdict: PASS»), хотя тот
 # закрыт и слит, — так волна 2 не поехала целиком.
+#
+# Вердикты чинятся не копией, а тем, что они лежат в git: чекаут ветки задачи приносит их
+# сам, и ровно те же файлы видит второй участник команды. Копия чинила только свою машину.
 
-Section "Worktree уносит зависимости и вердикты"
+Section "Worktree уносит зависимости, а вердикты приносит git"
 
 $rd = Join-Path ([System.IO.Path]::GetTempPath()) ("bcf-wt-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Force -Path $rd | Out-Null
 & git -C $rd init -q -b main 2>&1 | Out-Null
 & git -C $rd config user.email t@t; & git -C $rd config user.name t
-Set-Content -LiteralPath (Join-Path $rd '.gitignore') -Value "node_modules/`ntasks/.verdicts/" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $rd '.gitignore') -Value "node_modules/" -Encoding UTF8
 Set-Content -LiteralPath (Join-Path $rd 'src.txt') -Value 'код' -Encoding UTF8
 New-Item -ItemType Directory -Force -Path (Join-Path $rd 'node_modules\.bin') | Out-Null
 Set-Content -LiteralPath (Join-Path $rd 'node_modules\.bin\tsc.cmd') -Value 'echo tsc' -Encoding UTF8
@@ -205,8 +208,13 @@ $vcopy = Join-Path $wtd 'tasks\.verdicts\TASK-01.md'
 Check "вердикт предшественника виден задаче" (Test-Path $vcopy) `
     'без него цикл блокирует задачу: «предшественник не имеет verdict: PASS»'
 if (Test-Path $vcopy) {
-    Check "вердикт перенесён содержимым, а не пустышкой" ((Get-Content -Raw $vcopy) -match 'verdict:\s*PASS')
+    Check "вердикт полон содержимым, а не пустышкой" ((Get-Content -Raw $vcopy) -match 'verdict:\s*PASS')
 }
+# Негативный случай прежней схемы: пока вердикт был в .gitignore, git о нём не знал, и в
+# дерево задачи его приходилось копировать. Копия жила ровно на одной машине.
+$tracked = @(& git -C $wtd ls-files 'tasks/.verdicts/TASK-01.md' 2>$null | Where-Object { $_ })
+Check "вердикт приехал в дерево задачи через git, а не копией" ($tracked.Count -eq 1) `
+    'git его не отслеживает — значит второму участнику команды он невиден'
 Remove-TaskWorktree -Root $rd -Task 'TASK-02'
 Check "удаление дерева задачи не тронуло зависимости проекта" (Test-Path (Join-Path $rd 'node_modules\.bin\tsc.cmd')) `
     'рекурсивное удаление пошло по ссылке внутрь и вычистило каталог проекта'
@@ -268,7 +276,11 @@ Section "Грязь в каталогах владельца НЕ отменяе
 # ОСНОВНОМ дереве и с правом правки; он зашёл в tasks/ и поменял в закрытой TASK-25
 # «- [x]» на «- [V]». Две строки в файле давно закрытой задачи отменили слияние
 # TASK-48, дошедшей до PASS. tasks/ и config/ принадлежат владельцу, кодовому агенту
-# запрещены и в слиянии продуктового кода не участвуют — значит откат, а не отказ.
+# запрещены и в слиянии продуктового кода не участвуют — значит слияние идёт дальше.
+#
+# Но и `git checkout --`, стоявший здесь раньше, не годится: в те же каталоги во время
+# прогона пишет человек, сидящий рядом, и его правка исчезала без следа. Правки уезжают
+# в ветку bcf/parked/<дата>, и ниже проверяется именно это: дерево чистое, работа цела.
 $d = New-Fixture
 New-Item -ItemType Directory -Force -Path (Join-Path $d 'tasks') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $d 'config') | Out-Null
@@ -286,10 +298,18 @@ $r = Merge-TaskWorktree -Root $d -Task 'TASK-99' -GeneratedFiles @('Cargo.lock')
 Check "слияние прошло, а не отменилось" ($r.Ok) "вид=$($r.Kind) сообщение=$($r.Message)"
 Check "работа задачи в основном дереве" `
     ((Get-Content -Raw -LiteralPath (Join-Path $d 'src.rs')).Trim() -eq 'правка задачи')
-Check "правка узла в tasks/ откачена" `
+Check "дерево вернулось к HEAD по tasks/" `
     ((Get-Content -Raw -LiteralPath (Join-Path $d 'tasks\TASK-25.md')).Trim() -eq '- [x] сделано')
-Check "правка узла в config/ откачена" `
+Check "дерево вернулось к HEAD по config/" `
     ((Get-Content -Raw -LiteralPath (Join-Path $d 'config\checks.json')).Trim() -eq '{ "a": 1 }')
+
+# Тот самый негативный случай: при `git checkout --` здесь не осталось бы НИЧЕГО, и
+# правка человека была бы потеряна молча.
+$parkBranch = 'bcf/parked/' + (Get-Date -Format 'yyyy-MM-dd')
+$parkedTask = (& git -C $d show "${parkBranch}:tasks/TASK-25.md" 2>$null | Out-String).Trim()
+$parkedCfg  = (& git -C $d show "${parkBranch}:config/checks.json" 2>$null | Out-String).Trim()
+Check "правка в tasks/ сохранена в ветке $parkBranch" ($parkedTask -eq '- [V] сделано') "получено: '$parkedTask'"
+Check "правка в config/ сохранена в ветке $parkBranch" ($parkedCfg -eq '{ "a": 2 }') "получено: '$parkedCfg'"
 
 # Грязь в ПРОДУКТОВОМ коде по-прежнему отменяет слияние: там правку теряют молча только
 # по недосмотру, и это ровно то, от чего проверка и стоит.

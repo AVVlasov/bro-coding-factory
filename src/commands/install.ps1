@@ -98,13 +98,38 @@ if (-not $only -or $only -eq 'project') {
     if (-not $dry) {
         New-Item -ItemType Directory -Force -Path (Join-Path $project 'tasks') | Out-Null
         New-Item -ItemType Directory -Force -Path (Join-Path $project 'tasks\.verdicts') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $project 'tasks\.claims') | Out-Null
     }
 }
 
 # --- .gitignore: состояние прогонов и рабочие каталоги задач --------------------------
+#
+# ВЕРДИКТОВ ЗДЕСЬ НЕТ, И ЭТО ГЛАВНОЕ ИЗМЕНЕНИЕ.
+#
+# `tasks/.verdicts/` лежал в этом списке, пока фабрику вела одна машина. В команде это
+# значит, что закрытая задача существует ровно у одного человека: второй видит бэклог,
+# в котором не закрыто ничего, и его фабрика честно берётся строить поверх несделанного.
+# Вердикт — такой же результат работы, как код, и едет в git вместе с задачей.
+#
+# Каталог заявок (`tasks/.claims/`) не игнорируется по той же причине: заявка, которой
+# не видно у соседа, не заявка.
 $giPath = Join-Path $project '.gitignore'
-$giAdd = @('.bcf/', 'tasks/.verdicts/', 'tasks/.bugs/', 'tasks/CURRENT-FOCUS.md')
+$giAdd = @('.bcf/', 'tasks/.bugs/', 'tasks/CURRENT-FOCUS.md')
 $gi = if (Test-Path $giPath) { @(Get-Content -LiteralPath $giPath) } else { @() }
+
+# Установка поверх проекта, где вердикты уже спрятаны прежней версией: строку надо снять,
+# иначе всё остальное сделано, а вердикты по-прежнему никуда не едут — и молча.
+$giStale = @('tasks/.verdicts/', 'tasks/.verdicts', 'tasks/.claims/', 'tasks/.claims')
+$giDrop = @($gi | Where-Object { $giStale -contains $_.Trim() })
+if ($giDrop.Count) {
+    if ($dry) { $written += ".gitignore (-$($giDrop.Count) строк: $($giDrop -join ', ') — вердикты и заявки едут в git)" }
+    else {
+        $gi = @($gi | Where-Object { $giStale -notcontains $_.Trim() })
+        Set-Content -LiteralPath $giPath -Value ($gi -join "`n") -Encoding UTF8
+        $written += ".gitignore (-$($giDrop.Count) строк: вердикты и заявки больше не прячутся)"
+    }
+}
+
 $giMissing = @($giAdd | Where-Object { $gi -notcontains $_ })
 if ($giMissing.Count) {
     # Сухой прогон обязан назвать И ЭТО. Показывать половину изменений — значит выдавать
@@ -119,6 +144,7 @@ if ($giMissing.Count) {
 if ($dry) {
     if (-not (Test-Path (Join-Path $project 'tasks')))          { $written += 'tasks/ (каталог)' }
     if (-not (Test-Path (Join-Path $project 'tasks\.verdicts'))) { $written += 'tasks/.verdicts/ (каталог)' }
+    if (-not (Test-Path (Join-Path $project 'tasks\.claims')))   { $written += 'tasks/.claims/ (каталог заявок)' }
     $written += '.bcf/project.json (карточка проекта)'
 }
 

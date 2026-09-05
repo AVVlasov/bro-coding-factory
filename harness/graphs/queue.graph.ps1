@@ -283,31 +283,28 @@ while ($true) {
             $vf = Join-Path $wt "tasks\.verdicts\$task.md"
             $isPass = (Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
 
-            # ВЕРДИКТ ОБЯЗАН ПЕРЕЖИТЬ WORKTREE.
+            # ВЕРДИКТ ЕДЕТ В GIT ВМЕСТЕ С ЗАДАЧЕЙ.
             #
             # Он пишется в дерево задачи (только там проверки честные — там лежит её
-            # работа), а каталог вердиктов в .gitignore, то есть слиянием он не переносится
-            # и умирает вместе с worktree. Между тем именно по нему считается готовность
-            # СЛЕДУЮЩЕЙ волны (Get-Verdict читает корень) и состояние бэклога в `bcf tasks`.
-            # Пока копии не было, прогон закрывал первую волну и вставал: остальные задачи
-            # навсегда оставались «ждёт», а отчёт называл это «не закрыто» — при том что
-            # работа была сделана и слита. Наблюдалось живьём 2026-08-06, прогон
-            # g_20260806-141305: TASK-01 слита за 7 минут, восемь задач не поехали.
+            # работа) и попадает в коммит выше. PASS приезжает в общую ветку слиянием, и
+            # переносить его отдельно больше не надо: раньше каталог вердиктов был в
+            # .gitignore, поэтому его копировали руками — и вердикт существовал ровно на
+            # одной машине, невидимый остальным участникам.
             #
-            # НО PASS ПЕРЕНОСИТСЯ ТОЛЬКО ПОСЛЕ УДАЧНОГО СЛИЯНИЯ.
+            # PASS НЕ ЗАСЧИТЫВАЕТСЯ ДО УДАЧНОГО СЛИЯНИЯ.
             #
             # Закрытие — это «работа в основном дереве», а не «в своей ветке всё зелёное».
-            # Пока PASS копировался здесь, задача с провалившейся интеграцией объявлялась
+            # Пока PASS переносился здесь, задача с провалившейся интеграцией объявлялась
             # закрытой: 2026-08-06 TASK-02 и TASK-03 получили PASS в основном дереве, их
             # код туда не попал (слияние упало на красных проверках), и следующая волна
-            # честно взялась строить TASK-04 поверх несуществующих стабов.
+            # честно взялась строить TASK-04 поверх несуществующих стабов. Слияние ниже
+            # и есть тот момент, когда PASS становится фактом проекта.
             #
-            # FAIL переносим сразу: он ничего не закрывает, а список ремедиации нужен
-            # человеку и следующей попытке. PASS — ниже, после Merge-TaskWorktree.
-            $vdirRoot = Join-Path $root 'tasks\.verdicts'
+            # FAIL публикуем сразу и отдельным коммитом: слияния у него не будет, а список
+            # ремедиации нужен человеку и следующей попытке.
             if ((Test-Path $vf) -and -not $isPass) {
-                New-Item -ItemType Directory -Force -Path $vdirRoot | Out-Null
-                Copy-Item -LiteralPath $vf -Destination (Join-Path $vdirRoot "$task.md") -Force -ErrorAction SilentlyContinue
+                $pv = Publish-TaskVerdict -Root $root -Task $task -VerdictFile $vf
+                if (-not $pv.Ok) { Write-GraphLog "$task — вердикт FAIL не опубликован: $($pv.Reason)" }
             }
 
             # Диагностика расщеплённого прогона. Если вердикта в worktree нет, а в
@@ -318,7 +315,7 @@ while ($true) {
             if (-not $isPass) {
                 $vfRoot = Join-Path $root "tasks\.verdicts\$task.md"
                 if ((Test-Path $vfRoot) -and (Select-String -Path $vfRoot -Pattern '^verdict:\s*PASS' -Quiet)) {
-                    Remove-TaskClaim -TaskId $task
+                    Remove-TaskClaim -TaskId $task -Root $root
                     Remove-TaskWorktree -Root $root -Task $task -KeepBranch
                     return @{ Task = $task; Ok = $false
                               Reason = "РАСЩЕПЛЁННЫЙ ПРОГОН: вердикт PASS лёг в основное дерево вместо worktree — цикл запущен не из своей копии. Работа задачи не потеряна (ветка bcf/task/$task), но слить её автоматически нельзя." }
@@ -341,7 +338,7 @@ while ($true) {
                     Copy-Item -LiteralPath $co -Destination (Join-Path $codir "$task.md") -Force -ErrorAction SilentlyContinue
                     $reason = "требует ревью человека — .bcf/callouts/$task.md (правка попала под friction-триггер)"
                 }
-                Remove-TaskClaim -TaskId $task
+                Remove-TaskClaim -TaskId $task -Root $root
                 Remove-TaskWorktree -Root $root -Task $task -KeepBranch
                 return @{ Task = $task; Ok = $false; Reason = $reason }
             }
@@ -363,6 +360,10 @@ while ($true) {
                     } catch { }
                 }
 
+                # SHA до слияния запоминается ЗДЕСЬ. Откат по HEAD~1 снимает последний
+                # коммит, каким бы он ни был: в общую ветку между слиянием и проверками
+                # успевает приехать чужая работа.
+                $beforeMerge = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
                 $m = Merge-TaskWorktree -Root $root -Task $task -GeneratedFiles (Get-GraphVar generated) -KeepConflictForArbiter
 
                 if (-not $m.Ok -and $m.Kind -eq 'conflict-open') {
@@ -402,8 +403,12 @@ while ($true) {
                 foreach ($cmd in @(Get-GraphVar mergeChecks)) {
                     $chk = Invoke-CommandNode $cmd -Label "слитое-$task-$([Math]::Abs($cmd.GetHashCode()) % 1000)" -WorkDir $root -TimeoutSec 1800
                     if (-not $chk.Ok) {
-                        & git -C $root reset --hard HEAD~1 2>&1 | Out-Null
-                        return @{ Task = $task; Ok = $false; Reason = 'семантический конфликт: проверки на слитом дереве красные' }
+                        $mergeSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+                        $undo = Undo-FailedMerge -Root $root -MergeSha $mergeSha -BeforeSha $beforeMerge
+                        Write-GraphLog "$task — откат слияния: $($undo.Message)"
+                        $why = 'семантический конфликт: проверки на слитом дереве красные'
+                        if (-not $undo.Ok) { $why = "$why; откат не удался — $($undo.Message)" }
+                        return @{ Task = $task; Ok = $false; Reason = $why }
                     }
                 }
 
@@ -438,9 +443,12 @@ while ($true) {
                     } catch { }
                     $lost = @($greenBefore | Where-Object { $_ -and ($_ -notin $greenAfter) })
                     if ($lost.Count) {
-                        & git -C $root reset --hard HEAD~1 2>&1 | Out-Null
-                        return @{ Task = $task; Ok = $false
-                                  Reason = "слияние сломало работавший сквозной путь: $($lost -join ', ')" }
+                        $mergeSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+                        $undo = Undo-FailedMerge -Root $root -MergeSha $mergeSha -BeforeSha $beforeMerge
+                        Write-GraphLog "$task — откат слияния: $($undo.Message)"
+                        $why = "слияние сломало работавший сквозной путь: $($lost -join ', ')"
+                        if (-not $undo.Ok) { $why = "$why; откат не удался — $($undo.Message)" }
+                        return @{ Task = $task; Ok = $false; Reason = $why }
                     }
                     $gained = @($greenAfter | Where-Object { $_ -and ($_ -notin $greenBefore) })
                     if ($gained.Count) { Write-GraphLog "задача $task закрыла сквозной путь: $($gained -join ', ')" }
@@ -449,14 +457,10 @@ while ($true) {
             }
 
             # ВОТ ЗДЕСЬ задача действительно закрыта: её работа в основном дереве и прошла
-            # проверки на слитом. Только теперь PASS-вердикт становится фактом проекта —
-            # по нему следующая волна считает готовность, а `bcf tasks` показывает закрытое.
-            if ($outcome.Ok -and (Test-Path $vf)) {
-                New-Item -ItemType Directory -Force -Path $vdirRoot | Out-Null
-                Copy-Item -LiteralPath $vf -Destination (Join-Path $vdirRoot "$task.md") -Force -ErrorAction SilentlyContinue
-            }
+            # проверки на слитом. PASS-вердикт приехал тем же слиянием, что и код, — по
+            # нему следующая волна считает готовность, а `bcf tasks` показывает закрытое.
 
-            Remove-TaskClaim -TaskId $task
+            Remove-TaskClaim -TaskId $task -Root $root
             Remove-TaskWorktree -Root $root -Task $task -KeepBranch:(-not $outcome.Ok)
             return $outcome
         }
