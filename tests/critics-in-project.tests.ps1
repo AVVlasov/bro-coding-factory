@@ -17,13 +17,19 @@
 #
 # 3. Блокирующий ракурс роняет вердикт, совещательный — нет. Пока все ракурсы весили
 #    одинаково, ракурс, заведённый «посмотреть», ронял прогон наравне с требованием
-#    заказчика — и его переставали заводить. Проверяется на настоящем Emit-RunAllReport:
-#    слово COMPLETE и поле acceptance_p1, а не на счётчике внутри теста.
+#    заказчика — и его переставали заводить. Проверять это по краям цепочки мало: свод
+#    считает одна функция, отчёт печатает другая, а КАКОЕ из двух чисел уедет в вердикт,
+#    решает строка графа между ними. Поэтому блок вердикта вырезается из файла графа
+#    разборщиком PowerShell и исполняется целиком — от Measure-BcfAcceptance до
+#    настоящего Emit-RunAllReport, пишущего .bcf/REVIEW.md и run-all.status.json.
 #
 # 4. Номера требований заказчика разбираются из задачи. Зона чтения сужена намеренно, и
-#    негативные случаи (номер в блоке кода, строка под секцией) здесь главные: широкий
-#    разбор превратил бы столбец требований в мусор — задача с командой `pkg@3.1.1`
-#    объявила бы себя закрывающей требование 3.1.1.
+#    негативные случаи здесь главные: широкий разбор превратил бы столбец требований в
+#    мусор — задача с командой `pkg@3.1.1` объявила бы себя закрывающей требование 3.1.1.
+#    Каждая охрана сторожится своей фикстурой: строка «Требование:» ниже первой секции,
+#    жирный номер внутри блока кода, буллет с номером без жирного. Фикстура, которая
+#    проходит по другой причине (номер с нумерацией «1. », который регексп не берёт и без
+#    охраны), сторожем не является — она была здесь и молчала на всех трёх мутациях.
 #
 # 5. Вердикт называет, чем он получен: версия фабрики и хэш файла графа.
 #
@@ -497,11 +503,158 @@ It 'P1 блокирующего ракурса отменяет COMPLETE' {
     Assert-Eq $r.statusObj.acceptance_p1 1
 }
 
-It 'та же находка совещательного ракурса COMPLETE не отменяет' {
-    # Совещательный ракурс в вердикт не попадает — Emit-RunAllReport получает ноль P1.
+It 'ноль P1 приёмки COMPLETE не отменяет' {
+    # Половина от предыдущей проверки: сам по себе отчёт при нуле P1 объявляет готовность.
+    # ЧЕМ ЭТОТ НОЛЬ ПОЛУЧЕН — вопрос следующего блока: здесь число передано руками.
     $r = Invoke-Report -P1 0
-    Assert-True $r.complete "совещательная находка уронила вердикт:`n$($r.review)"
+    Assert-True $r.complete "нулевой P1 уронил вердикт:`n$($r.review)"
     Assert-Match $r.review 'Статус:\*\* COMPLETE'
+}
+
+# --- 4б. Вес ракурса на настоящей проводке графа -------------------------------------------
+#
+# ПОЧЕМУ ОТДЕЛЬНЫМ БЛОКОМ. Предыдущие проверки стоят по краям цепочки: одна считает свод
+# (Measure-BcfAcceptance), другая печатает отчёт (Emit-RunAllReport) по числу, которое ей
+# дали руками. Между ними — строка графа, решающая, КАКОЕ число уедет в вердикт: число
+# блокирующих P1 или число всех P1. Пока эту строку никто не исполнял, замена
+# `-AcceptanceP1 $blockP1` на `-AcceptanceP1 $findP1.Count` (поведение до правки: находка
+# совещательного ракурса роняет прогон) оставляла все сюиты зелёными.
+#
+# Здесь блок вердикта ВЫРЕЗАЕТСЯ ИЗ ФАЙЛА ГРАФА разборщиком PowerShell и исполняется:
+# от подсчёта находок до настоящего Emit-RunAllReport, который пишет .bcf/REVIEW.md и
+# .bcf/run-all.status.json. Тест не пересказывает проводку своими словами — он её гоняет.
+Write-Host ''
+Write-Host '4б. Вес ракурса решается кодом графа, а не пересказом в тесте' -ForegroundColor White
+
+$verdictProj = Join-Path $box 'verdict'
+New-Item -ItemType Directory -Force -Path (Join-Path $verdictProj 'config') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $verdictProj 'tasks') | Out-Null
+Set-Content -LiteralPath (Join-Path $verdictProj 'proof.txt') -Value 'доказательство' -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $verdictProj 'config\journeys.json') -Encoding UTF8 -Value @'
+{ "command": "Write-Output 'J-01 зелёный'",
+  "journeys": [ { "id": "J-01", "title": "человек заводит запись", "proof": "proof.txt" } ] }
+'@
+Set-Content -LiteralPath (Join-Path $verdictProj 'tasks\TASK-01-card.md') -Encoding UTF8 -Value @'
+# TASK-01 — карточка приёма
+
+Требование: 3.1.1
+
+## Файлы
+
+- `src/app.ts`
+'@
+
+$verdictRunner = Join-Path $box 'run-verdict.ps1'
+Set-Content -LiteralPath $verdictRunner -Encoding UTF8 -Value @'
+param([string]$FactoryHome, [string]$Graph, [string]$Root, [string]$Mode, [string]$Result)
+$ErrorActionPreference = 'Stop'
+$env:BCF_HOME = $FactoryHome
+$env:BCF_PROJECT_ROOT = $Root
+$env:BCF_MEMORY_DISABLED = '1'
+. (Join-Path $FactoryHome 'harness\lib\bcf-context.ps1')
+. (Join-Path $FactoryHome 'harness\lib\critics.ps1')
+
+# Два ракурса разного веса. Находка кладётся тому, кого просит режим, — свод считает
+# настоящая Measure-BcfAcceptance, а не тест.
+$lenses = @(
+    [pscustomobject]@{ Id = 'gates';   Owner = 'лидер java'; Blocking = $true;  File = ''; Ask = '' },
+    [pscustomobject]@{ Id = 'journey'; Owner = 'аналитик';   Blocking = $false; File = ''; Ask = '' }
+)
+$found = ('{"summary":"смотрел","findings":[{"severity":"P1","what":"путь не проходится","file":"src/app.ts","line":10}]}' | ConvertFrom-Json)
+$empty = ('{"summary":"чисто","findings":[]}' | ConvertFrom-Json)
+$answers = if ($Mode -eq 'blocking') { @($found, $empty) } else { @($empty, $found) }
+$measure = Measure-BcfAcceptance -Lenses $lenses -Answers $answers
+
+# Блок вердикта из файла графа: от $findAll до присваивания с Emit-RunAllReport.
+$toks = $null; $errs = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Graph, [ref]$toks, [ref]$errs)
+$asgs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+$from = @($asgs | Where-Object { $_.Left.Extent.Text -eq '$findAll' })[0]
+$to   = @($asgs | Where-Object { $_.Right.Extent.Text -match 'Emit-RunAllReport' })[0]
+if (-not $from) { throw 'в графе не найден подсчёт находок приёмки ($findAll)' }
+if (-not $to)   { throw 'в графе не найден вызов Emit-RunAllReport' }
+if ($to.Extent.EndOffset -le $from.Extent.StartOffset) { throw 'блок вердикта в графе идёт задом наперёд' }
+$src = Get-Content -Raw -LiteralPath $Graph
+$region = $src.Substring($from.Extent.StartOffset, $to.Extent.EndOffset - $from.Extent.StartOffset)
+
+# Обвязка узла графа, без которой вырезанный блок не запустится. Подменяются только журнал
+# и фаза: всё, что касается вердикта, исполняется настоящим кодом.
+function Write-GraphLog { param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+function Set-Phase { param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
+$script:GraphCtx = [pscustomobject]@{ DryPlan = $false; Dir = $Root }
+$passed = @('TASK-01')
+$stuck  = @()
+$tasks  = @('TASK-01')
+$root   = $Root
+
+. ([scriptblock]::Create($region))
+
+$statusPath = Join-Path $Root '.bcf\run-all.status.json'
+$status = Get-Content -Raw -LiteralPath $statusPath | ConvertFrom-Json
+([ordered]@{
+    mode          = $Mode
+    complete      = [bool]$rep.complete
+    acceptance_p1 = [int]$status.acceptance_p1
+    blocking_p1   = [int]$measure.BlockingP1
+    total_p1      = @(@($measure.Findings) | Where-Object { $_.severity -eq 'P1' }).Count
+    advisory_p1   = [int]$measure.AdvisoryP1
+    review        = (Get-Content -Raw -LiteralPath (Join-Path $Root '.bcf\REVIEW.md'))
+} | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $Result -Encoding UTF8
+'@
+
+function Invoke-GraphVerdict {
+    param([Parameter(Mandatory)][ValidateSet('advisory', 'blocking')][string]$Mode)
+    $tag = [guid]::NewGuid().ToString('N').Substring(0, 6)
+    $result = Join-Path $box "verdict-$tag.json"
+    $graph = Join-Path $root 'harness\graphs\queue.graph.ps1'
+    & pwsh -NoProfile -NonInteractive -File $verdictRunner -FactoryHome $root -Graph $graph `
+        -Root $verdictProj -Mode $Mode -Result $result *> $null
+    if (-not (Test-Path -LiteralPath $result)) { throw "блок вердикта графа не отработал в режиме «$Mode» (нет $result)" }
+    return (Get-Content -Raw -LiteralPath $result | ConvertFrom-Json)
+}
+
+It 'находка совещательного ракурса доезжает до отчёта, но вердикт не роняет' {
+    $r = Invoke-GraphVerdict -Mode advisory
+    # Числа расходятся — иначе проверка проходила бы при любом выборе аргумента.
+    Assert-Eq $r.total_p1 1 'находки совещательного ракурса нет в своде'
+    Assert-Eq $r.advisory_p1 1
+    Assert-Eq $r.blocking_p1 0
+    # И граф выбрал из двух чисел именно блокирующее: это видно в статусе прогона.
+    Assert-Eq $r.acceptance_p1 0 'в вердикт уехало общее число P1, а не число блокирующих'
+    Assert-True $r.complete "находка совещательного ракурса уронила прогон:`n$($r.review)"
+    Assert-Match $r.review 'Статус:\*\* COMPLETE'
+}
+
+It 'та же находка блокирующего ракурса прогон роняет' {
+    $r = Invoke-GraphVerdict -Mode blocking
+    Assert-Eq $r.blocking_p1 1
+    Assert-Eq $r.acceptance_p1 1 'блокирующая находка не доехала до вердикта'
+    Assert-False $r.complete 'блокирующая находка не помешала объявить готовность'
+    Assert-Match $r.review 'ЕСТЬ P1 ПРИЁМКИ'
+}
+
+It 'в вызов отчёта граф передаёт счётчик блокирующих, а не всех находок' {
+    # Читается разборщиком, а не грепом: аргумент берётся у самого узла дерева разбора.
+    $graph = Join-Path $root 'harness\graphs\queue.graph.ps1'
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($graph, [ref]$null, [ref]$null)
+    $call = @($ast.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Emit-RunAllReport'
+    }, $true))[0]
+    Assert-True $call 'в графе очереди нет вызова Emit-RunAllReport'
+    $els = @($call.CommandElements)
+    $ix = -1
+    for ($i = 0; $i -lt $els.Count; $i++) {
+        if ($els[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+            $els[$i].ParameterName -eq 'AcceptanceP1') { $ix = $i; break }
+    }
+    Assert-True ($ix -ge 0) 'отчёту не передан -AcceptanceP1: приёмка перестала влиять на вердикт'
+    $arg = [string]$els[$ix + 1].Extent.Text
+    Assert-Eq $arg '$blockP1' 'в -AcceptanceP1 уехало не число блокирующих находок'
+    $asg = @($ast.FindAll({
+        param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$blockP1'
+    }, $true))[0]
+    Assert-True $asg 'в графе нет присваивания $blockP1'
+    Assert-Match $asg.Right.Extent.Text 'BlockingP1' '$blockP1 считается не по блокирующим ракурсам'
 }
 
 # --- 5. Номера требований заказчика --------------------------------------------------------
@@ -539,6 +692,11 @@ $taskSection = @'
 - `src/schedule.ts`
 '@
 
+# Строка «Требование:» НИЖЕ первой секции. Написана ровно так же, как настоящая строка
+# шапки: без нумерации, без скобок, номер отдельным словом. Иначе фикстура проходит не
+# потому, что зона чтения сужена, а потому, что регексп не принял «1. » или скобку, —
+# и охрана шапки остаётся без сторожа. Проверено мутацией: `$header = $Body` вместо
+# `Get-BcfTaskHeader` даёт здесь 4.4.4.
 $taskNone = @'
 # TASK-09 — внутренний рефакторинг
 
@@ -548,7 +706,42 @@ $taskNone = @'
 
 ## Готовность
 
-1. Требование: 4.4.4 (строка ниже первой секции — не шапка)
+Требование: 4.4.4
+'@
+
+# Блок кода ВНУТРИ секции «## Требования». Пример реестра, а не требование задачи: строка
+# набрана как буллет с жирным номером, то есть отличает её от настоящей только забор.
+$taskFenced = @'
+# TASK-11 — импорт расписания
+
+## Требования
+
+- **3.3.1** оператор загружает расписание из файла
+
+Так выглядит строка чужого реестра, требованием задачи она не является:
+
+```
+- **9.9.9** строка из выгрузки заказчика
+```
+
+## Файлы
+
+- `src/import.ts`
+'@
+
+# Буллет с номером, но БЕЗ жирного. Человек пишет так пункты списка; требованием он их
+# не объявлял, и в столбец такой номер ехать не должен.
+$taskPlainBullet = @'
+# TASK-12 — печать талона
+
+## Требования
+
+- **3.4.1** оператор печатает талон приёма
+- 5.5.5 сверить с версией макета
+
+## Файлы
+
+- `src/print.ts`
 '@
 
 It 'строка в шапке: несколько номеров через запятую' {
@@ -570,6 +763,26 @@ It 'секция «## Требования»: жирные номера, ост�
 It 'задача без требований не выдумывает их' {
     $r = @(Get-BcfRequirementsFromText -Body $taskNone)
     Assert-Eq @($r).Count 0 "разобрано лишнее: $($r -join ',')"
+}
+
+It 'строка «Требование:» ниже первой секции шапкой не считается' {
+    # Охрана зоны чтения: читается шапка задачи, а не всё тело. Без неё «Требование: 4.4.4»
+    # из раздела «Готовность» объявило бы задачу закрывающей пункт договора 4.4.4.
+    $r = @(Get-BcfRequirementsFromText -Body $taskNone)
+    Assert-False ($r -contains '4.4.4') 'строка из тела задачи прочитана как шапка'
+}
+
+It 'жирный номер внутри блока кода в секции требований не читается' {
+    # Охрана забора внутри секции: пример чужого реестра набран как настоящий буллет.
+    $r = @(Get-BcfRequirementsFromText -Body $taskFenced)
+    Assert-Eq ($r -join ',') '3.3.1' "номер из блока кода уехал в требования: $($r -join ',')"
+}
+
+It 'буллет с номером, но без жирного, требованием не становится' {
+    # Охрана жирного номера: требование — то, что человек объявил требованием, а не всякий
+    # номер в списке. Без неё «сверить с версией макета» попадает в столбец заказчика.
+    $r = @(Get-BcfRequirementsFromText -Body $taskPlainBullet)
+    Assert-Eq ($r -join ',') '3.4.1' "не жирный номер уехал в требования: $($r -join ',')"
 }
 
 It 'требования читаются из файла задачи по её id' {
