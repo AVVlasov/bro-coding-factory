@@ -176,7 +176,12 @@ function Read-BcfRun {
     }
 }
 
-# Пульс работающих агентов: .bcf/fleet/*.worker.json.
+# Пульс работающих агентов: файлы воркеров в реестре установки.
+#
+# РЕЕСТР ОБЩИЙ НА УСТАНОВКУ, А ПУЛЬС — ПРОЕКТНЫЙ. Потолок агентов один на машину,
+# поэтому файлы воркеров лежат в каталоге фабрики (harness/lib/fleet.ps1). Но признак
+# «прогон этого проекта жив» обязан считаться только по его собственным воркерам:
+# соседний проект, работающий всю ночь, иначе рисовал бы вечный пульс чужому прогону.
 #
 # ЖУРНАЛА ДЛЯ ОПРЕДЕЛЕНИЯ «ЖИВ» НЕ ХВАТАЕТ. Между node-start и node-finish рантайм в
 # журнал не пишет ничего, а потолок на узел по умолчанию 1800 секунд: любой агентский
@@ -189,26 +194,35 @@ function Read-BcfRun {
 # («120с, тишина 12с») — это и есть настоящий признак жизни.
 function Get-BcfFleetPulse {
     param([Parameter(Mandatory)][string]$Project)
-    $dir = Join-Path $Project '.bcf\fleet'
+    if (-not (Get-Command Get-BcfFleetRoot -ErrorAction SilentlyContinue)) {
+        # Каталог реестра знает ровно один файл — harness/lib/fleet.ps1. Вторая копия
+        # правила разъехалась бы с ним молча, и доска смотрела бы не туда, куда пишут.
+        $harness = if (Get-Command Get-BcfHarness -ErrorAction SilentlyContinue) { Get-BcfHarness }
+                   else { Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'harness' }
+        . (Join-Path $harness 'lib\fleet.ps1')
+    }
+    $dir = Get-BcfFleetRoot
     if (-not (Test-Path $dir)) { return $null }
+    $mine = ([string]$Project).TrimEnd('\', '/').ToLowerInvariant()
     $best = $null
+    $count = 0
     foreach ($f in (Get-ChildItem $dir -Filter '*.worker.json' -File -ErrorAction SilentlyContinue)) {
         try {
             $rec = Get-Content -Raw -LiteralPath $f.FullName | ConvertFrom-Json
             $hb = if ($rec.heartbeat) { ConvertTo-BcfLocalTime $rec.heartbeat } else { $f.LastWriteTime }
         } catch { $hb = $f.LastWriteTime; $rec = $null }
+        if (-not $rec -or ([string]$rec.project).TrimEnd('\', '/').ToLowerInvariant() -ne $mine) { continue }
+        $count++
         if (-not $best -or $hb -gt $best.At) {
             $best = [pscustomobject]@{
                 At = $hb
-                Detail = $(if ($rec -and $rec.detail) { [string]$rec.detail } else { '' })
-                Task = $(if ($rec -and $rec.task) { [string]$rec.task } else { '' })
+                Detail = $(if ($rec.detail) { [string]$rec.detail } else { '' })
+                Task = $(if ($rec.task) { [string]$rec.task } else { '' })
                 Count = 0
             }
         }
     }
-    if ($best) {
-        $best.Count = @(Get-ChildItem $dir -Filter '*.worker.json' -File -ErrorAction SilentlyContinue).Count
-    }
+    if ($best) { $best.Count = $count }
     return $best
 }
 
