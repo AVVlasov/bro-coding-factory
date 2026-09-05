@@ -1,0 +1,20 @@
+name: tests
+
+# Фабрика ставит и водит обвязку в чужих проектах — регресс в её собственных сюитах
+# ловится здесь, а не на первом же bcf install у команды. windows-latest, потому что
+# фабрика пока целиком под Windows (см. README.md, docs/SETUP.md): резолв bash и пути
+# обвязки собираются через "\" по всему харнессу.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: pwsh tests/all.ps1
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/all.ps1
