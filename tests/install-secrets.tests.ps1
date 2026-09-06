@@ -885,6 +885,55 @@ Check 'простой случай (без -a/pathspec) по-прежнему л
 Reset-Fixture -ProjectDir $p -Sha $cleanSha
 
 # ---------------------------------------------------------------------------
+Section '27. secret-scan.sh (Claude Code): связка коротких флагов -nm/-anm денаится — mustFix ревью M-05a'
+# ---------------------------------------------------------------------------
+# Ревью нашло: git бандлит короткие опции в один токен слева направо (`-am` = `-a` + `-m`,
+# см. `git commit -h`), а проверка присутствия флага из раздела 25 сравнивала токен
+# ЦЕЛИКОМ с "-n"/"--no-verify" — связка "-nm"/"-anm" проезжала мимо неё ровно как
+# отдельный "-n" мимо git-хука. Контроль на настоящем git ниже (не Claude-хук) доказывает,
+# что бандлинг — поведение самого git, а не придуманный сценарий: creds.txt уже
+# отслеживается в baseline (раздел 8), поэтому "-anm" (стажирует правку САМ) реально
+# коммитит секрет мимо .githooks/pre-commit, установленного и включённого на этой же
+# фикстуре.
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r27real = Invoke-RealCommit -ProjectDir $p -Command 'git commit -anm bypass'
+Check 'контроль: настоящий git commit -anm тоже пропускает секрет мимо git-хука (git сам бандлит -a -n -m)' (
+    $r27real.Code -eq 0
+) $r27real.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+foreach ($form in @(
+    @{ Label = 'git commit -nm wip (связка -n+-m)';      Cmd = 'git commit -nm wip';    Expect = '-nm' }
+    @{ Label = 'git commit -anm "wip" (связка -a-n+-m)'; Cmd = 'git commit -anm "wip"'; Expect = '-anm' }
+)) {
+    $r = Invoke-ClaudeHookWrapper -ProjectDir $p -Command $form.Cmd
+    Check "$($form.Label): secret-scan.sh денаит (обошла бы .githooks/pre-commit целиком)" (
+        $r.Code -eq 2 -and $r.Out -match '"permissionDecision"\s*:\s*"deny"'
+    ) "код $($r.Code): $($r.Out)"
+    Check "$($form.Label): причина называет саму связку" ($r.Out -match [regex]::Escape($form.Expect)) $r.Out
+}
+
+# Негативные регресс-контроли: самые частые формы без "-n" не должны денаиться новой
+# проверкой связки — иначе обычный `-m`/`-am` стал бы ложно заблокированным.
+$r27negM = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m note'
+Check 'git commit -m note: связка "-n" не находится там, где её нет (регресс-контроль)' (
+    -not $r27negM.Out.Trim()
+) $r27negM.Out
+Check 'git commit -m note: код возврата 0' ($r27negM.Code -eq 0) "код $($r27negM.Code): $($r27negM.Out)"
+
+$r27negAM = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -am note'
+Check 'git commit -am note: "-am" не путается со связкой "-n"+"-m" (регресс-контроль)' (
+    -not $r27negAM.Out.Trim()
+) $r27negAM.Out
+Check 'git commit -am note: код возврата 0' ($r27negAM.Code -eq 0) "код $($r27negAM.Code): $($r27negAM.Out)"
+
+# Мутация проверена вручную перед сдачей: с закомментированной веткой
+# `elif short_bundle_has_no_verify(t)` в secret-scan.sh обе позитивные проверки этого
+# раздела краснеют (verdict пустой, wrapper молчит и вызывает .githooks/pre-commit по
+# текущему — здесь пустому — индексу, коммит с "-nm"/"-anm" перестаёт денаиться) —
+# восстановлено сразу после проверки, в дифф не входит.
+
+# ---------------------------------------------------------------------------
 Restore-TestEnv
 Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue
 
