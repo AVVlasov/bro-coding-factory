@@ -13,6 +13,24 @@
 . (Join-Path $BcfRoot 'src\lib\backends.ps1')
 . (Join-Path $BcfRoot 'src\lib\detect.ps1')
 
+# ФАБРИКА ПОКА ТОЛЬКО ПОД WINDOWS. Поиск настоящего bash для settings.json (по
+# git --exec-path и известным каталогам установки Git, 'C:\Program Files\Git\...') и
+# разделитель '\' в путях зашиты по всему харнессу — на Linux/macOS install молча
+# подставил бы в settings.json несуществующий путь или пустоту, а хуки звались бы
+# напрямую без интерпретатора. Пока этот слой путей не переписан, честнее отказать
+# сразу, чем изображать живую пробу на окружении, где половина проверок значения не
+# имеет.
+#
+# BCF_SIMULATE_NOT_WINDOWS=1 — тестовый шов: $IsWindows у PowerShell константа
+# («Cannot overwrite variable IsWindows because it is read-only»), настоящий Linux/macOS
+# для проверки этой ветки под рукой не всегда есть. Тот же приём, что BCF_BASH_FORCE_NOT_FOUND.
+if ($IsWindows -eq $false -or $env:BCF_SIMULATE_NOT_WINDOWS -eq '1') {
+    Write-BcfFail 'doctor поддерживает только Windows: резолв bash и пути обвязки зашиты под неё.'
+    Write-BcfNote 'поиск bash идёт по Git for Windows (git --exec-path, ProgramFiles\Git\...), путь к хукам собирается через ''\''.'
+    Write-BcfNote 'на Linux/macOS это даст не диагностику, а неверный вердикт — слой путей ещё не переписан под них.'
+    exit 1
+}
+
 $noProbe   = $script:BcfArgs -contains '--no-probe'
 $runChecks = $script:BcfArgs -contains '--checks'
 $project   = $script:BcfProject
@@ -195,16 +213,30 @@ if (-not (Test-Path $memClient)) {
         if ($LASTEXITCODE -ne 0) { $memErr = $stats; $stats = '' }
     } catch { $memErr = $_.Exception.Message; $stats = '' }
 
-    $memCfgPath = ''
-    foreach ($c in @((Join-Path $project 'config\memory.config.json'), (Join-Path (Get-BcfMemoryDir) 'memory.config.json'))) {
-        if (Test-Path $c) { $memCfgPath = $c; break }
-    }
+    # Адрес — из того же файла правил, что у клиента и у `bcf memory` (проект плюс
+    # накладка машины). Своя копия резолва здесь уже показывала не тот порт, который
+    # брал клиент, и совет «поднять» отправлял чинить не ту базу.
+    . (Join-Path (Get-BcfHarness) 'lib\memory-config.ps1')
+    $memSet = Resolve-BcfMemorySettings -Project $project -FactoryMemoryDir (Get-BcfMemoryDir)
+    $memCfgPath = if ($memSet) { $memSet.Path } else { '' }
     $memWhere = ''
-    if ($memCfgPath) {
-        try {
-            $mc = Get-Content -Raw -LiteralPath $memCfgPath | ConvertFrom-Json
-            $memWhere = "$($mc.host):$($mc.port), контейнер $(if ($mc.container) { $mc.container } else { 'bcf-agent-memory' })"
-        } catch { }
+    if ($memSet) {
+        $memWhere = "$($memSet.Host):$($memSet.Port), контейнер $($memSet.Container)"
+        if ($memSet.PortFromLocal) { $memWhere += " (порт из $($memSet.LocalPath))" }
+
+        # ПАРОЛЬ ИЗ РЕПОЗИТОРИЯ НА СЕТЕВОМ АДРЕСЕ. Дефолт заведён для контейнера на этой
+        # же машине и секретом не является — он лежит в открытом файле. Тот же дефолт на
+        # чужом хосте означает базу, которую открывает любой, кто видел исходники, а
+        # выглядит это как штатно настроенная память.
+        $memPw = Get-BcfMemoryPassword -Settings $memSet
+        if (-not $memSet.IsLocalHost -and $memPw.IsDefault) {
+            Write-BcfFail "память на $($memSet.Host), а пароль — дефолтный из репозитория"
+            Write-BcfNote "задай настоящий в `$env:$($memSet.PwEnv) (см. .env.example) или верни host в localhost."
+            $bad++
+        } elseif (-not $memSet.IsLocalHost -and -not $memPw.FromEnv) {
+            Write-BcfWarn "память на $($memSet.Host), а пароля нет ни в `$env:$($memSet.PwEnv), ни в конфиге"
+            $warn++
+        }
     }
 
     if ($stats -match '\{') {
@@ -237,6 +269,73 @@ if (-not (Test-Path $memClient)) {
         Write-BcfNote 'поднять: bcf memory init'
         $warn++
     }
+}
+
+# --- Ключи окружения --------------------------------------------------------------------
+#
+# ЧТО ЗДЕСЬ ЗА ДЕФЕКТ. Субагенты (ретроспектор, супервизор, автор тестов) ходят к модели
+# не через CLI, а напрямую по HTTP, и ключ берут из окружения либо из .env проекта. Без
+# ключа запрос уходит и возвращается отказом авторизации — а обвязка видит просто пустой
+# ответ и записывает «субагент ничего не нашёл». Гейты при этом зелёные: проверять было
+# нечего. Поймать это можно только вопросом «а ключ-то есть», заданным заранее.
+#
+# Список имён берём из .env.example фабрики: один файл, в котором перечислено всё, что
+# обвязка читает из окружения. Значения — из окружения и из .env проекта, ровно оттуда же,
+# откуда их возьмут сами вызывающие скрипты.
+Write-Host ''
+Write-BcfLine '  КЛЮЧИ ОКРУЖЕНИЯ' 'White'
+Write-Host ''
+
+$envExample = Join-Path (Get-BcfHome) '.env.example'
+$dotEnv = @{}
+$projEnvFile = Join-Path $project '.env'
+if (Test-Path $projEnvFile) {
+    foreach ($line in (Get-Content -LiteralPath $projEnvFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+            $dotEnv[$Matches[1]] = $Matches[2].Trim().Trim('"', "'")
+        }
+    }
+}
+function Test-BcfEnvKeySet {
+    param([string]$Name)
+    if ([Environment]::GetEnvironmentVariable($Name)) { return $true }
+    return [bool]$dotEnv[$Name]
+}
+
+if (-not (Test-Path $envExample)) {
+    Write-BcfWarn '.env.example в фабрике нет — что класть в .env, узнать неоткуда'
+    $warn++
+} else {
+    $envKeys = @()
+    foreach ($line in (Get-Content -LiteralPath $envExample -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*([A-Z][A-Z0-9_]*)\s*=') { $envKeys += $Matches[1] }
+    }
+    $setKeys = @($envKeys | Where-Object { Test-BcfEnvKeySet $_ })
+    $src = if ($dotEnv.Count) { "окружение и .env проекта ($($dotEnv.Count) строк)" } else { 'окружение (.env в проекте нет)' }
+    Write-BcfOk "ключей объявлено $($envKeys.Count), заполнено $($setKeys.Count)   ($src)"
+    if ($setKeys.Count) { Write-BcfDim ("заполнены: " + (($setKeys | Sort-Object) -join ', ')) }
+}
+
+# Ключ роли, которая пойдёт к модели напрямую. Проверяем только тех, кто в проекте
+# действительно установлен: ругань на неустановленное перестают читать.
+$invokerKeys = @{
+    'invoke-retrospector.ps1'      = @('BCF_RETROSPECTOR_API_KEY', 'BCF_API_KEY')
+    'invoke-supervisor.ps1'        = @('BCF_SUPERVISOR_API_KEY', 'BCF_API_KEY')
+    'invoke-test-author.ps1'       = @('BCF_TEST_AUTHOR_API_KEY', 'BCF_RETROSPECTOR_API_KEY', 'BCF_API_KEY')
+    'invoke-reference-digester.ps1' = @('BCF_DIGESTER_API_KEY', 'BCF_RETROSPECTOR_API_KEY', 'BCF_API_KEY')
+}
+$binDir = Join-Path $project '.claude\agents\bin'
+$keyless = @()
+foreach ($f in ($invokerKeys.Keys | Sort-Object)) {
+    if (-not (Test-Path (Join-Path $binDir $f))) { continue }
+    $has = @($invokerKeys[$f] | Where-Object { Test-BcfEnvKeySet $_ })
+    if (-not $has.Count) { $keyless += "$f → $($invokerKeys[$f] -join ' / ')" }
+}
+if ($keyless.Count) {
+    Write-BcfWarn "ролей без ключа: $($keyless.Count) — их вызовы вернутся отказом авторизации"
+    foreach ($k in $keyless) { Write-BcfNote $k }
+    Write-BcfNote 'снаружи это выглядит как «субагент ничего не нашёл», а не как ошибка настройки.'
+    $warn++
 }
 
 # --- Проверки проекта -----------------------------------------------------------------

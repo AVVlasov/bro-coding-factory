@@ -403,35 +403,43 @@ It 'занятый порт виден, а свободный подбирает
     } finally { try { $listener.Stop() } catch { } }
 }
 
-It 'порт памяти чинится в конфиге проекта, а не фабрики' {
+It 'порт памяти чинится в накладке машины, а не в конфигах' {
     . (Join-Path $root 'harness\lib\docker.ps1')
     . (Join-Path $root 'harness\lib\memory-port.ps1')
 
     $p = New-Sandbox 'memory-port'
-    $factoryCfg = Join-Path $p 'factory-memory.config.json'
-    Set-Content -LiteralPath $factoryCfg -Encoding UTF8 -Value (@{
+    # Конфиг проекта — то, что лежит в git и одинаково у всей команды. Порт машины ему не
+    # принадлежит: пока подбор писал сюда, у владельца появлялся диff, которого он не
+    # делал, а коммит увозил номер порта его машины всем остальным.
+    $projCfg = Join-Path $p 'config\memory.config.json'
+    New-Item -ItemType Directory -Force -Path (Split-Path $projCfg -Parent) | Out-Null
+    Set-Content -LiteralPath $projCfg -Encoding UTF8 -Value (@{
         host = 'localhost'; port = 5433; database = 'bcf_agent_memory'; user = 'bcf'
         embedding_dim = 1024; embedding_model = 'text-embedding-bge-m3'
     } | ConvertTo-Json)
+    $before = Get-Content -Raw -LiteralPath $projCfg
 
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     $busy = ([System.Net.IPEndPoint]$listener.Server.LocalEndPoint).Port
     try {
-        $r = Resolve-BcfMemoryPort -Wanted $busy -Container 'bcf-agent-memory' -ConfigPath $factoryCfg -ProjectRoot $p
+        $r = Resolve-BcfMemoryPort -Wanted $busy -Container 'bcf-agent-memory' -ProjectRoot $p -HostName 'localhost'
         Assert-True ($r.Changed) 'занятый порт остался прежним'
         Assert-True (-not $r.Error) "подбор отказал: $($r.Error)"
         Assert-True ($r.Port -ne $busy) 'подставлен тот же занятый порт'
 
-        $projCfg = Join-Path $p 'config\memory.config.json'
-        Assert-True (Test-Path $projCfg) 'исправление не записано в конфиг проекта'
-        $j = Get-Content -Raw -LiteralPath $projCfg | ConvertFrom-Json
-        Assert-True ([int]$j.port -eq $r.Port) 'в конфиге проекта не тот порт, что вернула функция'
-        # Остальные ключи обязаны доехать: иначе починили порт и потеряли модель эмбеддингов.
-        Assert-True ($j.embedding_dim -eq 1024) 'конфиг проекта потерял размерность эмбеддингов'
-        # Фабричный образец не трогаем: он общий для всех проектов машины.
-        $f = Get-Content -Raw -LiteralPath $factoryCfg | ConvertFrom-Json
-        Assert-True ([int]$f.port -eq 5433) 'фабричный конфиг переписан — сломано всем остальным проектам'
+        $localCfg = Join-Path $p '.bcf\memory.local.json'
+        Assert-True (Test-Path $localCfg) 'исправление не записано в накладку машины'
+        $j = Get-Content -Raw -LiteralPath $localCfg | ConvertFrom-Json
+        Assert-True ([int]$j.port -eq $r.Port) 'в накладке не тот порт, что вернула функция'
+        Assert-True ($j.container -eq 'bcf-agent-memory') 'имя контейнера в накладку не попало'
+        Assert-True ((Get-Content -Raw -LiteralPath $projCfg) -eq $before) 'конфиг проекта переписан — диff уедет в git'
+
+        # Слитые настройки: адрес из конфига проекта, порт из накладки.
+        . (Join-Path $root 'harness\lib\memory-config.ps1')
+        $set = Resolve-BcfMemorySettings -Project $p -FactoryMemoryDir (Join-Path $root 'memory')
+        Assert-True ($set.Port -eq $r.Port) 'резолвер не увидел подобранный порт'
+        Assert-True ($set.Dim -eq 1024) 'резолвер потерял размерность эмбеддингов из конфига проекта'
     } finally { try { $listener.Stop() } catch { } }
 }
 
@@ -441,10 +449,11 @@ It 'свободный порт не переписывает конфиги' {
 
     $p = New-Sandbox 'memory-port-free'
     $free = Find-BcfFreePort -From 5600
-    $r = Resolve-BcfMemoryPort -Wanted $free -Container 'bcf-agent-memory' -ConfigPath '' -ProjectRoot $p
+    $r = Resolve-BcfMemoryPort -Wanted $free -Container 'bcf-agent-memory' -ProjectRoot $p -HostName 'localhost'
     Assert-True (-not $r.Changed) 'порт был свободен, а функция всё равно его сменила'
     Assert-True ($r.Port -eq $free) 'свободный порт подменён'
     Assert-True (-not (Test-Path (Join-Path $p 'config\memory.config.json'))) 'конфиг создан там, где чинить было нечего'
+    Assert-True (-not (Test-Path (Join-Path $p '.bcf\memory.local.json'))) 'накладка создана там, где чинить было нечего'
 }
 
 # --- Пустая память ≠ сломанная запись ---------------------------------------------------

@@ -24,26 +24,22 @@ $script:Retrospector = if ($env:BCF_INVOKE_RETROSPECTOR) { $env:BCF_INVOKE_RETRO
 $script:FindingGate  = if ($env:BCF_FINDING_GATE)    { $env:BCF_FINDING_GATE }    else { Join-Path $script:RepoRoot '.claude/hooks/subagent-finding-gate.sh' }
 
 $script:MemCompose   = if ($env:BCF_MEM_COMPOSE)     { $env:BCF_MEM_COMPOSE }     else { Join-Path $script:HomeRoot 'memory/pgvector/docker-compose.yml' }
-# Конфиг памяти: проектный переопределяет фабричный, если проекту нужна своя база.
-$script:MemDbConfig  = if ($env:BCF_MEM_CONFIG) { $env:BCF_MEM_CONFIG }
-                       elseif (Test-Path (Join-Path $script:RepoRoot 'config/memory.config.json')) { Join-Path $script:RepoRoot 'config/memory.config.json' }
-                       else { Join-Path $script:HomeRoot 'memory/memory.config.json' }
 
-# Имя контейнера и ПОРТ: из memory.config.json, иначе дефолты.
+# Имя контейнера, ПОРТ и адрес — из одного места на всю фабрику (memory-config.ps1):
+# конфиг проекта плюс накладка машины .bcf/memory.local.json. Своя копия правила здесь
+# уже расходилась с командой `bcf memory`: контейнер поднимался один, клиент шёл в другой.
 #
-# Порт читается здесь не для красоты. Compose параметризован переменными окружения
+# Порт читается не для красоты. Compose параметризован переменными окружения
 # (BCF_MEM_CONTAINER, BCF_PG_PORT), и пока мостик их не выставлял, он поднимал контейнер по
 # ДЕФОЛТАМ compose, а клиент шёл по адресу из конфига. На проекте со своей базой это
 # расходилось молча: контейнер есть, память «недоступна».
-$script:MemContainer = 'bcf-agent-memory'
-$script:MemPort      = 5433
-if (Test-Path $script:MemDbConfig) {
-    try {
-        $__memCfg = Get-Content -Raw -LiteralPath $script:MemDbConfig | ConvertFrom-Json
-        if ($__memCfg.container) { $script:MemContainer = "$($__memCfg.container)" }
-        if ($__memCfg.port)      { $script:MemPort = [int]$__memCfg.port }
-    } catch { }
-}
+. (Join-Path $PSScriptRoot 'memory-config.ps1')
+$script:MemSettings  = Resolve-BcfMemorySettings -Project $script:RepoRoot -FactoryMemoryDir (Join-Path $script:HomeRoot 'memory')
+$script:MemDbConfig  = if ($script:MemSettings) { $script:MemSettings.Path } else { Join-Path $script:HomeRoot 'memory/memory.config.json' }
+$script:MemContainer = if ($script:MemSettings) { $script:MemSettings.Container } else { 'bcf-agent-memory' }
+$script:MemPort      = if ($script:MemSettings) { [int]$script:MemSettings.Port } else { 5433 }
+$script:MemHost      = if ($script:MemSettings) { $script:MemSettings.Host } else { 'localhost' }
+$script:MemIsLocal   = if ($script:MemSettings) { [bool]$script:MemSettings.IsLocalHost } else { $true }
 
 # Гарантирует, что эмбеддинг-модель памяти загружена в LM Studio. Без неё
 # memory_client.py embed падает → recall/upsert молча мрут → цикл обучения не
@@ -156,7 +152,12 @@ function Ensure-LmStudioEmbedding {
 . (Join-Path $PSScriptRoot 'memory-port.ps1')
 
 function Get-M13Health {
-    # 'healthy'|'starting'|'unhealthy'|'stopped'|'absent'|'no-response'|'no-daemon'|'no-docker'.
+    # 'healthy'|'starting'|'unhealthy'|'stopped'|'absent'|'no-response'|'no-daemon'|'no-docker'|'remote'.
+    #
+    # Базы может не быть на этой машине: тогда контейнера нет и быть не должно, а
+    # docker-ветка подняла бы ВТОРУЮ, пустую, рядом с настоящей — и прогон учился бы в
+    # ней. Живость удалённой базы проверяет сам клиент при первом обращении.
+    if (-not $script:MemIsLocal) { return 'remote' }
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { return 'no-docker' }
     # НЕ `docker version`: на Windows он не падает, а ЗАПУСКАЕТ Docker Desktop и ждёт его
     # — прогон вис минутами, ничего не печатая. Канал демона существует ровно тогда,
@@ -202,6 +203,10 @@ function Ensure-M13Memory {
     }
 
     $health = Get-M13Health
+    if ($health -eq 'remote') {
+        Write-Host "[memory] база памяти на $($script:MemHost):$($script:MemPort) — контейнером здесь не управляем." -ForegroundColor DarkGray
+        return $true
+    }
     if ($health -eq 'no-docker') {
         Write-Host "[memory] ⚠ docker не найден в PATH — векторная память недоступна, цикл обучения ВЫКЛЮЧЕН." -ForegroundColor Red
         return $false
@@ -274,7 +279,7 @@ function Ensure-M13Memory {
                 # повтор упадёт так же. Подбираем свободный порт и пишем его в конфиг
                 # ПРОЕКТА — там же его прочитает клиент памяти.
                 $pr = Resolve-BcfMemoryPort -Wanted $script:MemPort -Container $script:MemContainer `
-                                            -ConfigPath $script:MemDbConfig -ProjectRoot $script:RepoRoot
+                                            -ProjectRoot $script:RepoRoot -HostName $script:MemHost
                 if ($pr.Holder) {
                     $kind = if ($pr.HolderKind -eq 'container') { 'контейнер' } else { 'процесс' }
                     Write-Host "[memory] порт $($script:MemPort) занят: $kind '$($pr.Holder)' — это не наша база." -ForegroundColor Yellow
@@ -342,7 +347,7 @@ function Ensure-M13Memory {
         Write-Host "[memory] контейнер '$($script:MemContainer)' жив, но $where, а клиент идёт на $($script:MemPort) — пересоздаю." -ForegroundColor Yellow
 
         $pr2 = Resolve-BcfMemoryPort -Wanted $script:MemPort -Container $script:MemContainer `
-                                     -ConfigPath $script:MemDbConfig -ProjectRoot $script:RepoRoot
+                                     -ProjectRoot $script:RepoRoot -HostName $script:MemHost
         if ($pr2.Holder) {
             $kind2 = if ($pr2.HolderKind -eq 'container') { 'контейнер' } else { 'процесс' }
             Write-Host "[memory] порт $($script:MemPort) занят: $kind2 '$($pr2.Holder)' — это не наша база." -ForegroundColor Yellow

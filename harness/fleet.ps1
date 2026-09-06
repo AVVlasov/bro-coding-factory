@@ -32,12 +32,15 @@ if ($Reindex) {
 }
 
 if ($Kill) {
-    if (Stop-FleetWorker -Id $Kill) { Write-Host "воркер $Kill остановлен." -ForegroundColor Yellow }
+    if (Stop-FleetWorker -Id $Kill -Project $root) { Write-Host "воркер $Kill остановлен." -ForegroundColor Yellow }
     else { Write-Host "воркер $Kill не найден." -ForegroundColor Red }
     return
 }
 
-$workers   = Get-FleetWorkers -StaleSec $StaleSec
+# Реестр общий на установку фабрики, поэтому здесь видно и воркеров соседних проектов.
+# Это не шум: они съедают тот же потолок агентов, и без них число «работает трое» —
+# неправда, из-за которой прогон упирается в rate-limit без объяснения.
+$workers   = Get-FleetWorkers -StaleSec $StaleSec -Project $root
 $claims    = Get-ActiveClaims -Root $root
 $staleClaims = @(Get-BcfFileClaims -Root $root | Where-Object { $_.stale })
 $worktrees = Get-TaskWorktrees -Root $root
@@ -53,13 +56,15 @@ if ($Json) {
     return
 }
 
-Write-Host "`n=== ВОРКЕРЫ ($($workers.Count)) ===" -ForegroundColor Cyan
+$mineCount = @($workers | Where-Object { $_.mine }).Count
+Write-Host "`n=== ВОРКЕРЫ ($($workers.Count), из них здесь $mineCount) ===" -ForegroundColor Cyan
 if ($workers.Count -eq 0) { Write-Host "  (никто не работает)" -ForegroundColor DarkGray }
 foreach ($w in $workers) {
     $mark = if ($w.stalled) { '  ЗАВИС' } else { '' }
-    $color = if ($w.stalled) { 'Red' } else { 'Gray' }
-    Write-Host ("  {0,-10} {1,-8} {2,-10} pid {3,-7} простой {4,4}s{5}  {6}" -f `
-        $w.id, $w.role, $w.task, $w.pid, $w.idle_sec, $mark, $w.detail) -ForegroundColor $color
+    $color = if ($w.stalled) { 'Red' } elseif (-not $w.mine) { 'DarkGray' } else { 'Gray' }
+    $where = if ($w.mine) { '' } else { "  [$(Split-Path $w.project -Leaf)]" }
+    Write-Host ("  {0,-10} {1,-8} {2,-10} pid {3,-7} простой {4,4}s{5}{6}  {7}" -f `
+        $w.id, $w.role, $w.task, $w.pid, $w.idle_sec, $mark, $where, $w.detail) -ForegroundColor $color
 }
 
 Write-Host "`n=== ЗАЯВКИ НА ЗАДАЧИ ($($claims.Count)) ===" -ForegroundColor Cyan

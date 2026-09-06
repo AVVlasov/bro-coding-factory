@@ -1,5 +1,5 @@
 {
-  "_doc": "Проводка хуков Claude Code. Порядок внутри matcher значим: сначала блокирующие гейты, потом информационные. PreToolUse Bash — pre-bash-guard (деструктивные команды). PreToolUse Write|Edit — agent-infra-protect (кодовый агент не правит собственную обвязку: субагентов, хуки, судей, скилы, settings, CLAUDE.md, config/ с гейтами и те части tasks/, куда пишет обвязка — вердикты, приёмку, фокус) и task-progression-gate (задача не объявляется закрытой без вердикта). PreToolUse Task — pre-task-memory-inject (поднимает в контекст уроки из векторной памяти). PostToolUse Write|Edit — быстрые детекторы качества. Stop — done-gate и валидаторы DoD: единственное место, где сессия не может завершиться на невыполненном.",
+  "_doc": "Проводка хуков Claude Code. Порядок внутри matcher значим: сначала блокирующие гейты, потом информационные. PreToolUse Bash — pre-bash-guard (деструктивные команды) и secret-scan (перед git commit сканирует staged-дифф на признаки ключей доступа). PreToolUse Write|Edit — agent-infra-protect (кодовый агент не правит собственную обвязку: субагентов, хуки, судей, скилы, settings, CLAUDE.md, config/ с гейтами и те части tasks/, куда пишет обвязка — вердикты, приёмку, фокус) и task-progression-gate (задача не объявляется закрытой без вердикта). PreToolUse Task — pre-task-memory-inject (поднимает в контекст уроки из векторной памяти). PostToolUse Write|Edit — быстрые детекторы качества. Stop — done-gate и валидаторы DoD: единственное место, где сессия не может завершиться на невыполненном. {{BASH_PATH}} — путь к настоящему Git Bash, подставленный `bcf install`/`bcf init` при записи этого файла (не голый 'bash': на Windows первым в PATH обычно стоит лаунчер WSL, см. Get-BcfBash в harness/lib/bcf-context.ps1). Плейсхолдер везде в двойных кавычках: путь по умолчанию у Git for Windows содержит пробел (C:\\Program Files\\Git\\...), без кавычек команда рвётся на два токена и не находится ни cmd.exe, ни самим Git Bash.",
 
   "permissions": {
     "allow": [
@@ -18,20 +18,21 @@
       {
         "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "bash .claude/hooks/pre-bash-guard.sh" }
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/pre-bash-guard.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/secret-scan.sh" }
         ]
       },
       {
         "matcher": "Write|Edit",
         "hooks": [
-          { "type": "command", "command": "bash .claude/hooks/agent-infra-protect.sh" },
-          { "type": "command", "command": "bash .claude/hooks/task-progression-gate.sh" }
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/agent-infra-protect.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/task-progression-gate.sh" }
         ]
       },
       {
         "matcher": "Task",
         "hooks": [
-          { "type": "command", "command": "bash .claude/hooks/pre-task-memory-inject.sh" }
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/pre-task-memory-inject.sh" }
         ]
       }
     ],
@@ -39,22 +40,22 @@
       {
         "matcher": "Write|Edit",
         "hooks": [
-          { "type": "command", "command": "bash .claude/hooks/post-write-check.sh" },
-          { "type": "command", "command": "bash .claude/hooks/mock-as-real-detector.sh" },
-          { "type": "command", "command": "bash .claude/hooks/skill-lint.sh" },
-          { "type": "command", "command": "bash .claude/hooks/non-target-script-detector.sh" }
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/post-write-check.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/mock-as-real-detector.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/skill-lint.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/non-target-script-detector.sh" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "bash .claude/hooks/done-gate.sh" },
-          { "type": "command", "command": "bash .claude/hooks/dod-format-validator.sh" },
-          { "type": "command", "command": "bash .claude/hooks/duplicate-taskid-check.sh" },
-          { "type": "command", "command": "bash .claude/hooks/dod-immutability-check.sh" },
-          { "type": "command", "command": "bash .claude/hooks/stop-verify.sh" },
-          { "type": "command", "command": "bash .claude/hooks/subagent-finding-gate.sh" }
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/done-gate.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/dod-format-validator.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/duplicate-taskid-check.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/dod-immutability-check.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/stop-verify.sh" },
+          { "type": "command", "command": "\"{{BASH_PATH}}\" .claude/hooks/subagent-finding-gate.sh" }
         ]
       }
     ]

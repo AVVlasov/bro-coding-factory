@@ -29,7 +29,7 @@ from psycopg.types.json import Json
 
 # Reuse embed() from memory_client.
 sys.path.insert(0, str(Path(__file__).parent))
-from memory_client import db_conn, load_config, embed  # type: ignore
+from memory_client import db_conn, load_config, embed, project_name  # type: ignore
 
 PROJECT_ROOT = Path(os.getenv("BCF_PROJECT_ROOT", Path(__file__).resolve().parents[2]))
 BUGS_DIR     = PROJECT_ROOT / "tasks" / ".bugs"
@@ -191,15 +191,17 @@ def cmd_open(args, cfg):
             else:
                 short_id = _next_short_id(cur, task)
                 hist = [f"iter {iteration}: opened by {opened_by}"]
+                # project пишется вместе с багом: одна база на все проекты машины, и без
+                # этого поля ledger соседнего продукта неотличим от своего.
                 cur.execute(
                     """
                     INSERT INTO agent_memory.bugs
-                      (short_id, task_id, signature, summary, verification, severity,
+                      (project, short_id, task_id, signature, summary, verification, severity,
                        status, must_address, embedding, history, opened_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s::vector, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'open', %s, %s::vector, %s, %s)
                     RETURNING short_id
                     """,
-                    (short_id, task, signature, summary, verification, severity,
+                    (project_name(cfg), short_id, task, signature, summary, verification, severity,
                      must_address, vec_lit, Json(hist), opened_by),
                 )
                 sid = cur.fetchone()[0]

@@ -1,5 +1,6 @@
 {
-  "$comment": "Connection + embedding config for the optional pgvector memory stack (memory/pgvector). The DB password is read from the environment variable named by 'password_env'; 'password_default' is a non-secret local-dev fallback only — set a real value via env for anything shared. embedding_dim MUST match the embedding model (bge-m3 = 1024).",
+  "$comment": "Подключение к pgvector и эмбеддинги (memory/pgvector). host — адрес сервера базы; localhost означает контейнер на этой же машине. Подобранный порт и имя контейнера перекрывает накладка машины .bcf/memory.local.json — в git она не попадает. Пароль берётся из переменной password_env; password_default — несекретный фолбэк для локальной базы, на сетевом адресе bcf memory init его не примет. project — чьи записи пишутся в общую базу; пусто = имя каталога. embedding_dim ОБЯЗАН совпадать с моделью (bge-m3 = 1024).",
+  "project": "",
   "host": "localhost",
   "port": 5433,
   "database": "bcf_agent_memory",
