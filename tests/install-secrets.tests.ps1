@@ -112,12 +112,19 @@ function New-GitFixture {
 }
 
 function Invoke-SecretScan {
-    param([string]$ProjectDir, [string]$Command)
+    param([string]$ProjectDir, [string]$Command, [switch]$ForceNoPython)
     $payload = (@{ tool_input = @{ command = $Command } } | ConvertTo-Json -Compress)
     $pf = Join-Path $sandbox ('hook-in-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.json')
     Set-Content -LiteralPath $pf -Value $payload -Encoding UTF8 -NoNewline
     $prev = $env:CLAUDE_PROJECT_DIR
     $env:CLAUDE_PROJECT_DIR = $ProjectDir
+    $prevPath = $env:PATH
+    if ($ForceNoPython) {
+        # Git Bash сам подставляет СВОИ mingw64/bin и usr/bin впереди любого PATH, который
+        # ему дать (проверено вручную) — git, cat, mktemp остаются на месте, а python
+        # (стоящий отдельно, в каталогах вида Python3xx/PyManager) из этого набора выпадает.
+        $env:PATH = (Split-Path $bash -Parent)
+    }
     try {
         $sh = ($secretScanSrc -replace '\\', '/')
         $inp = ($pf -replace '\\', '/')
@@ -125,6 +132,7 @@ function Invoke-SecretScan {
         $code = $LASTEXITCODE
     } finally {
         if ($null -eq $prev) { Remove-Item env:CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue } else { $env:CLAUDE_PROJECT_DIR = $prev }
+        if ($ForceNoPython) { $env:PATH = $prevPath }
         Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{ Code = $code; Out = $out }
@@ -436,6 +444,21 @@ $r10c = Invoke-SecretScan -ProjectDir $p10c -Command 'git add -A && git commit -
 Check 'git add -A && git commit без секрета проходит молча (регресс не внесён)' (-not $r10c.Out.Trim()) $r10c.Out
 Check 'чистый add+commit: код возврата хука 0' ($r10c.Code -eq 0) "код $($r10c.Code): $($r10c.Out)"
 
+# Регрессия найдена ЧЕТВЁРТЫМ ревью M-05: `git ls-files --others --exclude-standard`
+# уважает core.quotepath (по умолчанию true у git) и C-квотирует не-ASCII байты имени
+# файла ("\320\272..."), а `git add --dry-run` печатает то же имя как есть, без
+# квотирования — из-за расхождения новый файл с кириллическим именем не находил себя в
+# списке неотслеживаемых и не сканировался вообще, хотя реально уходил в коммит.
+$p10d = New-GitFixture 'scan-add-commit-cyrillic-bypass'
+Set-Content -LiteralPath (Join-Path $p10d 'ключи.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r10d = Invoke-SecretScan -ProjectDir $p10d -Command 'git add -A && git commit -m x'
+Check 'git add -A && git commit: кириллическое имя файла тоже блокирует (core.quotepath)' (
+    $r10d.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r10d.Out
+Check 'кириллица: код возврата хука 2' ($r10d.Code -eq 2) "код $($r10d.Code): $($r10d.Out)"
+Check 'кириллица: причина называет файл и строку' ($r10d.Out -match 'ключи\.txt:1') $r10d.Out
+Check 'кириллица: само значение ключа НЕ печатается' ($r10d.Out -notmatch [regex]::Escape($fakeAwsKey)) $r10d.Out
+
 # ---------------------------------------------------------------------------
 Section '11. secret-scan.sh: значение-ссылка на переменную/окружение — не находка'
 # ---------------------------------------------------------------------------
@@ -518,6 +541,60 @@ if (Test-Path -LiteralPath $workflowPath) {
         $wf -match 'pwsh\s+-NoProfile\s+-File\s+tests[\\/]all\.ps1'
     ) $wf
 }
+
+# ---------------------------------------------------------------------------
+Section '14. secret-scan.sh: `cd <каталог> && git add ... && git commit ...` не даёт обойти сканер'
+# ---------------------------------------------------------------------------
+# Регрессия найдена ЧЕТВЁРТЫМ ревью M-05: pathspec сегмента `git add` разбирался через
+# `git add --dry-run -C <корень репозитория>` всегда, без учёта предшествующего
+# `cd <каталог>` в той же командной строке — относительный путь, данный ИЗ подкаталога,
+# не совпадал ни с чем при поиске от корня, и файл выпадал из сканирования целиком.
+# Воспроизведение ревью: секрет в sub/creds.txt, `cd sub && git add creds.txt && git commit -m x`.
+$p14 = New-GitFixture 'scan-cd-add-commit-bypass'
+New-Item -ItemType Directory -Force -Path (Join-Path $p14 'sub') | Out-Null
+Set-Content -LiteralPath (Join-Path $p14 'sub\creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r14 = Invoke-SecretScan -ProjectDir $p14 -Command 'cd sub && git add creds.txt && git commit -m x'
+Check 'cd sub && git add && git commit: хук блокирует секрет из подкаталога' (
+    $r14.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r14.Out
+Check 'cd-обход: код возврата хука 2' ($r14.Code -eq 2) "код $($r14.Code): $($r14.Out)"
+Check 'cd-обход: причина называет путь относительно корня репозитория' ($r14.Out -match 'sub/creds\.txt:1') $r14.Out
+Check 'cd-обход: само значение ключа НЕ печатается' ($r14.Out -notmatch [regex]::Escape($fakeAwsKey)) $r14.Out
+
+# Регресс-контроль: та же связка `cd && add && commit` без секрета проходит молча — фикс
+# не начал блокировать любой cd+add+commit как таковой.
+$p14b = New-GitFixture 'scan-cd-add-commit-clean'
+New-Item -ItemType Directory -Force -Path (Join-Path $p14b 'sub') | Out-Null
+Set-Content -LiteralPath (Join-Path $p14b 'sub\note.txt') -Value 'просто текст, без секретов' -Encoding UTF8
+$r14b = Invoke-SecretScan -ProjectDir $p14b -Command 'cd sub && git add note.txt && git commit -m x'
+Check 'cd sub && git add && git commit без секрета проходит молча (регресс не внесён)' (-not $r14b.Out.Trim()) $r14b.Out
+
+# ---------------------------------------------------------------------------
+Section '15. secret-scan.sh: python не найден — отказ на git commit, тишина на прочих командах'
+# ---------------------------------------------------------------------------
+# Регрессия найдена ЧЕТВЁРТЫМ ревью M-05: без python хук выходил кодом 0 БЕЗ разбора
+# чего бы то ни было — гейт секретов, зарегистрированный в settings.json, молча исчезал
+# на любой машине без python, хотя docs/SETUP.md объявляет python опциональным (только
+# под память). PATH подрезается ТОЛЬКО на время вызова хука (Invoke-SecretScan
+# -ForceNoPython), сам тестовый прогон и остальные секции им не задеты.
+$p15 = New-GitFixture 'scan-no-python'
+$r15commit = Invoke-SecretScan -ProjectDir $p15 -Command 'git -c user.name="t" -c user.email="t@local" commit -m x' -ForceNoPython
+Check 'без python: commit-подобная команда отказывает явно (permissionDecision: deny)' (
+    $r15commit.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r15commit.Out
+Check 'без python: код возврата хука 2 на коммите' ($r15commit.Code -eq 2) "код $($r15commit.Code): $($r15commit.Out)"
+Check 'без python: причина называет python, а не молчит про секрет' ($r15commit.Out -match 'python') $r15commit.Out
+
+$r15status = Invoke-SecretScan -ProjectDir $p15 -Command 'git status' -ForceNoPython
+Check 'без python: не-commit команда по-прежнему проходит молча (хук не блокирует весь Bash)' (
+    $r15status.Code -eq 0 -and -not $r15status.Out.Trim()
+) "код $($r15status.Code): $($r15status.Out)"
+
+# Контроль сценария: с обычным PATH (python на месте) тот же коммит без секрета проходит
+# молча — доказывает, что деградация специфична именно к отсутствию python, а не к
+# сломанному сценарию вообще.
+$r15control = Invoke-SecretScan -ProjectDir $p15 -Command 'git -c user.name="t" -c user.email="t@local" commit -m ok'
+Check 'контроль сценария: с обычным PATH тот же коммит без секрета проходит молча' (-not $r15control.Out.Trim()) $r15control.Out
 
 # ---------------------------------------------------------------------------
 Restore-TestEnv

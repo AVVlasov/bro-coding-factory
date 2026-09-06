@@ -64,24 +64,50 @@
 # you print JSON" — сама дока), JSON с permissionDecisionReason и текст на stderr — это
 # то, откуда Claude Code берёт текст причины при показе блокировки.
 #
+# КИРИЛЛИЦА И ДРУГИЕ НЕ-ASCII ИМЕНА. `git ls-files --others` уважает core.quotepath
+# (по умолчанию true у git) и C-квотирует не-ASCII байты имени файла ("\320\272..."),
+# а `git add --dry-run` печатает то же имя как есть, без квотирования. Список
+# неотслеживаемых файлов и ответ --dry-run сверялись строка в строку — при расхождении
+# в квотировании новый файл с не-ASCII именем не находил себя в списке и не сканировался
+# вообще. Все git-вызовы этого файла, которые сравнивают или парсят ИМЕНА файлов,
+# зовутся с -c core.quotepath=false, чтобы то и другое отдавало один и тот же байтовый
+# вид имени.
+#
+# `cd <каталог> && git add ... && git commit ...`. Pathspec в сегменте `add` — это то,
+# что стояло бы в РЕАЛЬНОМ рабочем каталоге на момент выполнения, а не в корне репозитория:
+# относительный путь читается от каталога, куда перевели предыдущие `cd` в той же
+# командной строке. Сегменты до `commit` разбираются по порядку, `cd <путь>` двигает
+# отслеживаемый рабочий каталог (без выражений вида `cd -`/переменных — там смена
+# каталога неоднозначна, и текущий каталог остаётся как был), и `git add --dry-run`
+# запускается с -C именно этим каталогом. Сам ответ --dry-run от этого не меняется:
+# git печатает путь относительно корня репозитория независимо от того, какой -C передан
+# (проверено вручную), поэтому дальнейший разбор пути правкой не тронут.
+#
+# PYTHON НЕ НАЙДЕН. Хук зарегистрирован в settings.json как обязательная проверка перед
+# коммитом — тихий exit 0 без python выключил бы её незаметно на любой машине без python,
+# хотя python в docs/SETUP.md объявлен опциональным (только под память). Без python
+# разобрать JSON от Claude Code по-настоящему нечем, поэтому решение грубое, на grep по
+# сырому входу: если строка похожа на git commit — хук ОТКАЗЫВАЕТ явно, с текстом причины
+# и кодом 2, а не пропускает секрет молча. На любой другой команде (не commit-подобной)
+# по-прежнему тихий exit 0 — иначе хук блокировал бы вообще все Bash-команды в проекте на
+# машине без python, а не только коммиты.
+#
 # Контракт:
 #   $CLAUDE_PROJECT_DIR — корень проекта (ставит Claude Code); без него — $PWD
 #   BCF_SECRET_SCAN_DISABLED=1 — выключить хук
+#   python/python3 не найден — commit-подобная команда отказывает явно (код 2), прочие
+#   команды пропускаются молча (см. "PYTHON НЕ НАЙДЕН" выше)
 
 set -u
 export PYTHONIOENCODING=utf-8
 
 [ "${BCF_SECRET_SCAN_DISABLED:-0}" = "1" ] && exit 0
 
-PY=""
-for c in python python3; do
-  if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
-done
-[ -z "$PY" ] && exit 0   # без python сканировать нечем
-
 # СО ВХОДА ЧИТАЕМ С ПОТОЛКОМ ВРЕМЕНИ, а не «пока не кончится» — см. pre-task-memory-inject.sh:
 # Claude Code закрывает stdin сразу после JSON, но запуск не из-под Claude Code (тест, рука)
 # может оставить канал открытым, и cat без таймаута ждёт вечно ПЕРЕД любой Bash-командой.
+# Читаем ДО поиска python: без входа нечего проверять независимо от того, нашёлся python
+# или нет, и незачем решать судьбу python-less запуска раньше времени.
 INPUT=""
 if [ ! -t 0 ]; then
   if command -v timeout >/dev/null 2>&1; then
@@ -91,6 +117,24 @@ if [ ! -t 0 ]; then
   fi
 fi
 [ -z "$INPUT" ] && exit 0
+
+PY=""
+for c in python python3; do
+  if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+
+if [ -z "$PY" ]; then
+  # См. "PYTHON НЕ НАЙДЕН" в заголовке файла. Без python сам JSON не разобрать — грубая
+  # проверка через grep по сырому входу: похоже на git commit — отказ явно, иначе тихий
+  # пропуск (не блокировать ВСЕ Bash-команды в проекте из-за одной непроверяемой).
+  if printf '%s' "$INPUT" | grep -q '"command"' && printf '%s' "$INPUT" | grep -qiE '\bgit\b.*\bcommit\b'; then
+    reason='secret-scan.sh не может проверить коммит на секреты: python (или python3) не найден в PATH. Поставьте python3 или явно отключите проверку BCF_SECRET_SCAN_DISABLED=1, если она сейчас не нужна.'
+    printf '%s\n' "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"$reason\"}}"
+    printf '%s\n' "$reason" >&2
+    exit 2
+  fi
+  exit 0
+fi
 
 start_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
 REPO_ROOT=""
@@ -109,7 +153,7 @@ printf '%s' "$INPUT" > "$tmpf"
 # Один вызов python: разобрать JSON от Claude Code, узнать, git ли это commit, при
 # необходимости прогнать git diff --cached и решить. Два процесса (разбор JSON отдельно,
 # скан отдельно) означали бы два места, где можно молча разойтись форматом.
-RESULT="$(REPO_ROOT="$REPO_ROOT" "$PY" - "$tmpf" <<'PYEOF'
+RESULT="$(REPO_ROOT="$REPO_ROOT" START_DIR="$start_dir" "$PY" - "$tmpf" <<'PYEOF'
 import json
 import os
 import re
@@ -177,21 +221,56 @@ has_all_flag = bool(
 # которые сами являются "git ... add ...", отдают свои аргументы настоящему git через
 # --dry-run: он и разворачивает -A/./glob, и учитывает .gitignore за нас, не нужно
 # повторять его логику pathspec самим.
-add_segments = [seg for seg in segments[:commit_seg_idx] if GIT_ADD_RE.search(seg)]
+#
+# `cd <каталог> && git add ...` — см. "cd <каталог> ..." в заголовке файла. Сегменты до
+# commit разбираются ПО ПОРЯДКУ; `cd` двигает отслеживаемый рабочий каталог, `git add`
+# запоминается вместе с тем, в каком каталоге он оказался бы на момент своего выполнения.
+CD_RE = re.compile(r'^\s*cd\s+(\S.*)$')
+
+
+def resolve_cd(cwd, raw_target):
+    # 'cd -' (предыдущий каталог) и составные/пустые аргументы неоднозначны без полной
+    # истории cd — оставляем cwd как был, не гадаем.
+    try:
+        parts = shlex.split(raw_target)
+    except ValueError:
+        return cwd
+    if not parts or parts[0] == '-':
+        return cwd
+    target = parts[0]
+    if os.path.isabs(target) or re.match(r'^[A-Za-z]:[\\/]', target):
+        candidate = target
+    else:
+        candidate = os.path.join(cwd, target)
+    return os.path.normpath(candidate)
+
+
+cwd = os.environ.get('START_DIR') or repo_root
+add_segments = []   # [(сегмент, каталог на момент его выполнения), ...]
+for seg in segments[:commit_seg_idx]:
+    cd_m = CD_RE.match(seg)
+    if cd_m:
+        cwd = resolve_cd(cwd, cd_m.group(1))
+        continue
+    if GIT_ADD_RE.search(seg):
+        add_segments.append((seg, cwd))
 has_add_stage = bool(add_segments)
 
 staged_new_files = []   # неотслеживаемые файлы, которые git add реально бы добавил
 if add_segments:
     try:
+        # -c core.quotepath=false — см. "КИРИЛЛИЦА И ДРУГИЕ НЕ-ASCII ИМЕНА" в заголовке
+        # файла: без этого ls-files C-квотирует не-ASCII имя иначе, чем печатает
+        # `git add --dry-run` ниже, и сравнение по множеству строк ниже никогда не совпадает.
         untracked_out = subprocess.run(
-            ['git', '-C', repo_root, 'ls-files', '--others', '--exclude-standard'],
+            ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'ls-files', '--others', '--exclude-standard'],
             capture_output=True, encoding='utf-8', errors='replace', timeout=20,
         ).stdout
     except Exception:
         untracked_out = ''
     untracked_set = set(p for p in untracked_out.split('\n') if p)
 
-    for seg in add_segments:
+    for seg, seg_cwd in add_segments:
         add_tail = re.sub(r'^.*?\badd\b', '', seg, count=1, flags=re.S).strip()
         try:
             add_args = shlex.split(add_tail)
@@ -203,9 +282,13 @@ if add_segments:
         try:
             # БЕЗ "--" перед аргументами: git-флаги add (-A, -u, .) обязаны остаться
             # флагами, а не превратиться в буквальный pathspec ("-A" файлом с таким
-            # именем) — "--" здесь как раз это и сделал бы.
+            # именем) — "--" здесь как раз это и сделал бы. -C seg_cwd — каталог, в
+            # котором этот add реально оказался бы после предыдущих cd в той же строке
+            # (по умолчанию repo_root, если cd не было); ответ --dry-run от этого не
+            # меняется — git печатает путь относительно корня репозитория независимо
+            # от переданного -C (см. заголовок файла).
             dr_out = subprocess.run(
-                ['git', '-C', repo_root, 'add', '--dry-run'] + add_args,
+                ['git', '-c', 'core.quotepath=false', '-C', seg_cwd, 'add', '--dry-run'] + add_args,
                 capture_output=True, encoding='utf-8', errors='replace', timeout=20,
             ).stdout
         except Exception:
@@ -220,8 +303,11 @@ if add_segments:
                 staged_new_files.append(dm.group(1))
 
 try:
+    # -c core.quotepath=false — тот же повод, что у ls-files выше: без этого заголовок
+    # диффа (+++ b/<путь>) C-квотирует не-ASCII имя, и парсер ниже (который квотирование
+    # не разбирает) отдаёт current_file строкой в кавычках вместо реального пути.
     diff = subprocess.run(
-        ['git', '-C', repo_root, 'diff', '--cached', '-U0', '--no-color'],
+        ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '--cached', '-U0', '--no-color'],
         capture_output=True, encoding='utf-8', errors='replace', timeout=20,
     ).stdout
 except Exception:
@@ -230,7 +316,7 @@ except Exception:
 if has_all_flag or has_add_stage:
     try:
         diff += subprocess.run(
-            ['git', '-C', repo_root, 'diff', '-U0', '--no-color'],
+            ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '-U0', '--no-color'],
             capture_output=True, encoding='utf-8', errors='replace', timeout=20,
         ).stdout
     except Exception:
