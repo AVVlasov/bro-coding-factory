@@ -36,6 +36,24 @@
 #
 # Найденный секрет НЕ печатается — только имя файла, номер строки и имя правила.
 #
+# СОВЕТ В ТЕКСТЕ ОТКАЗА ЗАВИСИТ ОТ ТОГО, ГДЕ НАХОДКА. Найдено пятым ревью M-05: текст
+# отказа безусловно советовал `git restore --staged <файл>` — это верно только для
+# находки в РЕАЛЬНОМ индексе (`git diff --cached`, застейджено ДО этой команды отдельным
+# `git add`). Находка из широкого/scoped диффа рабочего дерева (-a/-am/--all или add из
+# этой же командной строки) и находка в новом файле ещё НЕ в индексе — `git restore
+# --staged` там ничего не отменяет, файл сам себе не появляется в индексе, пока команда
+# не исполнилась. Поэтому каждая находка размечается источником (staged/unstaged) и
+# текст отказа даёт для каждого источника свой, рабочий совет — см. STAGED_REMEDY/
+# UNSTAGED_REMEDY ниже.
+#
+# ГРАНИЦА: ФАЙЛ, СОЗДАННЫЙ В ЭТОЙ ЖЕ КОМАНДНОЙ СТРОКЕ. Хук — PreToolUse, он смотрит на
+# командную строку ДО её исполнения. `echo секрет > c.txt && git add c.txt && git commit`
+# создаёт c.txt только в момент выполнения `echo` — на момент проверки файла ещё нет на
+# диске, `git ls-files --others` его не видит, и `git add --dry-run c.txt` не находит,
+# что добавлять. Это не обход разбора pathspec (он отработал бы верно, появись файл раньше),
+# а сама природа PreToolUse: хук не может увидеть то, чего команда ещё не создала. Граница
+# названа в docs/SETUP.md, а не только здесь.
+#
 # ОБХОД ЧЕРЕЗ -a/-am/--all. `git commit -a` (и короткая склейка `-am`) стажирует
 # отслеживаемые правки ИЗНУТРИ самого commit, уже после того, как этот хук успел
 # посмотреть на индекс — секрет, лежащий только в рабочем дереве (git add не делали),
@@ -51,10 +69,22 @@
 # разбирается на сегменты по &&/||/;/| — сегмент до commit, начинающийся с `git ... add`,
 # даёт свои аргументы САМОМУ git через `git add --dry-run` (а не собственный разбор
 # pathspec: git уже умеет -A/./glob/.gitignore) — это НЕ исполняет добавление, только
-# спрашивает, что было бы добавлено. Отслеживаемые файлы из этого списка уже покрыты
-# диффом рабочего дерева (см. выше); неотслеживаемые НОВЫЕ файлы — то, чего `-a` вообще
-# не берёт (см. комментарий у HAS_ALL_FLAG), — сканируются целиком по содержимому,
-# отдельно от diff-парсера.
+# спрашивает, что было бы добавлено.
+#
+# ДИФФ РАБОЧЕГО ДЕРЕВА ОГРАНИЧЕН ПУТЯМИ ИЗ `git add --dry-run`, А НЕ ВЕСЬ РЕПОЗИТОРИЙ.
+# Найдено пятым ревью M-05: до этой правки при has_add_stage к --cached диффу
+# безусловно добавлялся ПОЛНЫЙ `git diff` рабочего дерева — тот же вызов, что и для
+# -a/-am/--all. Из-за этого отслеживаемый файл с секретом, который команда вообще не
+# трогает («password = ...» правится локально в cfg.txt, но коммитится только
+# `git add doc.md && git commit`), блокировал коммит doc.md, хотя в этот коммит cfg.txt
+# не попадает. Широкий diff нужен ТОЛЬКО у -a/-am/--all — там git commit сам стажирует
+# ЛЮБУЮ отслеживаемую правку. У `git add <pathspec>` набор файлов уже точно известен:
+# это и есть ответ `git add --dry-run` (ADD_STAGE_PATHS ниже, накопленный по всем
+# add-сегментам команды). Дифф рабочего дерева при has_add_stage запускается с этими
+# путями как pathspec (`git diff -- <ADD_STAGE_PATHS...>`), а не без ограничений.
+# Отслеживаемые файлы из этого списка получают дифф; неотслеживаемые НОВЫЕ файлы — то,
+# чего `git diff` без --no-index вообще не показывает, — сканируются целиком по
+# содержимому отдельно (staged_new_files, тот же список, что и раньше).
 #
 # ФОРМАТ ОТВЕТА PreToolUse. Сверено 2026-09-05 с code.claude.com/docs/en/hooks: для
 # PreToolUse ответ обязан идти через hookSpecificOutput.permissionDecision (значение
@@ -254,9 +284,12 @@ for seg in segments[:commit_seg_idx]:
         continue
     if GIT_ADD_RE.search(seg):
         add_segments.append((seg, cwd))
-has_add_stage = bool(add_segments)
 
 staged_new_files = []   # неотслеживаемые файлы, которые git add реально бы добавил
+add_stage_paths = []    # ВСЕ пути (новые и уже отслеживаемые), которые git add реально
+                         # добавил бы — этим списком, а не всем репозиторием, ограничен
+                         # дифф рабочего дерева ниже при has_add_stage (см. "ДИФФ РАБОЧЕГО
+                         # ДЕРЕВА ОГРАНИЧЕН ПУТЯМИ ИЗ git add --dry-run" в заголовке файла).
 if add_segments:
     try:
         # -c core.quotepath=false — см. "КИРИЛЛИЦА И ДРУГИЕ НЕ-ASCII ИМЕНА" в заголовке
@@ -295,34 +328,58 @@ if add_segments:
             continue
         for line in dr_out.split('\n'):
             dm = re.match(r"^add '(.+)'$", line)
+            if not dm:
+                continue
             # --dry-run НИЧЕГО не пишет в индекс (проверено фикстурой в сюите) — только
-            # спрашивает git, что было бы добавлено. Отслеживаемые правки из этого списка
-            # уже покрыты git diff ниже (has_add_stage включает его так же, как has_all_flag);
-            # интересны только НОВЫЕ файлы — то, чего -a вообще не берёт (см. HAS_ALL_FLAG выше).
-            if dm and dm.group(1) in untracked_set:
-                staged_new_files.append(dm.group(1))
+            # спрашивает git, что было бы добавлено. Путь идёт в add_stage_paths целиком
+            # (и отслеживаемые правки, и новые файлы) — этим списком, а не безусловным
+            # git diff, ограничен дифф рабочего дерева ниже; неотслеживаемые НОВЫЕ файлы
+            # дополнительно попадают в staged_new_files — им нужно не дифф, а всё
+            # содержимое целиком (см. HAS_ALL_FLAG и заголовок файла).
+            path = dm.group(1)
+            if path not in add_stage_paths:
+                add_stage_paths.append(path)
+            if path in untracked_set:
+                staged_new_files.append(path)
 
 try:
     # -c core.quotepath=false — тот же повод, что у ls-files выше: без этого заголовок
     # диффа (+++ b/<путь>) C-квотирует не-ASCII имя, и парсер ниже (который квотирование
     # не разбирает) отдаёт current_file строкой в кавычках вместо реального пути.
-    diff = subprocess.run(
+    cached_diff = subprocess.run(
         ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '--cached', '-U0', '--no-color'],
         capture_output=True, encoding='utf-8', errors='replace', timeout=20,
     ).stdout
 except Exception:
     emit_nothing()
 
-if has_all_flag or has_add_stage:
+# UNSTAGED_DIFF — рабочее дерево, ЕЩЁ не в индексе. -a/-am/--all стажирует ЛЮБУЮ
+# отслеживаемую правку внутри самого commit, поэтому там дифф безусловный и полный.
+# has_add_stage — это КОНКРЕТНЫЙ git add с уже известным git'у списком путей
+# (add_stage_paths, ответ --dry-run) — дифф ограничен ИМ, а не всем репозиторием: секрет
+# в файле, который эта команда не добавляет и не коммитит, её не касается (см. "ДИФФ
+# РАБОЧЕГО ДЕРЕВА ОГРАНИЧЕН..." в заголовке файла — пятое ревью M-05). Одновременное
+# -am и add (редкий состав) разрешается в пользу более широкой проверки: -am и так
+# покрывает любой путь из add_stage_paths.
+unstaged_diff = ''
+if has_all_flag:
     try:
-        diff += subprocess.run(
+        unstaged_diff = subprocess.run(
             ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '-U0', '--no-color'],
             capture_output=True, encoding='utf-8', errors='replace', timeout=20,
         ).stdout
     except Exception:
         pass   # --cached уже прочитан — не откатываем всю проверку из-за второго вызова
+elif add_stage_paths:
+    try:
+        unstaged_diff = subprocess.run(
+            ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '-U0', '--no-color', '--'] + add_stage_paths,
+            capture_output=True, encoding='utf-8', errors='replace', timeout=20,
+        ).stdout
+    except Exception:
+        pass
 
-if not diff and not staged_new_files:
+if not cached_diff and not unstaged_diff and not staged_new_files:
     emit_nothing()   # нечего коммитить — ни staged, ни рабочее дерево, ни новые файлы не тронуты
 
 # --- Образцы: см. заголовок файла для источника и версии сверки -------------------------
@@ -384,55 +441,86 @@ def check_line(content):
     return None
 
 
-hits = []
-current_file = None
-new_line = 0
 hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 
-for raw in diff.split('\n'):
-    if raw.startswith('+++ '):
-        path = raw[4:].strip()
-        current_file = None if path == '/dev/null' else re.sub(r'^[ab]/', '', path)
-        continue
-    if raw.startswith('@@ '):
-        m = hunk_re.match(raw)
-        if m:
-            new_line = int(m.group(1))
-        continue
-    if raw.startswith('---'):
-        continue
-    if raw.startswith('+'):
-        content = raw[1:]
-        if current_file is not None:
-            name = check_line(content)
-            if name:
-                hits.append((current_file, new_line, name))
-        new_line += 1
-        continue
-    # '-' (удалённая строка) и служебные строки diff --git/index/rename на новую
-    # нумерацию не влияют — их пропускаем.
+
+def scan_diff_text(diff_text, source):
+    """Разбирает unified diff (-U0) и возвращает находки (файл, строка, правило,
+    источник). Общая точка для --cached и рабочего дерева, чтобы разбор не жил в двух
+    местах и не разошёлся между ними на следующей правке — source ТОЛЬКО помечает,
+    откуда пришла находка (staged/unstaged), для текста отказа ниже."""
+    out = []
+    current_file = None
+    new_line = 0
+    for raw in diff_text.split('\n'):
+        if raw.startswith('+++ '):
+            path = raw[4:].strip()
+            current_file = None if path == '/dev/null' else re.sub(r'^[ab]/', '', path)
+            continue
+        if raw.startswith('@@ '):
+            m = hunk_re.match(raw)
+            if m:
+                new_line = int(m.group(1))
+            continue
+        if raw.startswith('---'):
+            continue
+        if raw.startswith('+'):
+            content = raw[1:]
+            if current_file is not None:
+                name = check_line(content)
+                if name:
+                    out.append((current_file, new_line, name, source))
+            new_line += 1
+            continue
+        # '-' (удалённая строка) и служебные строки diff --git/index/rename на новую
+        # нумерацию не влияют — их пропускаем.
+    return out
+
+
+# source='staged' — находка уже в индексе (git diff --cached): её туда занёс отдельный
+# git add ДО этой команды, `git restore --staged` реально её оттуда уберёт. source=
+# 'unstaged' — находка из рабочего дерева (-a/-am/--all или пути add_stage_paths) либо
+# из нового файла: в индексе её ЕЩЁ нет, `git restore --staged` там ничего не отменяет
+# (см. "СОВЕТ В ТЕКСТЕ ОТКАЗА..." в заголовке файла — пятое ревью M-05).
+hits = scan_diff_text(cached_diff, 'staged')
+hits += scan_diff_text(unstaged_diff, 'unstaged')
 
 # Новые (ранее неотслеживаемые) файлы, которые `git add` из командной строки реально
 # добавил бы, — они не проходят через diff-парсер выше (для git нет "before", значит нет
-# и unified diff), поэтому читаются и сканируются целиком, с первой строки.
+# и unified diff), поэтому читаются и сканируются целиком, с первой строки. В индексе их
+# тоже ещё нет — source='unstaged'.
 for path in dict.fromkeys(staged_new_files):
     try:
         with open(os.path.join(repo_root, path), encoding='utf-8', errors='replace') as f:
             for lineno, line in enumerate(f, start=1):
                 name = check_line(line)
                 if name:
-                    hits.append((path, lineno, name))
+                    hits.append((path, lineno, name, 'unstaged'))
     except Exception:
         continue
 
 if not hits:
     emit_nothing()
 
-lines = [f'  {f}:{ln} — {name}' for f, ln, name in hits]
+STAGED_REMEDY = (
+    'уже в индексе — убери находку из индекса (git restore --staged <файл>) '
+    'или замени на переменную окружения.'
+)
+UNSTAGED_REMEDY = (
+    'ещё не в индексе (рабочее дерево, -a/-am/--all или git add из этой же команды) — '
+    'убери секрет из файла или не включай этот путь в add/-a/-am, закоммить остальное отдельно.'
+)
+remedies = []
+if any(h[3] == 'staged' for h in hits):
+    remedies.append(STAGED_REMEDY)
+if any(h[3] == 'unstaged' for h in hits):
+    remedies.append(UNSTAGED_REMEDY)
+
+lines = [f'  {f}:{ln} — {name}' for f, ln, name, _src in hits]
 reason = (
-    'коммит заблокирован: в staged-диффе похоже на секрет (само значение не печатается):\n'
-    + '\n'.join(lines)
-    + '\nубери находку из индекса (git restore --staged <файл>) или замени на переменную окружения.'
+    'коммит заблокирован: похоже на секрет (само значение не печатается):\n'
+    + '\n'.join(lines) + '\n'
+    + '\n'.join(remedies)
     + '\nложное срабатывание — переформулируй строку так, чтобы она не совпадала с образцом.'
 )
 print(json.dumps({

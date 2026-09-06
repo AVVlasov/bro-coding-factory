@@ -435,6 +435,10 @@ Check 'git add <файл> && git commit: хук тоже блокирует (н�
     $r10b.Out -match '"permissionDecision"\s*:\s*"deny"'
 ) $r10b.Out
 Check 'git add <файл> && git commit: код возврата хука 2' ($r10b.Code -eq 2) "код $($r10b.Code)"
+# Копия ответа под своим именем: $r10b дальше переиспользуется в разделе 12 (doctor) под
+# ТЕМ ЖЕ именем для другого сценария — раздел 17 ссылается на этот сохранённый ответ, а
+# не на $r10b, чтобы не читать чужой, более поздний вывод по случайному совпадению имени.
+$r10bAddNamedOut = $r10b.Out
 
 # Регресс-контроль: чистый add+commit (без секрета) по-прежнему проходит молча — фикс не
 # начал блокировать любую связку add+commit как таковую.
@@ -595,6 +599,120 @@ Check 'без python: не-commit команда по-прежнему прох�
 # сломанному сценарию вообще.
 $r15control = Invoke-SecretScan -ProjectDir $p15 -Command 'git -c user.name="t" -c user.email="t@local" commit -m ok'
 Check 'контроль сценария: с обычным PATH тот же коммит без секрета проходит молча' (-not $r15control.Out.Trim()) $r15control.Out
+
+# ---------------------------------------------------------------------------
+Section '16. secret-scan.sh: `git add <файл> && git commit` не задевает секрет в файле, который эта команда не добавляет'
+# ---------------------------------------------------------------------------
+# ПЯТОЕ РЕВЬЮ M-05 (опровержение находки 10): при has_add_stage хук до этой правки
+# добавлял к --cached БЕЗУСЛОВНО ПОЛНЫЙ `git diff` рабочего дерева — тот же вызов, что и
+# для -a/-am/--all. Секрет в отслеживаемом файле, который команда не трогает вовсе,
+# блокировал чужой чистый коммит. Воспроизведение ревью: cfg.txt правится локально на
+# `password = "MyRealLocalPass123"` и НЕ добавляется, коммитится только новый doc.md
+# командой `git add doc.md && git commit -m doc`; после реального `git add doc.md`
+# `git diff --cached --name-only` показывает один doc.md — cfg.txt в этот коммит не идёт.
+$p16 = New-GitFixture 'scan-add-scoped-not-whole-repo'
+Set-Content -LiteralPath (Join-Path $p16 'cfg.txt') -Value 'host = "localhost"' -Encoding UTF8
+& $gitExe -C $p16 add -A 2>&1 | Out-Null
+& $gitExe -C $p16 commit -qm 'cfg.txt без секрета' 2>&1 | Out-Null
+# Правим отслеживаемый cfg.txt и НЕ делаем git add — секрет остаётся только в рабочем
+# дереве, вне индекса и вне области add ниже.
+Set-Content -LiteralPath (Join-Path $p16 'cfg.txt') -Value 'password = "MyRealLocalPass123"' -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $p16 'doc.md') -Value 'просто документ, без секретов' -Encoding UTF8
+
+# Контроль сценария: после реального `git add doc.md` в этот коммит идёт только doc.md.
+& $gitExe -C $p16 add doc.md 2>&1 | Out-Null
+$realStaged16 = & $gitExe -C $p16 diff --cached --name-only
+& $gitExe -C $p16 restore --staged doc.md 2>&1 | Out-Null
+Check 'контроль сценария: настоящий git add doc.md стажирует только doc.md' (
+    ($realStaged16 | Measure-Object).Count -eq 1 -and $realStaged16 -eq 'doc.md'
+) $realStaged16
+
+$r16a = Invoke-SecretScan -ProjectDir $p16 -Command 'git add doc.md && git -c user.name="t" -c user.email="t@local" commit -m doc'
+Check 'git add doc.md && git commit: посторонний секрет в cfg.txt НЕ блокирует (не входит в add)' (
+    $r16a.Code -eq 0 -and -not $r16a.Out.Trim()
+) "код $($r16a.Code): $($r16a.Out)"
+
+# Регресс-контроль А: тот же секрет, добавленный ИМЕНЕМ файла, по-прежнему блокирует —
+# сужение диффа до add_stage_paths не потеряло путь, который команда РЕАЛЬНО называет.
+$r16b = Invoke-SecretScan -ProjectDir $p16 -Command 'git add cfg.txt && git -c user.name="t" -c user.email="t@local" commit -m x'
+Check 'git add cfg.txt && git commit: тот же секрет, названный по имени, по-прежнему блокирует' (
+    $r16b.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r16b.Out
+Check 'git add cfg.txt: код возврата хука 2' ($r16b.Code -eq 2) "код $($r16b.Code)"
+Check 'git add cfg.txt: причина называет cfg.txt:1' ($r16b.Out -match 'cfg\.txt:1') $r16b.Out
+
+# Регресс-контроль Б: -A по-прежнему видит cfg.txt (git add --dry-run -A перечисляет и
+# изменённые отслеживаемые файлы, не только новые) и блокирует — сужение диффа не
+# ослабило -A/--all.
+$r16c = Invoke-SecretScan -ProjectDir $p16 -Command 'git add -A && git -c user.name="t" -c user.email="t@local" commit -m x'
+Check 'git add -A && git commit: cfg.txt по-прежнему в области видимости -A и блокирует' (
+    $r16c.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r16c.Out
+Check 'git add -A: причина называет cfg.txt:1' ($r16c.Out -match 'cfg\.txt:1') $r16c.Out
+
+# ---------------------------------------------------------------------------
+Section '17. secret-scan.sh: текст отказа советует по месту находки, а не всегда "git restore --staged"'
+# ---------------------------------------------------------------------------
+# ПЯТОЕ РЕВЬЮ M-05 (опровержение находки 11): текст отказа всегда советовал
+# `git restore --staged <файл>` — верно только для находки, УЖЕ лежащей в реальном
+# индексе. Для находки из рабочего дерева (-a/-am/--all, add из этой же команды, новый
+# файл) эта команда ничего не отменяет: индекс на этот файл пуст, `git restore --staged`
+# не находит, что снимать.
+Check 'находка РЕАЛЬНО в индексе ($r6, раздел 6: git add -A сделан заранее, вне команды): совет — git restore --staged' (
+    $r6.Out -match 'git restore --staged'
+) $r6.Out
+Check '-am ($r9a, раздел 9): совет НЕ предлагает git restore --staged (нечего снимать)' (
+    $r9a.Out -notmatch 'git restore --staged'
+) $r9a.Out
+Check 'git add -A && git commit ($r10a, раздел 10): совет НЕ предлагает git restore --staged' (
+    $r10a.Out -notmatch 'git restore --staged'
+) $r10a.Out
+Check 'git add <файл> && git commit ($r10bAddNamedOut, раздел 10): совет НЕ предлагает git restore --staged' (
+    $r10bAddNamedOut -notmatch 'git restore --staged'
+) $r10bAddNamedOut
+Check 'cd sub && git add && git commit ($r14, раздел 14): совет НЕ предлагает git restore --staged' (
+    $r14.Out -notmatch 'git restore --staged'
+) $r14.Out
+
+# Смешанный случай: один секрет РЕАЛЬНО в индексе (застейджен отдельным git add до этой
+# команды), второй — в новом файле, который добавляет САМА эта команда. Оба совета
+# обязаны прозвучать одновременно, каждый про свою находку.
+$p17 = New-GitFixture 'scan-mixed-staged-and-unstaged'
+Set-Content -LiteralPath (Join-Path $p17 'indexed.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p17 add indexed.txt 2>&1 | Out-Null
+Set-Content -LiteralPath (Join-Path $p17 'new.txt') -Value 'const password = "realsecretvalue123";' -Encoding UTF8
+$r17 = Invoke-SecretScan -ProjectDir $p17 -Command 'git add new.txt && git -c user.name="t" -c user.email="t@local" commit -m mixed'
+Check 'смешанный случай: обе находки названы (indexed.txt и new.txt)' (
+    $r17.Out -match 'indexed\.txt:1' -and $r17.Out -match 'new\.txt:1'
+) $r17.Out
+Check 'смешанный случай: совет "git restore --staged" присутствует (для indexed.txt)' (
+    $r17.Out -match 'git restore --staged'
+) $r17.Out
+Check 'смешанный случай: совет "не включай этот путь в add" присутствует (для new.txt)' (
+    $r17.Out -match 'не включай этот путь в add'
+) $r17.Out
+& $gitExe -C $p17 restore --staged indexed.txt 2>&1 | Out-Null
+
+# ---------------------------------------------------------------------------
+Section '18. документация: граница защиты названа, опечатка "диff" не возвращалась'
+# ---------------------------------------------------------------------------
+# Раздел проверяет две находки четвёртого пункта ревью, не покрытые кодом хука:
+# ГРАНИЦА (файл, созданный в той же командной строке, не виден PreToolUse — раньше
+# документация читалась как полная защита) и опечатка смешанным алфавитом "диff".
+$setupTxt = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\SETUP.md')
+Check 'docs/SETUP.md называет границу защиты (файл, созданный той же командной строкой)' (
+    $setupTxt -match 'Граница защиты'
+)
+Check 'docs/SETUP.md: граница даёт конкретный пример (echo ... && git add ... && git commit)' (
+    $setupTxt -match 'echo\s+секрет\s*>\s*c\.txt'
+)
+
+$archTxt = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\ARCHITECTURE.md')
+$cfgTxt  = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\CONFIG.md')
+Check 'docs/ARCHITECTURE.md: опечатка смешанным алфавитом не возвращалась' ($archTxt -notmatch 'диff')
+Check 'docs/CONFIG.md: опечатка смешанным алфавитом не возвращалась' ($cfgTxt -notmatch 'диff')
+Check 'docs/ARCHITECTURE.md: слово написано целиком кириллицей' ($archTxt -match 'дифф')
+Check 'docs/CONFIG.md: слово написано целиком кириллицей' ($cfgTxt -match 'дифф')
 
 # ---------------------------------------------------------------------------
 Restore-TestEnv
