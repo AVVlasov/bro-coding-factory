@@ -170,8 +170,12 @@ import sys
 def short_bundle_has_no_verify(t):
     if not t.startswith("-") or t.startswith("--"):
         return False
-    body = t[1:]
-    if not body or not body.isalpha():
+    # Значение сообщения может быть приклеено к "m" в том же токене, с пробелами и цифрами
+    # (`-anm"wip 1"` после shlex это один токен `-anmwip 1`), поэтому разбираем только
+    # буквенный префикс токена, а не требуем, чтобы токен целиком состоял из букв.
+    m = re.match(r"^-([A-Za-z]*)", t)
+    body = m.group(1) if m else ""
+    if not body:
         return False
     if "m" in body:
         body = body[:body.index("m")]

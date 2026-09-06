@@ -905,6 +905,11 @@ Reset-Fixture -ProjectDir $p -Sha $cleanSha
 foreach ($form in @(
     @{ Label = 'git commit -nm wip (связка -n+-m)';      Cmd = 'git commit -nm wip';    Expect = '-nm' }
     @{ Label = 'git commit -anm "wip" (связка -a-n+-m)'; Cmd = 'git commit -anm "wip"'; Expect = '-anm' }
+    @{ Label = 'git commit -anm"wip 1" (сообщение с пробелом приклеено к m)'; Cmd = 'git commit -anm"wip 1"'; Expect = '-anm' }
+    @{ Label = 'git commit -anmwip2 (сообщение с цифрой приклеено к m)';    Cmd = 'git commit -anmwip2';    Expect = '-anm' }
+    @{ Label = 'git commit -nmwip1 (связка -n+-m с приклеенным значением)';  Cmd = 'git commit -nmwip1';     Expect = '-nm' }
+    @{ Label = 'git commit -nam"wip 1" (n до a, значение с пробелом)';       Cmd = 'git commit -nam"wip 1"'; Expect = '-nam' }
+    @{ Label = 'git commit -qnm"note 2" (q и n перед m)';                    Cmd = 'git commit -qnm"note 2"'; Expect = '-qnm' }
 )) {
     $r = Invoke-ClaudeHookWrapper -ProjectDir $p -Command $form.Cmd
     Check "$($form.Label): secret-scan.sh денаит (обошла бы .githooks/pre-commit целиком)" (
@@ -920,6 +925,11 @@ Check 'git commit -m note: связка "-n" не находится там, г�
     -not $r27negM.Out.Trim()
 ) $r27negM.Out
 Check 'git commit -m note: код возврата 0' ($r27negM.Code -eq 0) "код $($r27negM.Code): $($r27negM.Out)"
+
+foreach ($neg in @('git commit -am"wip 1"', 'git commit -amnote', 'git commit -mn')) {
+    $rNeg = Invoke-ClaudeHookWrapper -ProjectDir $p -Command $neg
+    Check "${neg}: значение после m не читается как флаги (регресс-контроль)" (-not $rNeg.Out.Trim() -and $rNeg.Code -eq 0) "код $($rNeg.Code): $($rNeg.Out)"
+}
 
 $r27negAM = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -am note'
 Check 'git commit -am note: "-am" не путается со связкой "-n"+"-m" (регресс-контроль)' (
