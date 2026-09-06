@@ -471,11 +471,16 @@ foreach ($f in (Get-ChildItem -Path (Join-Path $root 'bin'), (Join-Path $root 's
                               (Join-Path $root 'templates'), (Join-Path $root 'memory') -Recurse -File -ErrorAction SilentlyContinue)) {
     $text = ''
     try { $text = [IO.File]::ReadAllText($f.FullName) } catch { continue }
+    # Git-хуки (templates/git-hooks/pre-commit) намеренно БЕЗ расширения — git ищет файл
+    # ровно по имени "pre-commit", расширение сломало бы распознавание хука. Такой файл
+    # отличается от прочих безрасширенных по шебангу, а не по имени (имя вида "pre-commit"
+    # не уникально для git-хуков).
+    $isShellNoExt = ($f.Extension -eq '') -and ($text -match '(?m)^#!.*\b(?:ba)?sh\b')
     $pats = switch ($f.Extension) {
         '.ps1' { @('\$env:([A-Z][A-Z0-9_]*)') }
         '.sh'  { @('\$\{([A-Z][A-Z0-9_]*):-') }
         '.py'  { @('os\.environ(?:\.get)?[\(\[]"([A-Z][A-Z0-9_]*)"') }
-        default { @() }
+        default { if ($isShellNoExt) { @('\$\{([A-Z][A-Z0-9_]*):-') } else { @() } }
     }
     foreach ($pat in $pats) {
         foreach ($m in [regex]::Matches($text, $pat)) {

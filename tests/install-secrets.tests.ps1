@@ -1,4 +1,4 @@
-# install-secrets.tests.ps1 — bash в settings.json и секреты перед коммитом.
+# install-secrets.tests.ps1 — bash в settings.json, git-хук pre-commit и сканер секретов.
 #
 #   pwsh tests/install-secrets.tests.ps1
 #
@@ -6,19 +6,28 @@
 #
 #   · settings.json с голым 'bash' — на Windows это чаще лаунчер WSL, а не Git Bash: хук
 #     виснет на неинициализированном дистрибутиве или падает молча, и вся проводка
-#     хуков (deструктивные команды, защита обвязки, DoD) перестаёт работать без единой
+#     хуков (деструктивные команды, защита обвязки, DoD) перестаёт работать без единой
 #     видимой ошибки на установке.
 #   · bash не найден — install не должен ни притвориться, что всё поставилось (записать
 #     settings.json с той же голой командой), ни уронить ВЕСЬ install: config/, hooks/,
-#     skills/ не зависят от bash и обязаны встать на место, а `bcf init`, который зовёт
-#     install подпроцессом и следующим шагом читает config/harness.json, не должен
-#     упасть необработанным исключением на файле, которого internal install не написал
-#     совсем по другой причине.
-#   · секрет, попавший в staged-дифф, — тот же класс, что утечка в публичный репозиторий:
-#     коммит обязан заблокироваться раньше, чем секрет уедет в историю git, а сам секрет
-#     не должен попасть даже в текст отказа.
+#     skills/, git-хук секретов не зависят от bash и обязаны встать на место, а `bcf init`,
+#     который зовёт install подпроцессом и следующим шагом читает config/harness.json, не
+#     должен упасть необработанным исключением на файле, которого internal install не
+#     написал совсем по другой причине.
+#   · секрет, попавший в индекс настоящего `git commit` — тот же класс, что утечка в
+#     публичный репозиторий: коммит обязан заблокироваться раньше, чем секрет уедет в
+#     историю git, а сам секрет не должен попасть даже в текст отказа.
 #   · свой несекретный дефолт (`password_default` в config/memory.config.json) не должен
 #     стать вечно красным гейтом — иначе первый же коммит, задевающий этот файл, встаёт.
+#
+# СМЕНА АРХИТЕКТУРЫ (2026-09-06, см. docs/ROADMAP.md M-05a). До этой правки сканер жил в
+# `.claude/hooks/secret-scan.sh` и сам разбирал командную строку `git commit`, чтобы
+# угадать будущий индекс — `-a`/`-am`/`--all`, `git add && git commit` одной строкой, `cd`
+# перед `add`, pathspec внутри `commit` каждый раз были новым обходом, потому что разбор
+# командной строки не закрыть в принципе. Теперь единственный сканер — настоящий git-хук
+# `.githooks/pre-commit`: git вызывает его сам, уже ПОСЛЕ того, как разрешил любой способ
+# стажирования, и раздел 8 и далее проверяют это НАСТОЯЩИМИ `git commit` во временном
+# репозитории с установленным хуком — не симуляцией разбора командной строки.
 #
 # Ни сети, ни моделей: хук — запуск в Git Bash на фикстуре, install/init — прямой прогон
 # CLI фабрики во временных песочницах. «bash не найден» СКВОЗЬ ПРОЦЕСС install
@@ -27,7 +36,10 @@
 # переподставляет эти две переменные системными путями при создании процесса, и override
 # родителя до дочернего pwsh не доезжает (см. секцию 3 и комментарий у Get-BcfBash) —
 # приоритет "git --exec-path перед известными каталогами" поэтому проверяется юнит-вызовом
-# функции в этом же процессе, а не через вложенный pwsh.
+# функции в этом же процессе, а не через вложенный pwsh. «python не найден» на хуке
+# симулируется вычищением python/PyManager/WindowsApps-шима из PATH перед вызовом
+# (проверено вручную: Git Bash подставляет собственные mingw64/bin/usr/bin впереди любого
+# унаследованного PATH, так что git остаётся резолвящимся, а python — нет).
 
 $ErrorActionPreference = 'Continue'
 try {
@@ -37,7 +49,6 @@ try {
 
 $root          = Split-Path $PSScriptRoot -Parent
 $bcf           = Join-Path $root 'bin\bcf.ps1'
-$secretScanSrc = Join-Path $root 'templates\claude\hooks\secret-scan.sh'
 $sandbox       = Join-Path ([IO.Path]::GetTempPath()) ("bcf-installsec-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 
 $script:Pass = 0; $script:Fail = 0
@@ -67,9 +78,9 @@ if (-not $python) {
     exit 1
 }
 
-# ПОЛНЫЕ ПУТИ ДО ЛЮБОЙ ПОДМЕНЫ PATH. Сценарии «bash не найден» подменяют PATH дочернему
-# процессу — если сам pwsh или git резолвятся по голому имени ПОСЛЕ подмены, тест ломает
-# то, чем сам же пользуется, а не то, что должен проверить.
+# ПОЛНЫЕ ПУТИ ДО ЛЮБОЙ ПОДМЕНЫ PATH. Сценарии «bash/python не найден» подменяют PATH
+# дочернему процессу — если сам pwsh или git резолвятся по голому имени ПОСЛЕ подмены,
+# тест ломает то, чем сам же пользуется, а не то, что должен проверить.
 $pwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
 if (-not $pwshExe) {
     Write-Host 'pwsh не найден полным путём — сценарии со скрытым PATH прогнать нечем. ПРОВАЛ.' -ForegroundColor Red
@@ -84,7 +95,7 @@ $gitBinDir = Split-Path $gitExe -Parent
 
 New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
 Write-Host ''
-Write-Host "  BASH В SETTINGS.JSON И СЕКРЕТЫ ПЕРЕД КОММИТОМ   песочница: $sandbox" -ForegroundColor Cyan
+Write-Host "  BASH, GIT-ХУК СЕКРЕТОВ И НАСТОЯЩИЕ GIT COMMIT   песочница: $sandbox" -ForegroundColor Cyan
 
 function Bcf {
     param([string[]]$CliArgs, [hashtable]$Env = @{})
@@ -111,28 +122,62 @@ function New-GitFixture {
     return $p
 }
 
-function Invoke-SecretScan {
-    param([string]$ProjectDir, [string]$Command, [switch]$ForceNoPython)
+# Фикстура + настоящий `bcf install` поверх нeё: единственный способ получить
+# `.githooks/pre-commit` реально включённым (core.hooksPath = .githooks), тем же кодом,
+# которым его получает владелец проекта — не ручной копией шаблона в обход install.
+function New-HookedFixture {
+    param([string]$Name)
+    $p = New-GitFixture $Name
+    $installResult = Bcf @('install', '--project', $p)
+    return [pscustomobject]@{ Path = $p; Install = $installResult }
+}
+
+# Настоящий `git commit` (в т.ч. составной, с `&&`) в Git Bash — не симуляция хука, а
+# именно то, что запускает Claude Code/человек. env:PATH временно урезается сценарием
+# «python не найден»; остальные переменные — точечные (BCF_SECRET_SCAN_DISABLED и т.п.).
+function Invoke-RealCommit {
+    param([string]$ProjectDir, [string]$Command, [hashtable]$Env = @{})
+    $prev = @{}
+    foreach ($k in $Env.Keys) { $prev[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item "env:$k" $Env[$k] }
+    Push-Location $ProjectDir
+    try {
+        $out = & $bash -c $Command 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        foreach ($k in $prev.Keys) {
+            if ($null -eq $prev[$k]) { Remove-Item "env:$k" -ErrorAction SilentlyContinue } else { Set-Item "env:$k" $prev[$k] }
+        }
+    }
+    return [pscustomobject]@{ Out = $out; Code = $code }
+}
+
+# Откатывает фикстуру к заведомо чистому коммиту между сценариями — дешевле, чем отдельная
+# фикстура (со своим `bcf install`, ~0.8с) на каждый из полутора десятков сценариев ниже,
+# и так же надёжно: каждый сценарий стартует с одного и того же известного состояния.
+function Reset-Fixture {
+    param([string]$ProjectDir, [string]$Sha)
+    & $gitExe -C $ProjectDir reset --hard $Sha 2>&1 | Out-Null
+    & $gitExe -C $ProjectDir clean -fd 2>&1 | Out-Null   # без -x: .bcf/ игнорируется .gitignore и не трогается
+}
+
+# Вызов `.claude/hooks/secret-scan.sh` напрямую (как это делает Claude Code: JSON во
+# stdin) — для проверки ТОНКОГО ПРЕДВАРИТЕЛЬНОГО вызова (разделы 19-21), не для проверки
+# самого сканирования (это разделы 8-18 через настоящий git commit).
+function Invoke-ClaudeHookWrapper {
+    param([string]$ProjectDir, [string]$Command)
     $payload = (@{ tool_input = @{ command = $Command } } | ConvertTo-Json -Compress)
     $pf = Join-Path $sandbox ('hook-in-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.json')
     Set-Content -LiteralPath $pf -Value $payload -Encoding UTF8 -NoNewline
     $prev = $env:CLAUDE_PROJECT_DIR
     $env:CLAUDE_PROJECT_DIR = $ProjectDir
-    $prevPath = $env:PATH
-    if ($ForceNoPython) {
-        # Git Bash сам подставляет СВОИ mingw64/bin и usr/bin впереди любого PATH, который
-        # ему дать (проверено вручную) — git, cat, mktemp остаются на месте, а python
-        # (стоящий отдельно, в каталогах вида Python3xx/PyManager) из этого набора выпадает.
-        $env:PATH = (Split-Path $bash -Parent)
-    }
     try {
-        $sh = ($secretScanSrc -replace '\\', '/')
+        $sh = (Join-Path $root 'templates\claude\hooks\secret-scan.sh') -replace '\\', '/'
         $inp = ($pf -replace '\\', '/')
         $out = (& $bash -c "'$sh' < '$inp'" 2>&1 | Out-String)
         $code = $LASTEXITCODE
     } finally {
         if ($null -eq $prev) { Remove-Item env:CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue } else { $env:CLAUDE_PROJECT_DIR = $prev }
-        if ($ForceNoPython) { $env:PATH = $prevPath }
         Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
     }
     return [pscustomobject]@{ Code = $code; Out = $out }
@@ -151,7 +196,7 @@ function Restore-TestEnv {
 }
 
 # ---------------------------------------------------------------------------
-Section '1. Обычный install: settings.json получает полный путь к bash, не голое имя'
+Section '1. Обычный install: settings.json получает полный путь к bash, git-хук секретов включён'
 # ---------------------------------------------------------------------------
 $p1 = New-GitFixture 'install-normal'
 $r1 = Bcf @('install', '--project', $p1)
@@ -205,6 +250,13 @@ if (Test-Path $settings1) {
     } finally { Pop-Location }
 }
 
+# Git-хук секретов — независимая от bash часть install (см. docs/ROADMAP.md M-05a):
+# .githooks/pre-commit версионируемый, core.hooksPath активирует его на этой машине.
+Check '.githooks/pre-commit поставлен' (Test-Path (Join-Path $p1 '.githooks\pre-commit'))
+Check 'core.hooksPath указывает на .githooks' (
+    (& $gitExe -C $p1 config --get core.hooksPath) -eq '.githooks'
+)
+
 # ---------------------------------------------------------------------------
 Section '2. bash не найден вообще: install отказывается писать settings.json с голым bash'
 # ---------------------------------------------------------------------------
@@ -226,6 +278,12 @@ Check 'settings.json НЕ записан' (-not (Test-Path $settings2))
 Check 'хуки при этом поставлены (не зависят от bash)' (Test-Path (Join-Path $p2 '.claude\hooks\secret-scan.sh'))
 Check 'config поставлен (init не упадёт на его отсутствии)' (Test-Path (Join-Path $p2 'config\harness.json'))
 Check 'CLAUDE.md поставлен' (Test-Path (Join-Path $p2 'CLAUDE.md'))
+# Git-хук секретов вообще не зависит от bash (это git, а не Claude Code) — обязан встать
+# и включиться, даже когда settings.json не поставлен из-за отсутствующего Git Bash.
+Check '.githooks/pre-commit поставлен, несмотря на отказ bash' (Test-Path (Join-Path $p2 '.githooks\pre-commit'))
+Check 'core.hooksPath включён, несмотря на отказ bash' (
+    (& $gitExe -C $p2 config --get core.hooksPath) -eq '.githooks'
+)
 
 # Повторный install --force тоже не имеет права родить settings.json с голым bash.
 $r2b = Bcf @('install', '--project', $p2, '--force') -Env $noBashEnv
@@ -298,6 +356,10 @@ Check 'init не падает необработанным исключение�
 Check 'init сообщает о непоставленном settings.json' ($r4.Out -match 'закончился отказом') $r4.Out
 Check 'config/harness.json создан несмотря на отказ install' (Test-Path (Join-Path $p4 'config\harness.json'))
 Check 'settings.json НЕ создан голым' (-not (Test-Path (Join-Path $p4 '.claude\settings.json')))
+Check 'git-хук секретов поставлен и включён несмотря на отказ bash' (
+    (Test-Path (Join-Path $p4 '.githooks\pre-commit')) -and
+    ((& $gitExe -C $p4 config --get core.hooksPath) -eq '.githooks')
+)
 # Регрессия найдена ревью M-05: init отчитывался кодом 0 при неподключённых 15 хуках —
 # «init прошёл зелёным» читалось как «обвязка на месте», хотя settings.json не поставлен.
 # install при этом же отказе сам выходит кодом 2 (см. install.ps1: exit 2 при
@@ -310,213 +372,375 @@ Check 'init выносит отказ в "без этого прогон не п
 Restore-TestEnv
 
 # ---------------------------------------------------------------------------
-Section '5. secret-scan.sh: обычный коммит без секретов проходит молча'
+Section '5. git-хук: чужой .git/hooks/pre-commit уже есть — install не перезаписывает и не дописывает вслепую'
 # ---------------------------------------------------------------------------
-$p5 = New-GitFixture 'scan-clean'
-Set-Content -LiteralPath (Join-Path $p5 'note.txt') -Value 'просто текст, без секретов' -Encoding UTF8
-& $gitExe -C $p5 add -A 2>&1 | Out-Null
-$r5 = Invoke-SecretScan -ProjectDir $p5 -Command 'git -c user.name="t" -c user.email="t@local" commit -m "note"'
-Check 'хук ничего не печатает на чистом коммите' (-not $r5.Out.Trim()) $r5.Out
-Check 'код возврата хука 0 (не блокирует Claude Code хук-протокол)' ($r5.Code -eq 0) $r5.Out
-& $gitExe -C $p5 restore --staged . 2>&1 | Out-Null
+# Чужой хук может быть на любом языке — python `pre-commit` framework, Husky-обёртка,
+# рукописный скрипт. Дозапись команды в конец чужого файла вслепую способна его сломать
+# так, что заметят не сразу (свой ранний `exit`, другой интерпретатор). install вместо
+# этого ставит .githooks/pre-commit (файл доступен), НЕ трогает core.hooksPath (иначе
+# существующий .git/hooks/pre-commit молча перестал бы вызываться) и печатает готовую
+# строку для ручной дозаписи.
+$p5 = New-GitFixture 'githook-legacy-precommit'
+$legacyHook5 = Join-Path $p5 '.git\hooks\pre-commit'
+Set-Content -LiteralPath $legacyHook5 -Value "#!/bin/sh`necho `"third party hook`"`n" -Encoding UTF8
+$r5 = Bcf @('install', '--project', $p5, '--only', 'claude')
+Check 'install (с чужим .git/hooks/pre-commit) отработал зелёным' ($r5.Code -eq 0) "код $($r5.Code): $($r5.Out)"
+Check '.githooks/pre-commit всё равно поставлен (файл доступен для ручной дозаписи)' (
+    Test-Path (Join-Path $p5 '.githooks\pre-commit')
+)
+Check 'core.hooksPath НЕ тронут (чужой .git/hooks/pre-commit не выключен молча)' (
+    -not (& $gitExe -C $p5 config --get core.hooksPath)
+)
+Check 'чужой .git/hooks/pre-commit не перезаписан (содержимое то же самое)' (
+    (Get-Content -Raw -LiteralPath $legacyHook5) -match 'third party hook'
+)
+Check 'install предупреждает и даёт готовую строку для дозаписи' (
+    $r5.Out -match 'сканер секретов перед коммитом: требуется ручное внимание' -and
+    $r5.Out -match '\.git/hooks/pre-commit' -and
+    $r5.Out -match '\.githooks/pre-commit'
+) $r5.Out
 
 # ---------------------------------------------------------------------------
-Section '6. secret-scan.sh: блокирует коммит с образцом ключа, значение не печатает'
+Section '6. git-хук: core.hooksPath уже указывает на чужую систему хуков — install не перезаписывает'
 # ---------------------------------------------------------------------------
-# Заведомо ненастоящие строки-образцы: собраны так, чтобы совпасть с форматом ключа, а не
-# быть чьим-то реальным секретом.
-$fakeAwsKey = 'AKIA' + ('FAKE' * 4)
-$p6 = New-GitFixture 'scan-secret'
-Set-Content -LiteralPath (Join-Path $p6 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-& $gitExe -C $p6 add -A 2>&1 | Out-Null
-$r6 = Invoke-SecretScan -ProjectDir $p6 -Command 'git -c user.name="t" -c user.email="t@local" commit -m "add creds"'
-# Формат PreToolUse по доке Claude Code (code.claude.com/docs/en/hooks, сверено 2026-09-05):
-# hookSpecificOutput.permissionDecision, не верхнеуровневый decision — верхнеуровневое поле
-# дока прямо называет неподходящим для PreToolUse. Блокировка держится на коде возврата 2
-# («Exit 2 means a blocking error... blocks whether or not you print JSON»), поэтому код
-# проверяем отдельно и это не необязательная деталь.
-Check 'хук возвращает hookSpecificOutput.permissionDecision: deny' (
-    $r6.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r6.Out
-Check 'код возврата хука 2 (блокирует по доке Claude Code независимо от JSON)' ($r6.Code -eq 2) "код $($r6.Code): $($r6.Out)"
-Check 'причина называет файл и строку' ($r6.Out -match 'creds\.txt:1') $r6.Out
-Check 'само значение ключа НЕ печатается' ($r6.Out -notmatch [regex]::Escape($fakeAwsKey)) $r6.Out
-& $gitExe -C $p6 restore --staged . 2>&1 | Out-Null
+$p6 = New-GitFixture 'githook-foreign-hookspath'
+New-Item -ItemType Directory -Force -Path (Join-Path $p6 'my-hooks') | Out-Null
+& $gitExe -C $p6 config core.hooksPath 'my-hooks' 2>&1 | Out-Null
+$r6 = Bcf @('install', '--project', $p6, '--only', 'claude')
+Check 'install (с чужим core.hooksPath) отработал зелёным' ($r6.Code -eq 0) "код $($r6.Code): $($r6.Out)"
+Check 'core.hooksPath остался чужим (my-hooks), не переписан на .githooks' (
+    (& $gitExe -C $p6 config --get core.hooksPath) -eq 'my-hooks'
+)
+Check '.githooks/pre-commit всё равно поставлен (для ручной дозаписи)' (
+    Test-Path (Join-Path $p6 '.githooks\pre-commit')
+)
+Check 'install называет текущий core.hooksPath в предупреждении' ($r6.Out -match "'my-hooks'") $r6.Out
 
 # ---------------------------------------------------------------------------
-Section '7. secret-scan.sh: password_default этого репозитория — не находка'
+Section '7. git-хук: не git-репозиторий — install не падает, предупреждает и не ставит хук'
 # ---------------------------------------------------------------------------
-# Регрессия: правило на присваивания уже, чем в detect-secrets (там ключевое слово допускает
-# суффикс) — иначе каждый коммит, задевающий config/memory.config.json, вставал бы.
-$p7 = New-GitFixture 'scan-own-default'
-New-Item -ItemType Directory -Force -Path (Join-Path $p7 'config') | Out-Null
-Set-Content -LiteralPath (Join-Path $p7 'config\memory.config.json') -Value (
-    '{ "host": "localhost", "password_default": "bcf_local_dev", "password_env": "BCF_PG_PASSWORD" }'
-) -Encoding UTF8
-& $gitExe -C $p7 add -A 2>&1 | Out-Null
-$r7 = Invoke-SecretScan -ProjectDir $p7 -Command 'git -c user.name="t" -c user.email="t@local" commit -m "memory config"'
-Check 'password_default/password_env не блокируют коммит' (-not $r7.Out.Trim()) $r7.Out
-& $gitExe -C $p7 restore --staged . 2>&1 | Out-Null
+$p7 = Join-Path $sandbox 'githook-not-a-repo'
+New-Item -ItemType Directory -Force -Path $p7 | Out-Null
+$r7 = Bcf @('install', '--project', $p7, '--only', 'claude')
+Check 'install на не-git-каталоге не падает необработанным исключением' ($r7.Out -notmatch 'Exception|ParserError') $r7.Out
+Check 'install на не-git-каталоге по-прежнему отрабатывает зелёным (остальное не зависит от git)' ($r7.Code -eq 0) "код $($r7.Code): $($r7.Out)"
+Check '.githooks/pre-commit НЕ поставлен (некуда — нет .git)' (-not (Test-Path (Join-Path $p7 '.githooks\pre-commit')))
+Check 'install называет причину (нет .git)' ($r7.Out -match 'не git-репозиторий') $r7.Out
 
 # ---------------------------------------------------------------------------
-Section '8. secret-scan.sh реагирует только на git commit, не на любую bash-команду'
+Section '8. настоящий git commit с установленным хуком: подготовка общей фикстуры, чистый коммит проходит'
 # ---------------------------------------------------------------------------
-$p8 = New-GitFixture 'scan-not-commit'
-Set-Content -LiteralPath (Join-Path $p8 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-& $gitExe -C $p8 add -A 2>&1 | Out-Null
-$r8a = Invoke-SecretScan -ProjectDir $p8 -Command 'git status'
-Check '"git status" не сканируется (тот же секрет уже staged)' (-not $r8a.Out.Trim()) $r8a.Out
-$r8b = Invoke-SecretScan -ProjectDir $p8 -Command 'docker commit mycontainer myimage'
-Check '"docker commit" не путается с "git commit"' (-not $r8b.Out.Trim()) $r8b.Out
-& $gitExe -C $p8 restore --staged . 2>&1 | Out-Null
+# Разделы 8-18 работают на ОДНОЙ фикстуре с РЕАЛЬНО установленным и включённым
+# `.githooks/pre-commit` (настоящий `bcf install`, не ручная копия шаблона в обход него).
+# Каждый сценарий откатывает фикстуру к одному known-good коммиту (Reset-Fixture) вместо
+# отдельного `bcf install` на сценарий — дешевле и так же надёжно.
+$hf = New-HookedFixture 'real-commits'
+$p = $hf.Path
+Check 'install (для живых git commit) отработал зелёным' ($hf.Install.Code -eq 0) "код $($hf.Install.Code): $($hf.Install.Out)"
+Check '.githooks/pre-commit реально стоит' (Test-Path (Join-Path $p '.githooks\pre-commit'))
+Check 'core.hooksPath реально указывает на .githooks' (
+    (& $gitExe -C $p config --get core.hooksPath) -eq '.githooks'
+)
 
-# ---------------------------------------------------------------------------
-Section '9. secret-scan.sh: -a/-am не даёт обойти сканер секретом из рабочего дерева'
-# ---------------------------------------------------------------------------
-# Регрессия найдена ревью M-05: `git commit -am` стажирует отслеживаемые правки ВНУТРИ
-# самого commit, уже после того, как хук проверил `git diff --cached`. Секрет, лежащий
-# только в рабочем дереве (git add не делали), на пустом индексе проезжал мимо хука
-# молча — ровно так, как воспроизведено ревью.
-$p9a = New-GitFixture 'scan-dash-a-bypass'
-Set-Content -LiteralPath (Join-Path $p9a 'creds.txt') -Value 'просто текст, без секретов' -Encoding UTF8
-& $gitExe -C $p9a add -A 2>&1 | Out-Null
-& $gitExe -C $p9a commit -qm 'creds.txt без секрета' 2>&1 | Out-Null
-# Правим отслеживаемый файл и НЕ делаем git add — ровно сценарий из находки ревью.
-Set-Content -LiteralPath (Join-Path $p9a 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-$stagedBefore = & $gitExe -C $p9a diff --cached --stat
-Check 'контроль сценария: индекс на момент правки пуст (правка НЕ добавлена в staging)' (-not $stagedBefore)
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value 'host = "localhost"' -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $p 'note.txt')  -Value 'просто заметка, без секретов' -Encoding UTF8
+& $gitExe -C $p add -A 2>&1 | Out-Null
+& $gitExe -C $p commit -qm 'baseline: harness + чистые файлы' 2>&1 | Out-Null
+$cleanSha = (& $gitExe -C $p rev-parse HEAD).Trim()
+Check 'контроль сценария: baseline-коммит реально создан' ([bool]$cleanSha)
 
-$r9a = Invoke-SecretScan -ProjectDir $p9a -Command 'git -c user.name="t" -c user.email="t@local" commit -am wip'
-Check '-am: хук блокирует секрет из рабочего дерева, а не только из индекса' (
-    $r9a.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r9a.Out
-Check '-am: код возврата хука 2' ($r9a.Code -eq 2) "код $($r9a.Code): $($r9a.Out)"
-Check '-am: причина называет файл и строку' ($r9a.Out -match 'creds\.txt:1') $r9a.Out
-Check '-am: само значение ключа НЕ печатается' ($r9a.Out -notmatch [regex]::Escape($fakeAwsKey)) $r9a.Out
+Add-Content -LiteralPath (Join-Path $p 'note.txt') -Value 'вторая строка' -Encoding UTF8
+& $gitExe -C $p add note.txt 2>&1 | Out-Null
+$r8 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m clean'
+Check 'чистый коммит (без секретов) проходит' ($r8.Code -eq 0) $r8.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
 
-# Без -a/-am тот же незастейдженный секрет по-прежнему вне области видимости --cached —
-# регресс-контроль, что фикс не начал сканировать рабочее дерево ВСЕГДА.
-$r9b = Invoke-SecretScan -ProjectDir $p9a -Command 'git -c user.name="t" -c user.email="t@local" commit -m wip'
-Check 'без -a/-am незастейдженный секрет по-прежнему не сканируется (регресс не внесён)' (-not $r9b.Out.Trim()) $r9b.Out
-& $gitExe -C $p9a checkout -- creds.txt 2>&1 | Out-Null
+$fakeAwsKey = 'AKIA' + ('FAKE' * 4)   # 16 симв. после AKIA — заведомо ненастоящий, формат ключа
 
 # ---------------------------------------------------------------------------
-Section '10. secret-scan.sh: `git add ... && git commit ...` в одной строке не даёт обойти сканер'
+Section '9. настоящий commit: -a / -am / -am"wip" блокируют секрет из рабочего дерева'
 # ---------------------------------------------------------------------------
-# Регрессия найдена ревью M-05: хук — PreToolUse, он смотрит на командную строку и индекс
-# ДО того, как что-либо из неё выполнилось. `git add -A && git commit -m secret` в одну
-# команду: на момент проверки git add ещё не сработал, `git diff --cached` пуст, секрет
-# из НЕОТСЛЕЖИВАЕМОГО файла (в staging его никогда не заносили — ни здесь, ни отдельной
-# командой раньше) проезжал мимо хука молча. Воспроизведение ревью: creds.txt не в
-# индексе, {"tool_input":{"command":"git add -A && git commit -m secret"}} -> exit 0.
-$p10a = New-GitFixture 'scan-add-commit-bypass'
-Set-Content -LiteralPath (Join-Path $p10a 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-$stagedBefore10 = & $gitExe -C $p10a diff --cached --stat
-Check 'контроль сценария: индекс пуст, creds.txt не добавлен ни разу' (-not $stagedBefore10)
-
-$r10a = Invoke-SecretScan -ProjectDir $p10a -Command 'git add -A && git commit -m secret'
-Check 'git add -A && git commit: хук блокирует секрет из НЕотслеживаемого файла' (
-    $r10a.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r10a.Out
-Check 'git add -A && git commit: код возврата хука 2' ($r10a.Code -eq 2) "код $($r10a.Code): $($r10a.Out)"
-Check 'git add -A && git commit: причина называет файл и строку' ($r10a.Out -match 'creds\.txt:1') $r10a.Out
-Check 'git add -A && git commit: само значение ключа НЕ печатается' ($r10a.Out -notmatch [regex]::Escape($fakeAwsKey)) $r10a.Out
-# Индекс после срабатывания хука обязан остаться пустым — сканирование идёт через
-# `git add --dry-run` (git явно обещает ничего не менять), а не через настоящий add.
-$stagedAfter10 = & $gitExe -C $p10a diff --cached --stat
-Check 'git add --dry-run не оставил побочных следов в индексе' (-not $stagedAfter10) $stagedAfter10
-
-# Тот же секрет, но git add адресует файл по имени, а не -A — pathspec тоже уходит
-# настоящему git (git add --dry-run <файл>), а не собственному разбору.
-$p10b = New-GitFixture 'scan-add-named-commit-bypass'
-Set-Content -LiteralPath (Join-Path $p10b 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-$r10b = Invoke-SecretScan -ProjectDir $p10b -Command 'git add creds.txt && git commit -m secret'
-Check 'git add <файл> && git commit: хук тоже блокирует (не только с -A)' (
-    $r10b.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r10b.Out
-Check 'git add <файл> && git commit: код возврата хука 2' ($r10b.Code -eq 2) "код $($r10b.Code)"
-# Копия ответа под своим именем: $r10b дальше переиспользуется в разделе 12 (doctor) под
-# ТЕМ ЖЕ именем для другого сценария — раздел 17 ссылается на этот сохранённый ответ, а
-# не на $r10b, чтобы не читать чужой, более поздний вывод по случайному совпадению имени.
-$r10bAddNamedOut = $r10b.Out
-
-# Регресс-контроль: чистый add+commit (без секрета) по-прежнему проходит молча — фикс не
-# начал блокировать любую связку add+commit как таковую.
-$p10c = New-GitFixture 'scan-add-commit-clean'
-Set-Content -LiteralPath (Join-Path $p10c 'note.txt') -Value 'просто текст, без секретов' -Encoding UTF8
-$r10c = Invoke-SecretScan -ProjectDir $p10c -Command 'git add -A && git commit -m note'
-Check 'git add -A && git commit без секрета проходит молча (регресс не внесён)' (-not $r10c.Out.Trim()) $r10c.Out
-Check 'чистый add+commit: код возврата хука 0' ($r10c.Code -eq 0) "код $($r10c.Code): $($r10c.Out)"
-
-# Регрессия найдена ЧЕТВЁРТЫМ ревью M-05: `git ls-files --others --exclude-standard`
-# уважает core.quotepath (по умолчанию true у git) и C-квотирует не-ASCII байты имени
-# файла ("\320\272..."), а `git add --dry-run` печатает то же имя как есть, без
-# квотирования — из-за расхождения новый файл с кириллическим именем не находил себя в
-# списке неотслеживаемых и не сканировался вообще, хотя реально уходил в коммит.
-$p10d = New-GitFixture 'scan-add-commit-cyrillic-bypass'
-Set-Content -LiteralPath (Join-Path $p10d 'ключи.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-$r10d = Invoke-SecretScan -ProjectDir $p10d -Command 'git add -A && git commit -m x'
-Check 'git add -A && git commit: кириллическое имя файла тоже блокирует (core.quotepath)' (
-    $r10d.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r10d.Out
-Check 'кириллица: код возврата хука 2' ($r10d.Code -eq 2) "код $($r10d.Code): $($r10d.Out)"
-Check 'кириллица: причина называет файл и строку' ($r10d.Out -match 'ключи\.txt:1') $r10d.Out
-Check 'кириллица: само значение ключа НЕ печатается' ($r10d.Out -notmatch [regex]::Escape($fakeAwsKey)) $r10d.Out
+# creds.txt уже отслеживается (baseline). Правим его В РАБОЧЕМ ДЕРЕВЕ и НЕ делаем git
+# add — ровно сценарий, который проезжал мимо разбора командной строки: `-a`/`-am`
+# стажируют правку ВНУТРИ самого commit, git-хук видит уже собранный git'ом индекс.
+foreach ($form in @(
+    @{ Label = 'git commit -a -m wip';              Cmd = 'git commit -a -m wip' }
+    @{ Label = 'git commit -am wip';                Cmd = 'git commit -am wip' }
+    @{ Label = 'git commit -am"wip" (без пробела)'; Cmd = 'git commit -am"wip"' }
+)) {
+    Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+    $r = Invoke-RealCommit -ProjectDir $p -Command $form.Cmd
+    Check "$($form.Label): блокирует" ($r.Code -ne 0) "код $($r.Code): $($r.Out)"
+    Check "$($form.Label): причина называет файл и строку" ($r.Out -match 'creds\.txt:1') $r.Out
+    Check "$($form.Label): значение ключа НЕ печатается" ($r.Out -notmatch [regex]::Escape($fakeAwsKey)) $r.Out
+    Reset-Fixture -ProjectDir $p -Sha $cleanSha
+}
 
 # ---------------------------------------------------------------------------
-Section '11. secret-scan.sh: значение-ссылка на переменную/окружение — не находка'
+Section '10. настоящий commit: `git add ... && git commit ...` в одной команде блокирует'
 # ---------------------------------------------------------------------------
-# Регрессия найдена ревью M-05: правило "присвоение секрета" считало находкой код, который
-# УЖЕ читает секрет из окружения (`process.env.X`, `os.environ[...]`, `os.getenv(...)`,
-# `config.api_key`, обращение к другой переменной вида `pwd = password`) — то есть блокировало
-# ровно то решение, которое сам текст отказа советует принять. Четыре воспроизведения ревью:
+Set-Content -LiteralPath (Join-Path $p 'newsecret.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r10 = Invoke-RealCommit -ProjectDir $p -Command 'git add newsecret.txt && git commit -m secret'
+Check 'git add newsecret.txt && git commit: блокирует новый файл с секретом' ($r10.Code -ne 0) "код $($r10.Code): $($r10.Out)"
+Check 'причина называет newsecret.txt:1' ($r10.Out -match 'newsecret\.txt:1') $r10.Out
+Check 'значение ключа НЕ печатается' ($r10.Out -notmatch [regex]::Escape($fakeAwsKey)) $r10.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Регресс-контроль: та же форма команды без секрета проходит молча — фикс не начал
+# блокировать любую связку add+commit как таковую.
+Set-Content -LiteralPath (Join-Path $p 'harmless.txt') -Value 'без секретов' -Encoding UTF8
+$r10b = Invoke-RealCommit -ProjectDir $p -Command 'git add -A && git commit -m harmless'
+Check 'git add -A && git commit без секрета проходит (регресс не внесён)' ($r10b.Code -eq 0) $r10b.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '11. настоящий commit: pathspec внутри самого `commit` (-m msg <файл>, --include, --only) блокирует'
+# ---------------------------------------------------------------------------
+foreach ($form in @(
+    @{ Label = 'git commit -m wip <файл> (pathspec)'; Cmd = 'git commit -m wip creds.txt' }
+    @{ Label = 'git commit --include <файл>';         Cmd = 'git commit --include creds.txt -m wip' }
+    @{ Label = 'git commit --only <файл>';            Cmd = 'git commit --only creds.txt -m wip' }
+)) {
+    Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+    $r = Invoke-RealCommit -ProjectDir $p -Command $form.Cmd
+    Check "$($form.Label): блокирует" ($r.Code -ne 0) "код $($r.Code): $($r.Out)"
+    Check "$($form.Label): причина называет файл и строку" ($r.Out -match 'creds\.txt:1') $r.Out
+    Check "$($form.Label): значение ключа НЕ печатается" ($r.Out -notmatch [regex]::Escape($fakeAwsKey)) $r.Out
+    Reset-Fixture -ProjectDir $p -Sha $cleanSha
+}
+
+# ---------------------------------------------------------------------------
+Section '12. секрет в отслеживаемом файле, которого коммит не касается, не блокирует'
+# ---------------------------------------------------------------------------
+$today = Get-Date -Format 'yyyy-MM-dd'
+New-Item -ItemType Directory -Force -Path (Join-Path $p 'docs') | Out-Null
+Set-Content -LiteralPath (Join-Path $p 'docs\decisions.md') -Value "## $today — BCF_SECRET_SCAN_DISABLED сид фикстуры для раздела 12" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $p 'cfg.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add -A 2>&1 | Out-Null
+$rSeed = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m seed' -Env @{ BCF_SECRET_SCAN_DISABLED = '1' }
+Check 'сид: секрет в cfg.txt закоммичен через обход (для теста ниже)' ($rSeed.Code -eq 0) $rSeed.Out
+
+Add-Content -LiteralPath (Join-Path $p 'note.txt') -Value 'третья строка' -Encoding UTF8
+& $gitExe -C $p add note.txt 2>&1 | Out-Null
+$r12 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m unrelated'
+Check 'секрет в cfg.txt (не тронутом этим коммитом) НЕ блокирует' ($r12.Code -eq 0) $r12.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '13. текст -m с «-a» внутри не даёт ложного расширения проверки'
+# ---------------------------------------------------------------------------
+# Регрессия старого механизма (пятое ревью M-05, до этой правки): короткий флаг искался по
+# сырой строке хвоста commit, поэтому `-m "правка -a теперь" doc.md` включал ПОЛНЫЙ diff
+# рабочего дерева и блокировал коммит из-за секрета в постороннем файле. Git-хук команду
+# вообще не разбирает — сценарий физически не может повториться, регресс-контроль не лишний.
+Set-Content -LiteralPath (Join-Path $p 'doc.md') -Value 'обычный документ' -Encoding UTF8
+& $gitExe -C $p add doc.md 2>&1 | Out-Null
+$r13 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "правка -a теперь" doc.md'
+Check 'commit с «-a» внутри текста сообщения проходит, если секретов нет' ($r13.Code -eq 0) $r13.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '14. значение-ссылка на переменную/окружение — не находка; реальный литерал по-прежнему блокирует'
+# ---------------------------------------------------------------------------
 $refFiles = @(
-    @{ Name = 'app.js'; Content = 'const token = process.env.GITHUB_TOKEN;'; What = 'JS: token = process.env.*' }
+    @{ Name = 'app.js';  Content = 'const token = process.env.GITHUB_TOKEN;'; What = 'JS: token = process.env.*' }
     @{ Name = 'app2.js'; Content = 'const apiKey = config.api_key;'; What = 'JS: apiKey = config.*' }
     @{ Name = 'app3.js'; Content = 'const secret = process.env.MY_SECRET;'; What = 'JS: secret = process.env.*' }
-    @{ Name = 'app.py'; Content = 'API_KEY = os.environ["OPENAI_API_KEY"]'; What = 'Python: API_KEY = os.environ[...]' }
+    @{ Name = 'app.py';  Content = 'API_KEY = os.environ["OPENAI_API_KEY"]'; What = 'Python: API_KEY = os.environ[...]' }
     @{ Name = 'app2.py'; Content = 'pwd = password or os.getenv("DB_PASSWORD")'; What = 'Python: pwd = password or os.getenv(...)' }
 )
 foreach ($rf in $refFiles) {
-    $p11 = New-GitFixture ('scan-ref-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
-    Set-Content -LiteralPath (Join-Path $p11 $rf.Name) -Value $rf.Content -Encoding UTF8
-    & $gitExe -C $p11 add -A 2>&1 | Out-Null
-    $rRef = Invoke-SecretScan -ProjectDir $p11 -Command 'git -c user.name="t" -c user.email="t@local" commit -m note'
-    Check "значение-ссылка не блокирует: $($rf.What)" (-not $rRef.Out.Trim()) $rRef.Out
-    & $gitExe -C $p11 restore --staged . 2>&1 | Out-Null
+    Set-Content -LiteralPath (Join-Path $p $rf.Name) -Value $rf.Content -Encoding UTF8
+    & $gitExe -C $p add $rf.Name 2>&1 | Out-Null
+    $rRef = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m note'
+    Check "значение-ссылка не блокирует: $($rf.What)" ($rRef.Code -eq 0) $rRef.Out
+    Reset-Fixture -ProjectDir $p -Sha $cleanSha
 }
 
-# Регресс-контроль: реальный литерал под тем же ключевым словом по-прежнему блокируется —
-# фильтр значений-ссылок не должен был выключить правило целиком.
-$p11b = New-GitFixture 'scan-real-literal-still-blocks'
-Set-Content -LiteralPath (Join-Path $p11b 'config.js') -Value 'const password = "realsecretvalue123";' -Encoding UTF8
-& $gitExe -C $p11b add -A 2>&1 | Out-Null
-$r11b = Invoke-SecretScan -ProjectDir $p11b -Command 'git -c user.name="t" -c user.email="t@local" commit -m note'
-Check 'реальный литерал password = "..." по-прежнему блокируется (правило не выключено)' (
-    $r11b.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r11b.Out
-& $gitExe -C $p11b restore --staged . 2>&1 | Out-Null
+Set-Content -LiteralPath (Join-Path $p 'config.js') -Value 'const password = "realsecretvalue123";' -Encoding UTF8
+& $gitExe -C $p add config.js 2>&1 | Out-Null
+$r14b = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m note'
+Check 'реальный литерал password = "..." по-прежнему блокируется (фильтр ссылок не выключил правило)' ($r14b.Code -ne 0) $r14b.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# password_default/password_env этого же репозитория (см. config/memory.config.json,
+# поставленный bcf install в baseline) — правка файла не должна вставать вечно-красным
+# гейтом на каждом коммите, задевающем его.
+Set-Content -LiteralPath (Join-Path $p 'config\memory.config.json') -Value (
+    '{ "host": "localhost", "password_default": "bcf_local_dev", "password_env": "BCF_PG_PASSWORD" }'
+) -Encoding UTF8
+& $gitExe -C $p add config\memory.config.json 2>&1 | Out-Null
+$r14c = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "memory config"'
+Check 'password_default/password_env в config/memory.config.json не блокирует' ($r14c.Code -eq 0) $r14c.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
 
 # ---------------------------------------------------------------------------
-Section '12. doctor объявляет Windows требованием'
+Section '15. BCF_SECRET_SCAN_DISABLED=1 с записью в docs/decisions.md пропускает и оставляет след'
+# ---------------------------------------------------------------------------
+New-Item -ItemType Directory -Force -Path (Join-Path $p 'docs') | Out-Null
+Set-Content -LiteralPath (Join-Path $p 'docs\decisions.md') -Value "## $today — BCF_SECRET_SCAN_DISABLED тестовый обход раздела 15" -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add -A 2>&1 | Out-Null
+$r15 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "disabled scan"' -Env @{ BCF_SECRET_SCAN_DISABLED = '1' }
+Check 'BCF_SECRET_SCAN_DISABLED=1 с записью в decisions.md пропускает секрет' ($r15.Code -eq 0) $r15.Out
+$decisionsCommitted = & $gitExe -C $p show HEAD:docs/decisions.md
+Check 'запись BCF_SECRET_SCAN_DISABLED реально уехала в коммит вместе с обходом' ($decisionsCommitted -match 'BCF_SECRET_SCAN_DISABLED') $decisionsCommitted
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '16. BCF_SECRET_SCAN_DISABLED=1 БЕЗ записи в docs/decisions.md — отказывает'
+# ---------------------------------------------------------------------------
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add -A 2>&1 | Out-Null
+$r16 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "should refuse"' -Env @{ BCF_SECRET_SCAN_DISABLED = '1' }
+Check 'без docs/decisions.md отказывает (не пропускает молча)' ($r16.Code -ne 0) $r16.Out
+Check 'причина называет BCF_SECRET_SCAN_DISABLED и decisions.md' (
+    $r16.Out -match 'BCF_SECRET_SCAN_DISABLED' -and $r16.Out -match 'decisions\.md'
+) $r16.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '17. python не найден на хуке — коммит отказывает явно'
+# ---------------------------------------------------------------------------
+# Git Bash подставляет собственные mingw64/bin/usr/bin впереди унаследованного PATH — git
+# остаётся резолвящимся, а python (и лаунчеры PyManager/WindowsApps) вычищены из PATH
+# отдельно (проверено вручную перед написанием этого раздела).
+$noPyPath = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'python' -and $_ -notmatch 'PyManager' -and $_ -notmatch 'WindowsApps' }) -join ';'
+Add-Content -LiteralPath (Join-Path $p 'note.txt') -Value 'без python' -Encoding UTF8
+& $gitExe -C $p add note.txt 2>&1 | Out-Null
+$r17 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "no python"' -Env @{ PATH = $noPyPath }
+Check 'без python в PATH коммит отказывает явно' ($r17.Code -ne 0) $r17.Out
+Check 'причина называет python' ($r17.Out -match 'python') $r17.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Контроль сценария: с обычным PATH тот же коммит без секрета проходит — деградация
+# специфична именно к отсутствию python, а не к сломанному сценарию вообще.
+Add-Content -LiteralPath (Join-Path $p 'note.txt') -Value 'с python' -Encoding UTF8
+& $gitExe -C $p add note.txt 2>&1 | Out-Null
+$r17control = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "with python"'
+Check 'контроль сценария: с обычным PATH тот же коммит без секрета проходит' ($r17control.Code -eq 0) $r17control.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '18. МУТАЦИЯ: с выключенным сканером все блокирующие случаи из разделов 9-11 проходят'
+# ---------------------------------------------------------------------------
+# Доказывает, что разделы 9-11 блокируют ИМЕННО из-за сканера, а не из-за чего-то ещё
+# (сломанная фикстура, посторонний гейт) — с тем же самым BCF_SECRET_SCAN_DISABLED-обходом
+# каждая ранее блокирующая форма обязана теперь пройти.
+New-Item -ItemType Directory -Force -Path (Join-Path $p 'docs') | Out-Null
+Set-Content -LiteralPath (Join-Path $p 'docs\decisions.md') -Value "## $today — BCF_SECRET_SCAN_DISABLED мутация раздела 18" -Encoding UTF8
+& $gitExe -C $p add docs\decisions.md 2>&1 | Out-Null
+$rSeed18 = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m "decisions seed"' -Env @{ BCF_SECRET_SCAN_DISABLED = '1' }
+Check 'мутация: сид decisions.md закоммичен' ($rSeed18.Code -eq 0) $rSeed18.Out
+$cleanSha18 = (& $gitExe -C $p rev-parse HEAD).Trim()
+
+$mutationForms = @(
+    @{ Label = 'git commit -am wip';                  Cmd = 'git commit -am wip';                Setup = { Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8 } }
+    @{ Label = 'git add newsecret.txt && git commit'; Cmd = 'git add newsecret.txt && git commit -m secret'; Setup = { Set-Content -LiteralPath (Join-Path $p 'newsecret.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8 } }
+    @{ Label = 'git commit -m wip <файл> (pathspec)';  Cmd = 'git commit -m wip creds.txt';        Setup = { Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8 } }
+    @{ Label = 'git commit --include <файл>';          Cmd = 'git commit --include creds.txt -m wip'; Setup = { Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8 } }
+    @{ Label = 'git commit --only <файл>';             Cmd = 'git commit --only creds.txt -m wip'; Setup = { Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8 } }
+)
+foreach ($form in $mutationForms) {
+    & $form.Setup
+    $r = Invoke-RealCommit -ProjectDir $p -Command $form.Cmd -Env @{ BCF_SECRET_SCAN_DISABLED = '1' }
+    Check "мутация «$($form.Label)»: со сканером выключен блокирующий случай теперь проходит" ($r.Code -eq 0) "код $($r.Code): $($r.Out)"
+    Reset-Fixture -ProjectDir $p -Sha $cleanSha18
+}
+
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '19. secret-scan.sh (Claude Code): тонкий вызов делегирует .githooks/pre-commit, deny, значение не печатается'
+# ---------------------------------------------------------------------------
+# Простой случай: секрет уже застейджен ОТДЕЛЬНОЙ командой git add, а сама команда commit
+# индекс не меняет (без -a/-am/pathspec) — текущий git diff --cached уже ровно то, что
+# увидел бы настоящий git commit, и wrapper может дать ответ ДО запуска git.
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add creds.txt 2>&1 | Out-Null
+$r19 = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git -c user.name="t" -c user.email="t@local" commit -m note'
+Check 'secret-scan.sh: возвращает hookSpecificOutput.permissionDecision: deny' (
+    $r19.Out -match '"permissionDecision"\s*:\s*"deny"'
+) $r19.Out
+Check 'secret-scan.sh: код возврата 2 (блокирует по доке Claude Code независимо от JSON)' ($r19.Code -eq 2) "код $($r19.Code): $($r19.Out)"
+Check 'secret-scan.sh: причина называет файл и строку' ($r19.Out -match 'creds\.txt:1') $r19.Out
+Check 'secret-scan.sh: само значение ключа НЕ печатается' ($r19.Out -notmatch [regex]::Escape($fakeAwsKey)) $r19.Out
+& $gitExe -C $p restore --staged creds.txt 2>&1 | Out-Null
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Регресс-контроль: чистый staged-коммит проходит молча.
+Set-Content -LiteralPath (Join-Path $p 'note.txt') -Value 'чисто' -Encoding UTF8
+& $gitExe -C $p add note.txt 2>&1 | Out-Null
+$r19clean = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m note'
+Check 'secret-scan.sh: чистый застейдженный коммит проходит молча' (-not $r19clean.Out.Trim()) $r19clean.Out
+Check 'secret-scan.sh: код возврата 0 на чистом коммите' ($r19clean.Code -eq 0) "код $($r19clean.Code): $($r19clean.Out)"
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '20. secret-scan.sh (Claude Code): молчит на не-commit командах и когда git-хук не установлен'
+# ---------------------------------------------------------------------------
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add creds.txt 2>&1 | Out-Null
+$r20a = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git status'
+Check '"git status" не проверяется (тот же секрет уже staged)' (-not $r20a.Out.Trim()) $r20a.Out
+$r20b = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'docker commit mycontainer myimage'
+Check '"docker commit" не путается с "git commit"' (-not $r20b.Out.Trim()) $r20b.Out
+& $gitExe -C $p restore --staged creds.txt 2>&1 | Out-Null
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Проект без git-хука (обычный git init, install не вызывался) — wrapper не имеет права
+# продублировать сканер, когда некому исполнить его на настоящем commit; должен смолчать.
+$p20c = New-GitFixture 'no-githook-installed'
+Set-Content -LiteralPath (Join-Path $p20c 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p20c add creds.txt 2>&1 | Out-Null
+Check 'контроль сценария: .githooks/pre-commit реально отсутствует' (-not (Test-Path (Join-Path $p20c '.githooks\pre-commit')))
+$r20c = Invoke-ClaudeHookWrapper -ProjectDir $p20c -Command 'git commit -m note'
+Check 'secret-scan.sh молчит, когда .githooks/pre-commit не поставлен (не дублирует сканер)' (
+    $r20c.Code -eq 0 -and -not $r20c.Out.Trim()
+) "код $($r20c.Code): $($r20c.Out)"
+
+# ---------------------------------------------------------------------------
+Section '21. secret-scan.sh не дублирует сканер: текст отказа совпадает с прямым вызовом .githooks/pre-commit'
+# ---------------------------------------------------------------------------
+# Проверяет требование "двух независимых логик быть не должно" буквально: wrapper не
+# пересчитывает находки заново, а передаёт РОВНО тот же текст, что напечатал бы сам хук.
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add creds.txt 2>&1 | Out-Null
+# Push-Location — обязательно: pre-commit резолвит свой репозиторий через `git rev-parse
+# --show-toplevel` от ТЕКУЩЕГО каталога процесса (без -C). Без этого прямой вызов из cwd
+# тестового раннера резолвил бы чужой репозиторий и дал бы пустой (ложный) эталон для
+# сравнения — ту же ошибку когда-то повторял и сам wrapper (см. правку secret-scan.sh).
+Push-Location $p
+try {
+    $directHookOut = (& $bash -c ((Join-Path $p '.githooks\pre-commit') -replace '\\', '/') 2>&1 | Out-String)
+} finally { Pop-Location }
+$r21 = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m note'
+Check 'текст отказа wrapper совпадает с текстом отказа хука 1:1' (
+    $r21.Out -match [regex]::Escape($directHookOut.Trim())
+) "хук: [$($directHookOut.Trim())] / wrapper: [$($r21.Out)]"
+& $gitExe -C $p restore --staged creds.txt 2>&1 | Out-Null
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '22. doctor объявляет Windows требованием'
 # ---------------------------------------------------------------------------
 # $IsWindows у PowerShell — константа ("Cannot overwrite variable IsWindows because it is
 # read-only"), поэтому ветка «не Windows» проверяется тестовым швом BCF_SIMULATE_NOT_WINDOWS,
 # а не подменой автоматической переменной.
-$p10 = New-GitFixture 'doctor-not-windows'
-$r10 = Bcf @('doctor', '--no-probe', '--project', $p10) -Env @{ BCF_SIMULATE_NOT_WINDOWS = '1' }
-Check 'doctor отказывает на "не Windows"' ($r10.Code -ne 0) "код $($r10.Code)"
+$p22 = New-GitFixture 'doctor-not-windows'
+$r22 = Bcf @('doctor', '--no-probe', '--project', $p22) -Env @{ BCF_SIMULATE_NOT_WINDOWS = '1' }
+Check 'doctor отказывает на "не Windows"' ($r22.Code -ne 0) "код $($r22.Code)"
 # Матчим ИМЕННО текст гейта из doctor.ps1, а не голое 'Windows' — та подстрока встречается
 # в куче безобидных мест (заголовок доктора, версия pwsh) и остаётся зелёной, даже когда
 # сам гейт вырезан. Проверено мутацией: со снятой веткой gate в doctor.ps1 этот Check
 # краснеет, а с голым 'Windows' — нет.
 Check 'причина — конкретный текст гейта doctor.ps1' (
-    $r10.Out -match [regex]::Escape('doctor поддерживает только Windows')
-) $r10.Out
-Check 'дальше живой пробы не идёт (нет вывода про роли/память)' ($r10.Out -notmatch 'ЖИВАЯ ПРОБА РОЛЕЙ|ПАМЯТЬ') $r10.Out
+    $r22.Out -match [regex]::Escape('doctor поддерживает только Windows')
+) $r22.Out
+Check 'дальше живой пробы не идёт (нет вывода про роли/память)' ($r22.Out -notmatch 'ЖИВАЯ ПРОБА РОЛЕЙ|ПАМЯТЬ') $r22.Out
 
-$r10b = Bcf @('doctor', '--no-probe', '--project', $p10)
-Check 'на самой Windows doctor отрабатывает как обычно (регресс не внесён)' ($r10b.Out -notmatch 'doctor поддерживает только Windows') $r10b.Out
+$r22b = Bcf @('doctor', '--no-probe', '--project', $p22)
+Check 'на самой Windows doctor отрабатывает как обычно (регресс не внесён)' ($r22b.Out -notmatch 'doctor поддерживает только Windows') $r22b.Out
 
 # Конкретная формулировка требования, а не голое 'Windows' (та подстрока была в обоих
 # файлах и до правки M-05 — например "Windows PowerShell 5 не подходит" в SETUP.md).
@@ -528,7 +752,7 @@ Check 'docs/SETUP.md называет Windows требованием (конкр
 )
 
 # ---------------------------------------------------------------------------
-Section '13. CI: workflow гоняет tests/all.ps1 на push и pull_request на windows-latest'
+Section '23. CI: workflow гоняет tests/all.ps1 на push и pull_request на windows-latest'
 # ---------------------------------------------------------------------------
 # Регрессия найдена ревью M-05: до этого раздела ни одна сюита не читала
 # .github/workflows/tests.yml — удаление файла или подмена runs-on/команды прогона не
@@ -547,164 +771,21 @@ if (Test-Path -LiteralPath $workflowPath) {
 }
 
 # ---------------------------------------------------------------------------
-Section '14. secret-scan.sh: `cd <каталог> && git add ... && git commit ...` не даёт обойти сканер'
+Section '24. документация: git-хук секретов назван в SETUP.md/ROADMAP.md, опечатка "диff" не возвращалась'
 # ---------------------------------------------------------------------------
-# Регрессия найдена ЧЕТВЁРТЫМ ревью M-05: pathspec сегмента `git add` разбирался через
-# `git add --dry-run -C <корень репозитория>` всегда, без учёта предшествующего
-# `cd <каталог>` в той же командной строке — относительный путь, данный ИЗ подкаталога,
-# не совпадал ни с чем при поиске от корня, и файл выпадал из сканирования целиком.
-# Воспроизведение ревью: секрет в sub/creds.txt, `cd sub && git add creds.txt && git commit -m x`.
-$p14 = New-GitFixture 'scan-cd-add-commit-bypass'
-New-Item -ItemType Directory -Force -Path (Join-Path $p14 'sub') | Out-Null
-Set-Content -LiteralPath (Join-Path $p14 'sub\creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-$r14 = Invoke-SecretScan -ProjectDir $p14 -Command 'cd sub && git add creds.txt && git commit -m x'
-Check 'cd sub && git add && git commit: хук блокирует секрет из подкаталога' (
-    $r14.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r14.Out
-Check 'cd-обход: код возврата хука 2' ($r14.Code -eq 2) "код $($r14.Code): $($r14.Out)"
-Check 'cd-обход: причина называет путь относительно корня репозитория' ($r14.Out -match 'sub/creds\.txt:1') $r14.Out
-Check 'cd-обход: само значение ключа НЕ печатается' ($r14.Out -notmatch [regex]::Escape($fakeAwsKey)) $r14.Out
-
-# Регресс-контроль: та же связка `cd && add && commit` без секрета проходит молча — фикс
-# не начал блокировать любой cd+add+commit как таковой.
-$p14b = New-GitFixture 'scan-cd-add-commit-clean'
-New-Item -ItemType Directory -Force -Path (Join-Path $p14b 'sub') | Out-Null
-Set-Content -LiteralPath (Join-Path $p14b 'sub\note.txt') -Value 'просто текст, без секретов' -Encoding UTF8
-$r14b = Invoke-SecretScan -ProjectDir $p14b -Command 'cd sub && git add note.txt && git commit -m x'
-Check 'cd sub && git add && git commit без секрета проходит молча (регресс не внесён)' (-not $r14b.Out.Trim()) $r14b.Out
-
-# ---------------------------------------------------------------------------
-Section '15. secret-scan.sh: python не найден — отказ на git commit, тишина на прочих командах'
-# ---------------------------------------------------------------------------
-# Регрессия найдена ЧЕТВЁРТЫМ ревью M-05: без python хук выходил кодом 0 БЕЗ разбора
-# чего бы то ни было — гейт секретов, зарегистрированный в settings.json, молча исчезал
-# на любой машине без python, хотя docs/SETUP.md объявляет python опциональным (только
-# под память). PATH подрезается ТОЛЬКО на время вызова хука (Invoke-SecretScan
-# -ForceNoPython), сам тестовый прогон и остальные секции им не задеты.
-$p15 = New-GitFixture 'scan-no-python'
-$r15commit = Invoke-SecretScan -ProjectDir $p15 -Command 'git -c user.name="t" -c user.email="t@local" commit -m x' -ForceNoPython
-Check 'без python: commit-подобная команда отказывает явно (permissionDecision: deny)' (
-    $r15commit.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r15commit.Out
-Check 'без python: код возврата хука 2 на коммите' ($r15commit.Code -eq 2) "код $($r15commit.Code): $($r15commit.Out)"
-Check 'без python: причина называет python, а не молчит про секрет' ($r15commit.Out -match 'python') $r15commit.Out
-
-$r15status = Invoke-SecretScan -ProjectDir $p15 -Command 'git status' -ForceNoPython
-Check 'без python: не-commit команда по-прежнему проходит молча (хук не блокирует весь Bash)' (
-    $r15status.Code -eq 0 -and -not $r15status.Out.Trim()
-) "код $($r15status.Code): $($r15status.Out)"
-
-# Контроль сценария: с обычным PATH (python на месте) тот же коммит без секрета проходит
-# молча — доказывает, что деградация специфична именно к отсутствию python, а не к
-# сломанному сценарию вообще.
-$r15control = Invoke-SecretScan -ProjectDir $p15 -Command 'git -c user.name="t" -c user.email="t@local" commit -m ok'
-Check 'контроль сценария: с обычным PATH тот же коммит без секрета проходит молча' (-not $r15control.Out.Trim()) $r15control.Out
-
-# ---------------------------------------------------------------------------
-Section '16. secret-scan.sh: `git add <файл> && git commit` не задевает секрет в файле, который эта команда не добавляет'
-# ---------------------------------------------------------------------------
-# ПЯТОЕ РЕВЬЮ M-05 (опровержение находки 10): при has_add_stage хук до этой правки
-# добавлял к --cached БЕЗУСЛОВНО ПОЛНЫЙ `git diff` рабочего дерева — тот же вызов, что и
-# для -a/-am/--all. Секрет в отслеживаемом файле, который команда не трогает вовсе,
-# блокировал чужой чистый коммит. Воспроизведение ревью: cfg.txt правится локально на
-# `password = "MyRealLocalPass123"` и НЕ добавляется, коммитится только новый doc.md
-# командой `git add doc.md && git commit -m doc`; после реального `git add doc.md`
-# `git diff --cached --name-only` показывает один doc.md — cfg.txt в этот коммит не идёт.
-$p16 = New-GitFixture 'scan-add-scoped-not-whole-repo'
-Set-Content -LiteralPath (Join-Path $p16 'cfg.txt') -Value 'host = "localhost"' -Encoding UTF8
-& $gitExe -C $p16 add -A 2>&1 | Out-Null
-& $gitExe -C $p16 commit -qm 'cfg.txt без секрета' 2>&1 | Out-Null
-# Правим отслеживаемый cfg.txt и НЕ делаем git add — секрет остаётся только в рабочем
-# дереве, вне индекса и вне области add ниже.
-Set-Content -LiteralPath (Join-Path $p16 'cfg.txt') -Value 'password = "MyRealLocalPass123"' -Encoding UTF8
-Set-Content -LiteralPath (Join-Path $p16 'doc.md') -Value 'просто документ, без секретов' -Encoding UTF8
-
-# Контроль сценария: после реального `git add doc.md` в этот коммит идёт только doc.md.
-& $gitExe -C $p16 add doc.md 2>&1 | Out-Null
-$realStaged16 = & $gitExe -C $p16 diff --cached --name-only
-& $gitExe -C $p16 restore --staged doc.md 2>&1 | Out-Null
-Check 'контроль сценария: настоящий git add doc.md стажирует только doc.md' (
-    ($realStaged16 | Measure-Object).Count -eq 1 -and $realStaged16 -eq 'doc.md'
-) $realStaged16
-
-$r16a = Invoke-SecretScan -ProjectDir $p16 -Command 'git add doc.md && git -c user.name="t" -c user.email="t@local" commit -m doc'
-Check 'git add doc.md && git commit: посторонний секрет в cfg.txt НЕ блокирует (не входит в add)' (
-    $r16a.Code -eq 0 -and -not $r16a.Out.Trim()
-) "код $($r16a.Code): $($r16a.Out)"
-
-# Регресс-контроль А: тот же секрет, добавленный ИМЕНЕМ файла, по-прежнему блокирует —
-# сужение диффа до add_stage_paths не потеряло путь, который команда РЕАЛЬНО называет.
-$r16b = Invoke-SecretScan -ProjectDir $p16 -Command 'git add cfg.txt && git -c user.name="t" -c user.email="t@local" commit -m x'
-Check 'git add cfg.txt && git commit: тот же секрет, названный по имени, по-прежнему блокирует' (
-    $r16b.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r16b.Out
-Check 'git add cfg.txt: код возврата хука 2' ($r16b.Code -eq 2) "код $($r16b.Code)"
-Check 'git add cfg.txt: причина называет cfg.txt:1' ($r16b.Out -match 'cfg\.txt:1') $r16b.Out
-
-# Регресс-контроль Б: -A по-прежнему видит cfg.txt (git add --dry-run -A перечисляет и
-# изменённые отслеживаемые файлы, не только новые) и блокирует — сужение диффа не
-# ослабило -A/--all.
-$r16c = Invoke-SecretScan -ProjectDir $p16 -Command 'git add -A && git -c user.name="t" -c user.email="t@local" commit -m x'
-Check 'git add -A && git commit: cfg.txt по-прежнему в области видимости -A и блокирует' (
-    $r16c.Out -match '"permissionDecision"\s*:\s*"deny"'
-) $r16c.Out
-Check 'git add -A: причина называет cfg.txt:1' ($r16c.Out -match 'cfg\.txt:1') $r16c.Out
-
-# ---------------------------------------------------------------------------
-Section '17. secret-scan.sh: текст отказа советует по месту находки, а не всегда "git restore --staged"'
-# ---------------------------------------------------------------------------
-# ПЯТОЕ РЕВЬЮ M-05 (опровержение находки 11): текст отказа всегда советовал
-# `git restore --staged <файл>` — верно только для находки, УЖЕ лежащей в реальном
-# индексе. Для находки из рабочего дерева (-a/-am/--all, add из этой же команды, новый
-# файл) эта команда ничего не отменяет: индекс на этот файл пуст, `git restore --staged`
-# не находит, что снимать.
-Check 'находка РЕАЛЬНО в индексе ($r6, раздел 6: git add -A сделан заранее, вне команды): совет — git restore --staged' (
-    $r6.Out -match 'git restore --staged'
-) $r6.Out
-Check '-am ($r9a, раздел 9): совет НЕ предлагает git restore --staged (нечего снимать)' (
-    $r9a.Out -notmatch 'git restore --staged'
-) $r9a.Out
-Check 'git add -A && git commit ($r10a, раздел 10): совет НЕ предлагает git restore --staged' (
-    $r10a.Out -notmatch 'git restore --staged'
-) $r10a.Out
-Check 'git add <файл> && git commit ($r10bAddNamedOut, раздел 10): совет НЕ предлагает git restore --staged' (
-    $r10bAddNamedOut -notmatch 'git restore --staged'
-) $r10bAddNamedOut
-Check 'cd sub && git add && git commit ($r14, раздел 14): совет НЕ предлагает git restore --staged' (
-    $r14.Out -notmatch 'git restore --staged'
-) $r14.Out
-
-# Смешанный случай: один секрет РЕАЛЬНО в индексе (застейджен отдельным git add до этой
-# команды), второй — в новом файле, который добавляет САМА эта команда. Оба совета
-# обязаны прозвучать одновременно, каждый про свою находку.
-$p17 = New-GitFixture 'scan-mixed-staged-and-unstaged'
-Set-Content -LiteralPath (Join-Path $p17 'indexed.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
-& $gitExe -C $p17 add indexed.txt 2>&1 | Out-Null
-Set-Content -LiteralPath (Join-Path $p17 'new.txt') -Value 'const password = "realsecretvalue123";' -Encoding UTF8
-$r17 = Invoke-SecretScan -ProjectDir $p17 -Command 'git add new.txt && git -c user.name="t" -c user.email="t@local" commit -m mixed'
-Check 'смешанный случай: обе находки названы (indexed.txt и new.txt)' (
-    $r17.Out -match 'indexed\.txt:1' -and $r17.Out -match 'new\.txt:1'
-) $r17.Out
-Check 'смешанный случай: совет "git restore --staged" присутствует (для indexed.txt)' (
-    $r17.Out -match 'git restore --staged'
-) $r17.Out
-Check 'смешанный случай: совет "не включай этот путь в add" присутствует (для new.txt)' (
-    $r17.Out -match 'не включай этот путь в add'
-) $r17.Out
-& $gitExe -C $p17 restore --staged indexed.txt 2>&1 | Out-Null
-
-# ---------------------------------------------------------------------------
-Section '18. документация: граница защиты названа, опечатка "диff" не возвращалась'
-# ---------------------------------------------------------------------------
-# Раздел проверяет две находки четвёртого пункта ревью, не покрытые кодом хука:
-# ГРАНИЦА (файл, созданный в той же командной строке, не виден PreToolUse — раньше
-# документация читалась как полная защита) и опечатка смешанным алфавитом "диff".
 $setupTxt = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\SETUP.md')
-Check 'docs/SETUP.md называет границу защиты (файл, созданный той же командной строкой)' (
-    $setupTxt -match 'Граница защиты'
+Check 'docs/SETUP.md называет .githooks/pre-commit единственным сканером' ($setupTxt -match '\.githooks/pre-commit')
+Check 'docs/SETUP.md называет core.hooksPath' ($setupTxt -match 'core\.hooksPath')
+Check 'docs/SETUP.md объясняет тонкий вызов .claude/hooks/secret-scan.sh' (
+    $setupTxt -match 'тонкий предварительный вызов'
 )
-Check 'docs/SETUP.md: граница даёт конкретный пример (echo ... && git add ... && git commit)' (
-    $setupTxt -match 'echo\s+секрет\s*>\s*c\.txt'
+
+$roadmapTxt = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\ROADMAP.md')
+Check 'docs/ROADMAP.md: M-05a закрыт (git-хук вместо разбора командной строки)' (
+    $roadmapTxt -match 'M-05a Секреты: git-хук вместо разбора командной строки'
+)
+Check 'docs/ROADMAP.md: "В работе" не содержит старую формулировку M-05a про pathspec' (
+    $roadmapTxt -notmatch 'M-05a Секреты: pathspec внутри самого коммита'
 )
 
 $archTxt = Get-Content -Raw -LiteralPath (Join-Path $root 'docs\ARCHITECTURE.md')

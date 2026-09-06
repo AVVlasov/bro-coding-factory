@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# pre-commit — единственный сканер секретов фабрики. git вызывает этот хук САМ, уже ПОСЛЕ
+# того, как разрешил -a/-am/--all, pathspec внутри `commit` (`-m msg <файл>`, `--include`,
+# `--only`) и любую связку `git add ... && git commit ...` — `git diff --cached` внутри
+# этого хука это ровно то дерево, что уедет в коммит, независимо от того, каким путём git
+# до него добрался. Разбор командной строки (так был устроен `.claude/hooks/secret-scan.sh`
+# до этой правки) закрывал каждый обход отдельно и находил новый на следующем ревью —
+# см. историю в docs/ROADMAP.md, M-05/M-05a. Здесь закрывать нечего: способ стажирования
+# индекса хуку не важен, а файл, который команда создаёт сама в той же строке (`echo секрет
+# > c.txt && git add c.txt && git commit`), к моменту вызова этого хука уже существует и
+# уже застейджен — старая граница защиты ("файл ещё не создан на момент проверки") тоже
+# закрыта самим переносом проверки на момент реального коммита.
+#
+# СТАВИТСЯ: `bcf install`/`bcf init` копируют этот файл в `.githooks/pre-commit` проекта
+# (версионируется вместе с проектом) и включают `git config core.hooksPath .githooks` —
+# почему `.githooks` + `core.hooksPath`, а не копия в `.git/hooks/pre-commit`, см.
+# docs/SETUP.md: `.git/hooks/` никогда не клонируется, а `.githooks/` содержимое
+# клонируется вместе с проектом, разовая локальная настройка (`core.hooksPath`) — то, что
+# `bcf install` делает у каждого участника один раз, так же как остальную обвязку.
+#
+# ИСТОЧНИК ОБРАЗЦОВ, ПРАВИЛО ПРИСВОЕНИЙ, ФИЛЬТР ЗНАЧЕНИЙ-ССЫЛОК не поменялись — те же, что
+# были в `.claude/hooks/secret-scan.sh` до этой правки (см. docs/ROADMAP.md, M-05): регэкспы
+# для облаков/GitHub/Slack/приватных ключей — из vendor-конфига gitleaks
+# (github.com/gitleaks/gitleaks, config/gitleaks.toml, правила aws-access-token,
+# gcp-api-key, github-pat/oauth/app-token/refresh-token/fine-grained-pat,
+# slack-bot-token/legacy-bot-token/user-token/app-token/webhook-url, private-key), сверено
+# 2026-09-05. Правило на присваивания password/secret/api_key/token — своё, ключевое слово
+# обязано стоять сразу перед оператором присваивания, без суффикса (иначе
+# `password_default`/`password_env` этого же репозитория считались бы находкой на каждом
+# коммите, задевающем `config/memory.config.json`). Значение-ссылка на переменную окружения
+# или конфиг (`process.env.*`, `os.environ`/`os.getenv`, `System.getenv`, `config.*`,
+# обращение к другой переменной вида `pwd = password`) находкой не считается: это код,
+# который секрет уже читает из окружения, а не хранит текстом.
+#
+# ПОЧЕМУ РЕМОНТ ПРОЩЕ, ЧЕМ БЫЛ. Раньше хук отдельно помнил, находка "уже в индексе" (снять
+# `git restore --staged`) или "ещё нет" (нечего снимать) — потому что PreToolUse видел
+# командную строку ДО исполнения и не мог знать, что git сделает со стажированием. Здесь
+# хук стоит ПОСЛЕ: если git заблокирует коммит (код возврата ненулевой), git сам
+# откатывает любое стажирование, которое сделал ДЛЯ ЭТОЙ команды (-a/-am/pathspec/
+# --include/--only) — проверено вручную, `git status` после отказа показывает файл снова
+# просто изменённым, не застейдженным. Из реального индекса (застейджено ОТДЕЛЬНЫМ `git
+# add` до этой команды) отказ ничего не снимает — поэтому единый совет ниже называет обе
+# возможности вместо того, чтобы гадать, какая сработала.
+#
+# Найденный секрет НЕ печатается — только файл, номер строки, имя правила.
+#
+# Контракт:
+#   BCF_SECRET_SCAN_DISABLED=1 — выключает проверку, ТОЛЬКО если в docs/decisions.md проекта
+#   есть запись `## <сегодняшняя дата> ... BCF_SECRET_SCAN_DISABLED` (тот же приём, что у
+#   остальных блокирующих хуков шаблона — см. templates/claude/hooks/agent-infra-protect.sh,
+#   done-gate.sh, dod-format-validator.sh, task-progression-gate.sh). Без записи — отказ.
+#   python/python3 не найден — коммит отказывает явно (без python нечем разобрать diff по
+#   образцам), а не проезжает непроверенным.
+
+set -u
+export PYTHONIOENCODING=utf-8
+
+today="$(date +%Y-%m-%d 2>/dev/null || echo x)"
+if [ "${BCF_SECRET_SCAN_DISABLED:-0}" = "1" ]; then
+  if grep -q "^## ${today}.*BCF_SECRET_SCAN_DISABLED" docs/decisions.md 2>/dev/null; then
+    exit 0
+  fi
+  printf '%s\n' "коммит заблокирован: BCF_SECRET_SCAN_DISABLED=1 задан, но в docs/decisions.md нет записи за сегодня. Добавь строку '## ${today} — BCF_SECRET_SCAN_DISABLED <причина>' и повтори коммит." >&2
+  exit 1
+fi
+
+PY=""
+for c in python python3; do
+  if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
+done
+if [ -z "$PY" ]; then
+  printf '%s\n' "коммит заблокирован: pre-commit не может проверить секреты — python (или python3) не найден в PATH. Поставь python3 или отключи проверку BCF_SECRET_SCAN_DISABLED=1 (запись в docs/decisions.md обязательна)." >&2
+  exit 1
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+
+"$PY" - "$repo_root" <<'PYEOF'
+import re
+import subprocess
+import sys
+
+repo_root = sys.argv[1]
+
+try:
+    cached_diff = subprocess.run(
+        ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '--cached', '-U0', '--no-color'],
+        capture_output=True, encoding='utf-8', errors='replace', timeout=20,
+    ).stdout
+except Exception:
+    sys.exit(0)   # git не отозвался — не наша область, сам git commit решит, что коммитить
+
+if not cached_diff:
+    sys.exit(0)   # пустой коммит (--allow-empty) или нечего сравнивать — сканировать нечего
+
+# --- Образцы: см. заголовок файла для источника и версии сверки -------------------------
+PATTERNS = [
+    ('ключ доступа AWS',            re.compile(r'\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b')),
+    ('ключ Google Cloud API',       re.compile(r'\bAIza[\w-]{35}\b')),
+    ('токен GitHub (classic PAT)',  re.compile(r'\bghp_[0-9A-Za-z]{36}\b')),
+    ('токен GitHub (OAuth)',        re.compile(r'\bgho_[0-9A-Za-z]{36}\b')),
+    ('токен GitHub (App/сервер)',   re.compile(r'\b(?:ghu|ghs)_[0-9A-Za-z]{36}\b')),
+    ('токен GitHub (refresh)',      re.compile(r'\bghr_[0-9A-Za-z]{36}\b')),
+    ('токен GitHub (fine-grained)', re.compile(r'\bgithub_pat_\w{82}\b')),
+    ('токен Slack (bot)',           re.compile(r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}[A-Za-z0-9-]*\b')),
+    ('токен Slack (legacy bot)',    re.compile(r'\bxoxb-[0-9]{8,14}-[A-Za-z0-9]{18,26}\b')),
+    ('токен Slack (user)',          re.compile(r'\bxox[pe](?:-[0-9]{10,13}){3}-[A-Za-z0-9-]{28,34}\b')),
+    ('токен Slack (app-level)',     re.compile(r'(?i)\bxapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+\b')),
+    ('вебхук Slack',                re.compile(r'(?:https?://)?hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}')),
+    ('приватный ключ (PEM)',        re.compile(r'(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----')),
+    # Значение — ИЛИ кавычная строка (qval), ИЛИ голое слово без точки (uval): точка убрана
+    # из символов uval нарочно — литералы ключей точек не содержат, а типичные ссылки-обходы
+    # ("os.environ", "config.api_key", "process.env") обрываются на первой же точке короче
+    # порога в 8 символов. REFERENCE_VALUE_RE ниже — второй, независимый барьер для случаев
+    # подлиннее.
+    ('присвоение секрета',          re.compile(
+        r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token)\b"
+        r"['\"]?\s*[:=]{1,2}\s*"
+        r"(?:(?P<q>['\"])(?P<qval>[^'\"]{8,})(?P=q)|(?P<uval>[A-Za-z0-9][A-Za-z0-9/+_=-]{7,}))"
+    )),
+]
+
+# ЗНАЧЕНИЯ-ССЫЛКИ. Применяется ТОЛЬКО к правилу "присвоение секрета": вендорские образцы
+# (AKIA…, ghp_…, приватный ключ) матчят сам секрет буквально и в фильтре не нуждаются.
+REFERENCE_VALUE_RE = re.compile(
+    r"^(?:"
+    r"process\.env\b|os\.environ\b|os\.getenv\b|getenv\(|System\.getenv\b|System\.Environment\b"
+    r"|\$\{"
+    r"|(?:config|cfg|settings|options|opts)\."
+    r"|password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def check_line(content):
+    """Возвращает имя сработавшего правила или None."""
+    for name, rx in PATTERNS:
+        m = rx.search(content)
+        if not m:
+            continue
+        if name == 'присвоение секрета':
+            val = m.group('qval')
+            if val is None:
+                val = m.group('uval')
+            if val and REFERENCE_VALUE_RE.match(val):
+                continue   # значение — ссылка на переменную/окружение, не литерал
+        return name
+    return None
+
+
+hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
+
+
+def scan_diff_text(diff_text):
+    """Разбирает unified diff (-U0) индекса и возвращает находки (файл, строка, правило)."""
+    out = []
+    current_file = None
+    new_line = 0
+    for raw in diff_text.split('\n'):
+        if raw.startswith('+++ '):
+            path = raw[4:].strip()
+            current_file = None if path == '/dev/null' else re.sub(r'^[ab]/', '', path)
+            continue
+        if raw.startswith('@@ '):
+            m = hunk_re.match(raw)
+            if m:
+                new_line = int(m.group(1))
+            continue
+        if raw.startswith('---'):
+            continue
+        if raw.startswith('+'):
+            content = raw[1:]
+            if current_file is not None:
+                name = check_line(content)
+                if name:
+                    out.append((current_file, new_line, name))
+            new_line += 1
+            continue
+        # '-' (удалённая строка) и служебные строки diff --git/index/rename на новую
+        # нумерацию не влияют — их пропускаем.
+    return out
+
+
+hits = scan_diff_text(cached_diff)
+if not hits:
+    sys.exit(0)
+
+lines = [f'  {f}:{ln} — {name}' for f, ln, name in hits]
+reason = (
+    'коммит заблокирован: похоже на секрет (само значение не печатается):\n'
+    + '\n'.join(lines) + '\n'
+    'убери секрет из файла и закоммить заново. если после этого git status всё ещё\n'
+    'показывает путь застейдженным, дополнительно сними его: git restore --staged <файл>.\n'
+    'ложное срабатывание — переформулируй строку так, чтобы она не совпадала с образцом.'
+)
+print(reason, file=sys.stderr)
+sys.exit(1)
+PYEOF
+exit $?
