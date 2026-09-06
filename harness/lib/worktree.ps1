@@ -8,6 +8,19 @@
 # ничего не знает про то, что две ветки правят одни файлы; за это отвечает
 # claims.ps1 (допуск на старте). См. wiki/research/2026-07-26-parallel-agents-file-conflicts.md.
 
+. (Join-Path $PSScriptRoot 'bcf-context.ps1')
+# Гейт приёмки (Test-BcfTaskAcceptanceGate) и класс задачи живут в claims.ps1 — тот же
+# файл, что уже определяет «Исполнитель:»/«Блокер:» тем же способом чтения шапки задачи.
+# Подключаем здесь, а не полагаемся на порядок дот-сорсинга у вызывающего: тесты этого
+# файла (harness/tests/merge-integration.tests.ps1) дот-сорсят ТОЛЬКО worktree.ps1.
+. (Join-Path $PSScriptRoot 'claims.ps1')
+
+# Трейлеры коммитов прогона (Format-BcfCommitTrailers/New-BcfCommitMessage/
+# Test-BcfCommitTrailers/Test-BcfCommitHasTrailers) переехали в bcf-context.ps1: их
+# зовёт не только этот файл, а и claims.ps1 (Publish-BcfClaimChange коммитит заявки и
+# приёмку), а claims.ps1 сам по себе НЕ дот-сорсит worktree.ps1 — только наоборот. Живут
+# они в bcf-context.ps1, который дот-сорсят оба файла первой строкой.
+
 function Get-WorktreeRoot {
     param([Parameter(Mandatory)][string]$Root)
     # Рядом с репозиторием, а не внутри: иначе worktree попадёт в собственный git status.
@@ -86,46 +99,177 @@ function New-TaskWorktree {
     }
 
     Connect-WorktreeDeps -Root $Root -Worktree $path
-    Copy-WorktreeVerdicts -Root $Root -Worktree $path
     return $path
 }
 
-# --- ВЕРДИКТЫ ЗАКРЫТЫХ ЗАДАЧ В WORKTREE -------------------------------------------------
+# --- ВЕРДИКТ ЕДЕТ В GIT, А НЕ КОПИЕЙ МИМО НЕГО ------------------------------------------
 #
-# Каталог вердиктов лежит в .gitignore — значит в чистом чекауте его нет. А цикл читает его
-# у СЕБЯ, чтобы проверить допуск: «предшественник TASK-01 не имеет verdict: PASS» — и задача
-# умирает через секунду после старта, хотя предшественник закрыт и слит. Наблюдалось живьём
-# 2026-08-06 (прогон g_20260806-143112): волна 2 целиком не поехала сразу после того, как
-# волна 1 успешно закрылась.
+# Здесь стояла Copy-WorktreeVerdicts: каталог вердиктов лежал в .gitignore, поэтому в
+# чистом чекауте его не было, и вердикты закрытых предшественников приходилось руками
+# копировать в дерево каждой новой задачи. Иначе цикл проверял допуск у себя, не находил
+# «verdict: PASS» и убивал задачу через секунду после старта — так 2026-08-06 не поехала
+# целая волна.
 #
-# Копируем только вердикты — состояние прогонов (.bcf) у каждой задачи своё, и делить его
-# между ветками нельзя.
-function Copy-WorktreeVerdicts {
+# Копия чинила симптом и создавала ту же болезнь на ярус выше: вердикт существовал ровно
+# на одной машине. Второй участник команды не видел ни одного закрытого гейта, и его
+# фабрика считала бэклог пустым по построению.
+#
+# Теперь вердикт — обычный файл в git: его пишет обвязка в дерево задачи, он попадает в
+# коммит ветки и приезжает к остальным слиянием. Вердикт незакрытой задачи, которую не
+# слили, публикует Publish-TaskVerdict.
+
+# Положить вердикт задачи в общее дерево и закоммитить ОДИН этот файл.
+#
+# Нужен там, где слияния не будет: задача не достигла PASS, её ветка остаётся жить, а
+# список ремедиации нужен и человеку, и следующей попытке. Коммит именно один файл: иначе
+# вердикт остаётся грязью в tasks/, а грязный tasks/ отменяет слияние следующей задачи.
+function Publish-TaskVerdict {
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$Worktree
+        [Parameter(Mandatory)][string]$Task,
+        [Parameter(Mandatory)][string]$VerdictFile,
+        [string]$RelDir = 'tasks/.verdicts',
+        # Метаданные прогона — трейлеры коммита. Пусто = коммит остаётся литеральным
+        # «${Task}: вердикт» без трейлеров, как раньше (юнит-вызов вне графа/планировщика).
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
+    if (-not (Test-Path -LiteralPath $VerdictFile)) { return @{ Ok = $false; Reason = 'вердикта нет' } }
+    $relDirWin = $RelDir -replace '/', '\'
+    $dstDir = Join-Path $Root $relDirWin
+    New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+    $dst = Join-Path $dstDir "$Task.md"
+    Copy-Item -LiteralPath $VerdictFile -Destination $dst -Force -ErrorAction SilentlyContinue
 
-    $rel = 'tasks\.verdicts'
-    try {
-        $cfgFile = Join-Path $Root 'config\harness.json'
-        if (Test-Path $cfgFile) {
-            $cfg = Get-Content -Raw -LiteralPath $cfgFile | ConvertFrom-Json
-            if ($cfg.paths -and $cfg.paths.verdicts) { $rel = ([string]$cfg.paths.verdicts) -replace '/', '\' }
-        }
-    } catch { }
-
-    $src = Join-Path $Root $rel
-    if (-not (Test-Path $src -PathType Container)) { return }
-    $dst = Join-Path $Worktree $rel
-    try {
-        New-Item -ItemType Directory -Force -Path $dst | Out-Null
-        foreach ($f in @(Get-ChildItem $src -Filter '*.md' -File -ErrorAction SilentlyContinue)) {
-            Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $dst $f.Name) -Force -ErrorAction SilentlyContinue
-        }
-    } catch {
-        Write-Host "  ⚠ не удалось перенести вердикты в worktree ($($_.Exception.Message)) — задача не увидит закрытых предшественников" -ForegroundColor Yellow
+    $rel = "$RelDir/$Task.md"
+    $inside = (& git -C $Root rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+    if ($inside -ne 'true') { return @{ Ok = $true; Reason = 'не git-репозиторий, вердикт положен файлом' } }
+    $id = Get-BcfGitIdentityArgs -Root $Root
+    & git -C $Root add -A -- $rel 2>&1 | Out-Null
+    $staged = @(& git -C $Root diff --cached --name-only -- $rel 2>$null | Where-Object { $_ })
+    if (-not $staged.Count) { return @{ Ok = $true; Reason = 'вердикт уже в дереве' } }
+    $msg = if ($RunId) {
+        New-BcfCommitMessage -Subject "${Task}: вердикт" -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+    } else {
+        "${Task}: вердикт"
     }
+    $out = (& git -C $Root @id commit -q -m $msg -- $rel 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Reason = $out.Trim() } }
+    return @{ Ok = $true; Reason = 'закоммичен' }
+}
+
+# --- ПРАВКИ ВЛАДЕЛЬЦА ПАРКУЮТСЯ, А НЕ ОТКАТЫВАЮТСЯ --------------------------------------
+#
+# Слияние ломает ЛЮБАЯ грязь в основном дереве, включая правку человека, сделанную во
+# время прогона. Прежний код звал `git checkout --` и писал предупреждение: работа
+# человека исчезала без следа, а узнавал он об этом из строки в логе ночного прогона.
+#
+# Теперь она уезжает коммитом в ветку `bcf/parked/<дата>`. Ветка стоит ничего, восстановить
+# из неё можно всё, и человек забирает свою правку `git checkout bcf/parked/<дата> -- <файл>`.
+# Коммит собирается через ВРЕМЕННЫЙ индекс: настоящий индекс дерева трогать нельзя, там
+# идёт слияние задачи.
+function Save-OwnerEditsToParkedBranch {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string[]]$Files,
+        [string]$Reason = 'правки владельца, найденные во время прогона',
+        # Метаданные прогона — трейлеры коммита парковки. Пусто = коммит остаётся
+        # литеральным «припарковано: …» без трейлеров, как раньше (юнит-вызов вне
+        # Merge-TaskWorktree, см. tests/team-claims.tests.ps1).
+        [string]$Task = '', [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
+    )
+    $files = @($Files | Where-Object { $_ })
+    if (-not $files.Count) { return @{ Ok = $true; Branch = ''; Commit = ''; Files = @(); Message = 'парковать нечего' } }
+
+    $branch = 'bcf/parked/' + (Get-Date -Format 'yyyy-MM-dd')
+    $tmpIndex = Join-Path ([IO.Path]::GetTempPath()) ('bcf-park-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.index')
+    $prevIndex = $env:GIT_INDEX_FILE
+    $commit = ''
+    try {
+        # Родитель — вчерашняя парковка того же дня, если она есть: иначе вторая правка за
+        # день затирала бы первую, и «сохранено» означало бы «сохранено последнее».
+        $parent = (& git -C $Root rev-parse --verify --quiet "refs/heads/$branch" 2>$null | Out-String).Trim()
+        if (-not $parent) { $parent = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim() }
+        if (-not $parent) { return @{ Ok = $false; Branch = $branch; Commit = ''; Files = $files; Message = 'в репозитории нет ни одного коммита' } }
+
+        $env:GIT_INDEX_FILE = $tmpIndex
+        & git -C $Root read-tree $parent 2>&1 | Out-Null
+        & git -C $Root add -A -- @files 2>&1 | Out-Null
+        $tree = (& git -C $Root write-tree 2>$null | Out-String).Trim()
+        if (-not $tree) { return @{ Ok = $false; Branch = $branch; Commit = ''; Files = $files; Message = 'git write-tree ничего не вернул' } }
+        $id = Get-BcfGitIdentityArgs -Root $Root
+        $subject = "припарковано: $Reason — $($files -join ', ')"
+        $msg = if ($RunId) {
+            New-BcfCommitMessage -Subject $subject -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        } else {
+            $subject
+        }
+        $commit = (& git -C $Root @id commit-tree $tree -p $parent -m $msg 2>$null | Out-String).Trim()
+        if (-not $commit) { return @{ Ok = $false; Branch = $branch; Commit = ''; Files = $files; Message = 'git commit-tree ничего не вернул' } }
+        & git -C $Root update-ref "refs/heads/$branch" $commit 2>&1 | Out-Null
+    } finally {
+        if ($null -eq $prevIndex) { Remove-Item Env:\GIT_INDEX_FILE -ErrorAction SilentlyContinue }
+        else { $env:GIT_INDEX_FILE = $prevIndex }
+        Remove-Item -LiteralPath $tmpIndex -Force -ErrorAction SilentlyContinue
+    }
+
+    # Дерево возвращаем к HEAD явно: правка уже лежит в ветке, а слияние идёт только на
+    # чистом дереве.
+    foreach ($f in $files) { & git -C $Root checkout HEAD -- $f 2>&1 | Out-Null }
+    return @{ Ok = $true; Branch = $branch; Commit = $commit; Files = $files
+              Message = "правки $($files -join ', ') сохранены в ветке $branch (забрать: git checkout $branch -- <файл>)" }
+}
+
+# --- ОТКАТ СЛИЯНИЯ, У КОТОРОГО ПРОВЕРКИ КРАСНЫЕ -----------------------------------------
+#
+# Здесь стоял `git reset --hard HEAD~1` на общем дереве, и это тихая потеря чужой работы.
+# Между слиянием и проверками на слитом дереве проходят минуты: за это время в ту же ветку
+# успевает попасть коммит соседней задачи или коммит человека, работающего рядом. `HEAD~1`
+# ничего не знает про содержимое — он снимает ПОСЛЕДНИЙ коммит, каким бы он ни был. В
+# команде это уже не гипотеза: сливаются несколько участников в одну ветку.
+#
+# Правило простое: жёсткий сброс на запомненный SHA допустим только внутри ветки задачи,
+# где кроме этой задачи никого нет. На общей ветке — `git revert`, который отменяет ровно
+# то слияние и оставляет всё, что приехало после.
+function Undo-FailedMerge {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        # AllowEmptyString, потому что sha приходит из `git rev-parse`, а он умеет вернуть
+        # пустоту. Без этого вызывающий получал бы исключение привязки параметра вместо
+        # внятного «откатывать нечего» — и падал бы посреди отката.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$MergeSha,
+        [string]$BeforeSha = ''
+    )
+    if (-not $MergeSha) { return @{ Ok = $false; Kind = 'no-sha'; Message = 'sha слияния не запомнен — откатывать нечего' } }
+
+    $branch = (& git -C $Root rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
+    $head   = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
+    $short  = $MergeSha.Substring(0, [Math]::Min(8, $MergeSha.Length))
+
+    if (($branch -like 'bcf/task/*') -and $BeforeSha -and ($head -eq $MergeSha)) {
+        & git -C $Root reset --hard $BeforeSha 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            return @{ Ok = $true; Kind = 'reset'; Branch = $branch
+                      Message = "ветка задачи $branch возвращена на $($BeforeSha.Substring(0, [Math]::Min(8, $BeforeSha.Length)))" }
+        }
+    }
+
+    # Коммит слияния имеет двух родителей, и revert требует сказать, какую сторону считать
+    # основной. У обычного коммита родитель один, и -m его сломает.
+    $parents = @((& git -C $Root rev-list --parents -n 1 $MergeSha 2>$null | Out-String).Trim() -split '\s+' | Where-Object { $_ })
+    $id = Get-BcfGitIdentityArgs -Root $Root
+    # Имя не $args: так зовётся автоматическая переменная функции, и присваивание в неё
+    # читается как ошибка ровно до того момента, когда ею станет.
+    $revertArgs = @('-C', $Root) + $id + @('revert', '--no-edit')
+    if ($parents.Count -ge 3) { $revertArgs += @('-m', '1') }
+    $revertArgs += $MergeSha
+    $out = (& git @revertArgs 2>&1 | Out-String)
+    if ($LASTEXITCODE -eq 0) {
+        return @{ Ok = $true; Kind = 'revert'; Branch = $branch
+                  Message = "слияние $short отменено коммитом revert — коммиты, приехавшие после него, на месте" }
+    }
+    & git -C $Root revert --abort 2>&1 | Out-Null
+    return @{ Ok = $false; Kind = 'revert-failed'; Branch = $branch
+              Message = "слияние $short не отменяется автоматически (revert конфликтует) — нужен человек: $($out.Trim())" }
 }
 
 # --- ЗАВИСИМОСТИ В WORKTREE -------------------------------------------------------------
@@ -219,9 +363,23 @@ function Merge-TaskWorktree {
         # Не откатывать конфликтное слияние: оставить маркеры в дереве, чтобы их свёл
         # агент-арбитр. Вызывающий обязан затем позвать Complete-ArbitratedMerge
         # либо Undo-ArbitratedMerge — иначе дерево останется в состоянии MERGING.
-        [switch]$KeepConflictForArbiter
+        [switch]$KeepConflictForArbiter,
+        # Метаданные прогона — только для трейлеров коммита слияния. Пусто = коммит
+        # прежним `--no-edit`, без трейлеров: юнит-тесты этой функции зовут её без
+        # единого понятия о прогоне, и их поведение не должно от этого меняться.
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     $branch = "bcf/task/$Task"
+
+    # ПРИЁМКА ЛИДЕРОМ — ПЕРЕД ЛЮБЫМ КАСАНИЕМ GIT. CORE и NFR без файла приёмки
+    # (`tasks/.acceptance/<TASK>.md`) не продвигаются в текущую ветку интеграции: тесты
+    # доказывают, что написано в них, а не то, что задача решает нужную проблему
+    # правильным способом. GEN и задачи без класса (или вовсе без файла — гейт им не
+    # писан, см. Test-BcfTaskAcceptanceGate) идут дальше как раньше.
+    $gate = Test-BcfTaskAcceptanceGate -TaskId $Task -Root $Root
+    if (-not $gate.Ok) {
+        return @{ Ok = $false; Conflicts = @(); Kind = 'needs-acceptance'; Message = $gate.Reason }
+    }
 
     # Слияние в ГРЯЗНОЕ дерево git отвергает целиком: «Your local changes … would be
     # overwritten by merge». Конфликтных файлов при этом НЕТ (нет состояния U), и
@@ -247,7 +405,36 @@ function Merge-TaskWorktree {
             $dirty = @($dirty | Where-Object { $parked -notcontains $_ })
         }
     }
-    # ГРЯЗЬ В ОБВЯЗКЕ — НЕ ПОВОД ТЕРЯТЬ РАБОТУ ЗАДАЧИ.
+    # СОБСТВЕННЫЕ ФАЙЛЫ ОБВЯЗКИ В tasks/ КОММИТЯТСЯ, А НЕ ПАРКУЮТСЯ.
+    #
+    # Вердикт, заявка и доска задач лежат в git ради того, чтобы их видела вся команда. Их
+    # пишет сама обвязка, и коммит рядом с ними иногда не проходит: параллельная задача
+    # держит индекс, или дерево в этот момент занято чужим слиянием. Припарковать их значило
+    # бы отобрать у задачи её собственную заявку прямо во время работы, а откатить — потерять
+    # вердикт. Считаем отдельным вызовом с --untracked-files=all: вердикт, написанный
+    # впервые, для git НОВЫЙ файл, а $dirty новых не содержит. Именно этот случай и есть
+    # обычный — каталог вердиктов только что перестал быть скрытым.
+    #
+    # tasks/STATUS.json здесь по той же причине и по ещё одной, своей: доска меняется после
+    # КАЖДОГО узла. Попади она в парковку — и каждое слияние волны отправляло бы в ветку
+    # bcf/parked/<дата> собственную доску прогона, а сам прогон вставал бы на грязном дереве.
+    $harnessDirty = @(& git -C $Root status --porcelain --untracked-files=all 2>$null |
+                      ForEach-Object { ($_ -replace '^..\s*', '').Trim() } |
+                      Where-Object { $_ -match '^tasks/(\.(verdicts|claims)/|STATUS\.json$)' })
+    if ($harnessDirty.Count) {
+        $hid = Get-BcfGitIdentityArgs -Root $Root
+        & git -C $Root add -A -- @harnessDirty 2>&1 | Out-Null
+        $hsubject = "обвязка: вердикты, заявки и доска задач перед слиянием $Task"
+        $hmsg = if ($RunId) {
+            New-BcfCommitMessage -Subject $hsubject -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        } else {
+            $hsubject
+        }
+        & git -C $Root @hid commit -q -m $hmsg -- @harnessDirty 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $dirty = @($dirty | Where-Object { $harnessDirty -notcontains $_ }) }
+    }
+
+    # ГРЯЗЬ В ОБВЯЗКЕ — НЕ ПОВОД ТЕРЯТЬ НИ РАБОТУ ЗАДАЧИ, НИ РАБОТУ ЧЕЛОВЕКА.
     #
     # ИНЦИДЕНТ 2026-08-10, тот же класс, что и с лок-файлом: узел ревизии плана работает
     # в ОСНОВНОМ дереве и с правом правки, зашёл в tasks/ и поменял в закрытой TASK-25
@@ -256,15 +443,28 @@ function Merge-TaskWorktree {
     #
     # Каталоги задач и конфигов принадлежат ВЛАДЕЛЬЦУ: кодовому агенту они запрещены
     # правилами проекта, и в слиянии продуктового кода не участвуют. Поэтому грязь там
-    # не блокирует, а откатывается — но ГРОМКО: тихий откат прятал бы факт, что узел
-    # полез туда, куда ему нельзя.
+    # слияние не блокирует. Но и `git checkout --`, стоявший здесь раньше, не годится:
+    # правку в tasks/ и config/ во время прогона делает не только узел, а ещё и человек,
+    # сидящий рядом, — и его работа исчезала, а он узнавал об этом из строки в логе.
+    #
+    # Правки уезжают коммитом в ветку bcf/parked/<дата>, откуда их забирают обратно.
     $ownerDirty = @($dirty | Where-Object { $_ -match '^(tasks|config)/' })
     if ($ownerDirty.Count) {
-        foreach ($f in $ownerDirty) { & git -C $Root checkout -- $f 2>&1 | Out-Null }
+        $park = Save-OwnerEditsToParkedBranch -Root $Root -Files $ownerDirty `
+                    -Reason "правки в каталогах владельца во время слияния $Task" `
+                    -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
         $dirty = @($dirty | Where-Object { $ownerDirty -notcontains $_ })
-        Write-Warning ("слияние: откачены правки узла в каталогах владельца — $($ownerDirty -join ', '). " +
-                       "Эти каталоги агенту запрещены; правка отменена, слияние продолжено. " +
-                       "Если правку сделал человек во время прогона — она потеряна, коммить до запуска.")
+        if ($park.Ok) {
+            Write-Warning ("слияние: правки в каталогах владельца припаркованы — $($ownerDirty -join ', '). " +
+                           $park.Message)
+        } else {
+            Write-Warning ("слияние: правки в каталогах владельца не удалось припарковать — $($park.Message). " +
+                           "Дерево оставлено как есть, слияние не пойдёт.")
+            return @{
+                Ok = $false; Conflicts = @(); Kind = 'dirty-tree'
+                Message = "правки владельца в $($ownerDirty -join ', ') не удалось сохранить: $($park.Message)"
+            }
+        }
     }
 
     if ($dirty.Count) {
@@ -274,7 +474,14 @@ function Merge-TaskWorktree {
         }
     }
 
-    $out = (& git -C $Root merge --no-ff --no-edit $branch 2>&1 | Out-String)
+    if ($RunId) {
+        $id = Get-BcfGitIdentityArgs -Root $Root
+        $msg = New-BcfCommitMessage -Subject "${Task}: слияние работы задачи" `
+                   -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        $out = (& git -C $Root @id merge --no-ff -m $msg $branch 2>&1 | Out-String)
+    } else {
+        $out = (& git -C $Root merge --no-ff --no-edit $branch 2>&1 | Out-String)
+    }
     if ($LASTEXITCODE -eq 0) {
         return @{ Ok = $true; Conflicts = @(); Kind = 'ok'; Message = $out.Trim() }
     }
@@ -301,7 +508,11 @@ function Merge-TaskWorktree {
 function Complete-ArbitratedMerge {
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$Task
+        [Parameter(Mandatory)][string]$Task,
+        # Метаданные прогона — только для трейлеров коммита. Пусто = коммит принимает
+        # готовое сообщение слияния (`--no-edit`) без трейлеров: сведение конфликта,
+        # позванное не из графа (руками, из другого оркестратора), не обязано их знать.
+        [string]$RunId = '', [string]$Role = '', [string]$Model = '', [string]$Backend = ''
     )
     $left = @(& git -C $Root diff --name-only --diff-filter=U 2>$null |
               ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -323,7 +534,18 @@ function Complete-ArbitratedMerge {
         return @{ Ok = $false; Message = "в сведённых файлах остались маркеры конфликта: $($withMarkers -join ', ')" }
     }
     & git -C $Root add -A 2>&1 | Out-Null
-    $out = (& git -C $Root -c user.name=ralph -c user.email=ralph@local commit --no-edit 2>&1 | Out-String)
+    # Идентичность — из конфига проекта (author.*), иначе из git-конфига репозитория,
+    # только на голой фикстуре — bcf/bcf@local. Раньше здесь стояло намертво вшитое
+    # user.name=ralph — коммит арбитра подписывался ботом, даже когда владелец назвал
+    # себя в config/harness.json.
+    $id = Get-BcfGitIdentityArgs -Root $Root
+    if ($RunId) {
+        $msg = New-BcfCommitMessage -Subject "${Task}: слияние конфликта сведено арбитром" `
+                   -Task $Task -RunId $RunId -Role $Role -Model $Model -Backend $Backend
+        $out = (& git -C $Root @id commit -m $msg 2>&1 | Out-String)
+    } else {
+        $out = (& git -C $Root @id commit --no-edit 2>&1 | Out-String)
+    }
     if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Message = $out.Trim() } }
     return @{ Ok = $true; Message = $out.Trim() }
 }

@@ -15,6 +15,9 @@
 #      слитое дерево — поэтому после слияния гоняем их ещё раз.
 
 . (Join-Path $PSScriptRoot 'bcf-context.ps1')
+# Доска задач: параллельный планировщик — второе место (после графа), где со стороны
+# видно, чем фабрика занята прямо сейчас.
+. (Join-Path $PSScriptRoot 'team-bus.ps1')
 
 # ---------------------------------------------------------------------------
 # ПРОВЕРКА НА СЛИТОМ ДЕРЕВЕ: ТРИ ИСХОДА, А НЕ ДВА
@@ -221,10 +224,27 @@ function Invoke-ParallelQueue {
         # прежде чем её убьют. Должно быть заметно больше самой долгой легитимной паузы
         # (итерация агента + verify), иначе сторож начнёт резать работающие задачи.
         [int]$TaskIdleKillSec = 2400,
+        # Id прогона для доски задач (tasks/STATUS.json). Пусто = доска не ведётся: у
+        # сухого плана и у вызова из чужой обвязки прогона как события нет.
+        [string]$Run = '',
+        # Метаданные прогона для трейлеров коммитов (Task/Run-Id/Role/Model/Backend) —
+        # тех же, что граф очереди пишет в свои коммиты (queue.graph.ps1). Пусто здесь не
+        # значит «без трейлеров»: ключи в сообщении коммита стоят всегда (Format-BcfCommitTrailers),
+        # пустым остаётся только значение — как у графа, когда бэкенд не сообщён.
+        [string]$Backend = '',
         [switch]$DryPlan
     )
 
     $log = { param($m) & $LogFn $m }
+
+    # Состояние задачи на общей доске. Отдельная функция, потому что мест, откуда задача
+    # уходит из работы, здесь семь, и «забыть в одном из них» означает задачу, которая со
+    # стороны навсегда осталась у фабрики.
+    $board = {
+        param($task, $state, $node)
+        if (-not $Run -or $DryPlan) { return }
+        try { Update-TaskStatus -Root $Root -Run $Run -Task $task -State $state -Node $node | Out-Null } catch { }
+    }
 
     $pending = [System.Collections.ArrayList]::new()
     foreach ($t in $Tasks) { [void]$pending.Add($t) }
@@ -239,6 +259,7 @@ function Invoke-ParallelQueue {
     foreach ($t in @($pending)) {
         if (& $IsPass $t $Root) {
             & $log "$t — уже verdict: PASS, пропуск."
+            & $board $t 'закрыта' ''
             $passed += $t; [void]$doneSet.Add($t); $pending.Remove($t)
         }
     }
@@ -290,16 +311,18 @@ function Invoke-ParallelQueue {
             if ($DryPlan) {
                 # В режиме плана «запускаем» мгновенно: занимаем заявку, чтобы
                 # следующие задачи проверялись против неё, и сразу освобождаем.
-                Add-TaskClaim -TaskId $task -Root $Root -UseCoupling
+                Add-TaskClaim -TaskId $task -Root $Root -UseCoupling -Local
                 [void]$running.Add(@{ Task = $task; Dry = $true })
                 continue
             }
 
             # 3. Worktree + запуск.
+            & $board $task 'у фабрики' "работа-$task"
             $wt = New-TaskWorktree -Root $Root -Task $task
             if (-not $wt) {
                 & $log "$task — не удалось создать worktree, задача пропущена."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = 'worktree не создан' }
+                & $board $task 'заблокирована' "работа-$task"
                 [void]$doneSet.Add($task)
                 continue
             }
@@ -318,7 +341,7 @@ function Invoke-ParallelQueue {
 
         if ($DryPlan) {
             foreach ($r in @($running)) {
-                Remove-TaskClaim -TaskId $r.Task
+                Remove-TaskClaim -TaskId $r.Task -Root $Root -Local
                 $running.Remove($r)
                 [void]$doneSet.Add($r.Task)
                 $passed += $r.Task
@@ -340,6 +363,7 @@ function Invoke-ParallelQueue {
             foreach ($t in @($pending)) {
                 $pend = @(& $GatePreds $t | Where-Object { -not (& $IsPass $_ $Root) })
                 $stuck += [pscustomobject]@{ Task = $t; Reason = "gate-block: предшественник $($pend -join ', ') не закрыт (не запускался)" }
+                & $board $t 'заблокирована' 'gate'
                 $pending.Remove($t)
             }
             break
@@ -382,7 +406,8 @@ function Invoke-ParallelQueue {
             if (-not $isPass) {
                 & $log "$task — не закрыта в worktree, слияния не будет."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = 'не достиг PASS (лимит/затык)' }
-                Remove-TaskClaim -TaskId $task
+                & $board $task 'заблокирована' "работа-$task"
+                Remove-TaskClaim -TaskId $task -Root $Root
                 Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
                 [void]$doneSet.Add($task)
                 continue
@@ -427,25 +452,53 @@ function Invoke-ParallelQueue {
                 Register-TaskConflict -Pair @($task, '(config)') -Files $cfgTouched -Kind 'config-violation'
             }
 
-            # Коммитим работу задачи в её ветке — без этого сливать нечего.
+            # Коммитим работу задачи в её ветке — без этого сливать нечего. Идентичность и
+            # трейлеры — те же, что у любого коммита фабрики (Get-BcfGitIdentityArgs,
+            # New-BcfCommitMessage): раньше здесь стояло намертво вшитое user.name=ralph,
+            # и параллельный ночной прогон (limits.taskConcurrency > 1) был единственным
+            # путём, где коммит фабрики не подписывался author.* владельца и не нёс
+            # Task/Run-Id/Role/Model/Backend, хотя граф очереди (queue.graph.ps1) их пишет.
             & git -C $r.Worktree add -A 2>&1 | Out-Null
-            & git -C $r.Worktree -c user.name=ralph -c user.email=ralph@local `
-                commit -m "${task}: работа агента (авто-коммит перед слиянием)" 2>&1 | Out-Null
+            $wid = Get-BcfGitIdentityArgs -Root $r.Worktree
+            $wmsg = New-BcfCommitMessage -Subject "${task}: работа агента (авто-коммит перед слиянием)" `
+                        -Task $task -RunId $Run -Role 'worker' -Model $Model -Backend $Backend
+            & git -C $r.Worktree @wid commit -m $wmsg 2>&1 | Out-Null
 
-            $merge = Merge-TaskWorktree -Root $Root -Task $task -GeneratedFiles $GeneratedFiles
+            # SHA до слияния запоминается ЗДЕСЬ, а не выводится потом из HEAD~1. Между
+            # слиянием и проверками проходят минуты, и в общую ветку успевает приехать
+            # чужой коммит: HEAD~1 снимет его, ничего не зная о том, чей он.
+            $beforeMerge = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
+            $merge = Merge-TaskWorktree -Root $Root -Task $task -GeneratedFiles $GeneratedFiles `
+                        -RunId $Run -Role 'worker' -Model $Model -Backend $Backend
             if (-not $merge.Ok) {
+                # CORE/NFR без файла приёмки — не «слияние не удалось» (это про git-механику),
+                # а решение, которого ждёт человек. Текст обязан быть ровно фразой гейта:
+                # по ней needs_human (run-all.ps1: всё, что не начинается с «gate-block») и
+                # доска задач узнают затык, который чинится не починкой кода, а `bcf task accept`.
+                # Раньше это падало в общую ветку ниже и печаталось как «git отверг слияние:
+                # ждёт приёмки лидера» — неправда про git и другой текст, чем ждёт задание.
+                if ($merge.Kind -eq 'needs-acceptance') {
+                    & $log "$task — verdict PASS, но класс требует приёмки лидера: $($merge.Message)"
+                    $stuck += [pscustomobject]@{ Task = $task; Reason = $merge.Message }
+                    & $board $task 'заблокирована' "приёмка-$task"
+                    Remove-TaskClaim -TaskId $task -Root $Root
+                    Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
+                    [void]$doneSet.Add($task)
+                    continue
+                }
                 # Причина важнее факта: «конфликт файлов», «git отверг слияние» и
                 # «дерево грязное» чинятся совершенно по-разному.
                 $why = if ($merge.Conflicts.Count) { "конфликт файлов: $($merge.Conflicts -join ', ')" }
                        elseif ($merge.Kind -eq 'dirty-tree') { $merge.Message }
                        else { "git отверг слияние: $(($merge.Message -split "`r?`n" | Select-Object -First 2) -join ' ')" }
                 if ($merge.Conflicts.Count) {
-                    $others = @((Get-ActiveClaims) | ForEach-Object { $_.task } | Where-Object { $_ -ne $task })
+                    $others = @((Get-ActiveClaims -Root $Root) | ForEach-Object { $_.task } | Where-Object { $_ -ne $task })
                     foreach ($o in $others) { Register-TaskConflict -Pair @($task, $o) -Files $merge.Conflicts }
                 }
                 & $log "$task — СЛИЯНИЕ НЕ УДАЛОСЬ: $why. Ветка сохранена."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = "слияние не удалось — $why" }
-                Remove-TaskClaim -TaskId $task
+                & $board $task 'заблокирована' "слияние-$task"
+                Remove-TaskClaim -TaskId $task -Root $Root
                 Remove-TaskWorktree -Root $Root -Task $task -KeepBranch
                 [void]$doneSet.Add($task)
                 continue
@@ -461,7 +514,9 @@ function Invoke-ParallelQueue {
                 if (-not $chk.Ok) { $mergeOk = $false; $checkFail = @{ Cmd = $cmd; Result = $chk }; break }
             }
             if (-not $mergeOk) {
-                & git -C $Root reset --hard HEAD~1 2>&1 | Out-Null
+                $mergeSha = (& git -C $Root rev-parse HEAD 2>$null | Out-String).Trim()
+                $undo = Undo-FailedMerge -Root $Root -MergeSha $mergeSha -BeforeSha $beforeMerge
+                & $log "$task — откат слияния: $($undo.Message)"
                 # Причина названа по исходу: «не запустилась» и «красная» чинят разные люди.
                 $reason = if ($checkFail.Result.Kind -eq 'not-runnable') {
                     "гейт не смог запуститься: $($checkFail.Cmd) — $($checkFail.Result.Reason)"
@@ -470,15 +525,18 @@ function Invoke-ParallelQueue {
                 } else {
                     "семантический конфликт: проверки на слитом дереве красные ($($checkFail.Cmd) — $($checkFail.Result.Reason))"
                 }
+                if (-not $undo.Ok) { $reason = "$reason; откат не удался — $($undo.Message)" }
                 & $log "$task — слияние откатано: $reason."
                 $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
+                & $board $task 'заблокирована' "слитое-$task"
                 $kind = if ($checkFail.Result.Kind -eq 'red') { 'semantic' } else { 'gate-not-runnable' }
                 Register-TaskConflict -Pair @($task, '(слитое дерево)') -Files @() -Kind $kind
             } else {
                 & $log "$task — слита в основную ветку."
                 $passed += $task
+                & $board $task 'закрыта' "слияние-$task"
             }
-            Remove-TaskClaim -TaskId $task
+            Remove-TaskClaim -TaskId $task -Root $Root
             Remove-TaskWorktree -Root $Root -Task $task
             [void]$doneSet.Add($task)
         }

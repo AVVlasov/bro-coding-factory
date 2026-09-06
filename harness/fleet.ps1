@@ -38,7 +38,8 @@ if ($Kill) {
 }
 
 $workers   = Get-FleetWorkers -StaleSec $StaleSec
-$claims    = Get-ActiveClaims
+$claims    = Get-ActiveClaims -Root $root
+$staleClaims = @(Get-BcfFileClaims -Root $root | Where-Object { $_.stale })
 $worktrees = Get-TaskWorktrees -Root $root
 $conflicts = Get-KnownConflicts
 
@@ -61,11 +62,23 @@ foreach ($w in $workers) {
         $w.id, $w.role, $w.task, $w.pid, $w.idle_sec, $mark, $w.detail) -ForegroundColor $color
 }
 
-Write-Host "`n=== ЗАЯВКИ НА ФАЙЛЫ ($($claims.Count)) ===" -ForegroundColor Cyan
+Write-Host "`n=== ЗАЯВКИ НА ЗАДАЧИ ($($claims.Count)) ===" -ForegroundColor Cyan
 if ($claims.Count -eq 0) { Write-Host "  (нет)" -ForegroundColor DarkGray }
 foreach ($c in $claims) {
-    Write-Host ("  {0,-10} pid {1,-7} файлов {2}" -f $c.task, $c.pid, @($c.files).Count) -ForegroundColor Gray
+    $who = if ($c.who) { $c.who } else { 'без имени' }
+    Write-Host ("  {0,-10} {1,-16} с {2,-16} файлов {3}" -f `
+        $c.task, $who, (Format-BcfClaimSince $c.since), @($c.files).Count) -ForegroundColor Gray
     foreach ($f in @($c.declared)) { Write-Host "      $f" -ForegroundColor DarkGray }
+}
+# Протухшие показываем отдельно и вслух: задачу они не держат, но человек, чья заявка
+# протухла, где-то есть, и молча забрать у него задачу — это то же столкновение, только
+# без предупреждения.
+if ($staleClaims.Count) {
+    Write-Host "`n  протухшие заявки (задачу не держат): $($staleClaims.Count)" -ForegroundColor DarkYellow
+    foreach ($c in $staleClaims) {
+        $age = if ($c.ageHours -lt 0) { 'время не разобрано' } else { "{0:N0} ч" -f $c.ageHours }
+        Write-Host ("    {0,-10} {1,-16} {2}" -f $c.task, $c.who, $age) -ForegroundColor DarkYellow
+    }
 }
 
 Write-Host "`n=== WORKTREE ($($worktrees.Count)) ===" -ForegroundColor Cyan

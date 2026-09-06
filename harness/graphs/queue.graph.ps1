@@ -43,6 +43,33 @@ try {
     if ($cj._default) { $mergeChecks = @($cj._default | Where-Object { $_ -is [string] -and $_.Trim() }) }
 } catch { }
 
+# --- ШИНА КОМАНДЫ: чем прогон начинается ------------------------------------------------
+#
+# Функции приезжают вместе с рантаймом (harness/lib/team-bus.ps1). Пока publish.remote
+# пуст, здесь не происходит ничего. Заполнен — прогон начинается с чужой работы: fetch и
+# перемотка ветки интеграции, дальше волна уходит своей веткой. Разошедшиеся ветки прогон
+# не сводит и не стартует: это решение человека, а не ночного прогона.
+$team = @{ Ok = $true; Wave = ''; Remote = ''; Branch = ''; Reason = 'сухой план: ветка волны не заводится' }
+if (-not $script:GraphCtx.DryPlan) {
+    $team = Start-TeamRun -Root $root
+    if (-not $team.Ok) {
+        Write-GraphLog "прогон не стартовал: $($team.Reason)"
+        return @{ complete = $false; ok = $false; reason = $team.Reason }
+    }
+    Write-GraphLog $team.Reason
+}
+
+# Состояние задачи на общей доске tasks/STATUS.json. Узлы её обновляют сами (рантайм
+# делает это из журнала), а «закрыта» и «заблокирована» ставит тот, кто это решил.
+function Set-QueueBoard {
+    param([string]$Task, [string]$State, [string]$Node = '')
+    if (-not $script:GraphCtx -or $script:GraphCtx.DryPlan) { return }
+    try {
+        Update-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId `
+            -Task $Task -State $State -Node $Node | Out-Null
+    } catch { }
+}
+
 # ---------------------------------------------------------------------------
 Set-Phase 'Разметка'
 # ---------------------------------------------------------------------------
@@ -176,11 +203,26 @@ Set-GraphVar generated   $generated
 Set-GraphVar mergeChecks $mergeChecks
 Set-GraphVar perTaskMax  $perTaskMax
 Set-GraphVar root        $root
+# Модель и бэкенд ЦИКЛА (не graph.roles.worker: коммит кодовой работы делает
+# harness/loop.ps1 внутри Invoke-CommandNode, а он берёт agent.command/models.code, а не
+# роли графа) — только для трейлеров коммита «работа агента».
+Set-GraphVar codeModel   $(if ($cfg.models -and $cfg.models.code) { [string]$cfg.models.code } else { '' })
+Set-GraphVar codeBackend $(if ($cfg.agent -and $cfg.agent.adapter) { [string]$cfg.agent.adapter } else { '' })
 
 $done = @{}
 $passed = @()
 $stuck = @()
 foreach ($t in $tasks) { if ($t.Pass) { $done[$t.Id] = $true; $passed += $t.Id } }
+
+# Доска показывает очередь целиком с самого начала: без этого со стороны видна одна
+# задача — та, что идёт, — и «остальные ждут» неотличимо от «остальных нет».
+if (-not $script:GraphCtx.DryPlan) {
+    Reset-TaskStatusBoard -Root $root -Run $script:GraphCtx.RunId `
+        -Queued @($tasks | Where-Object { -not $_.Pass } | ForEach-Object { $_.Id }) `
+        -Closed @($tasks | Where-Object {      $_.Pass } | ForEach-Object { $_.Id }) | Out-Null
+    Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($($script:GraphCtx.RunId))" `
+        -RunId (Get-GraphRunId) -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend) | Out-Null
+}
 
 # Задача без объявленных файлов к работе НЕ допускается — и отказ выдаётся здесь, до
 # первого потраченного токена. Допуск на старте держится на декларации владения: без неё
@@ -193,6 +235,7 @@ foreach ($t in $tasks) {
     $done[$t.Id] = $true
     $stuck += [pscustomobject]@{ Task = $t.Id
         Reason = 'файлы не объявлены: в задаче нет списка в секции «## Файлы», поэтому владение неизвестно и допуск не работает' }
+    Set-QueueBoard -Task $t.Id -State 'заблокирована' -Node 'допуск'
     Write-GraphLog "✗ $($t.Id): файлы не объявлены — к работе не допущена"
 }
 
@@ -245,7 +288,8 @@ while ($true) {
 
             $wt = New-TaskWorktree -Root $root -Task $task
             if (-not $wt) { return @{ Task = $task; Ok = $false; Reason = 'worktree не создан' } }
-            Add-TaskClaim -TaskId $task -Root $root -UseCoupling
+            Add-TaskClaim -TaskId $task -Root $root -UseCoupling `
+                -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
             $max = Get-GraphVar perTaskMax
             # -ProjectRoot ОБЯЗАТЕЛЕН и указывает на worktree задачи.
             #
@@ -278,36 +322,37 @@ while ($true) {
             # Ветка с коммитом стоит ничего, а восстановить из неё можно всё; обратное
             # неверно. Слияние по-прежнему делается только по PASS.
             & git -C $wt add -A 2>&1 | Out-Null
-            & git -C $wt -c user.name=ralph -c user.email=ralph@local commit -m "${task}: работа агента" 2>&1 | Out-Null
+            $wid = Get-BcfGitIdentityArgs -Root $wt
+            $wmsg = New-BcfCommitMessage -Subject "${task}: работа агента" -Task $task -RunId (Get-GraphRunId) `
+                        -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
+            & git -C $wt @wid commit -m $wmsg 2>&1 | Out-Null
 
             $vf = Join-Path $wt "tasks\.verdicts\$task.md"
             $isPass = (Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet)
 
-            # ВЕРДИКТ ОБЯЗАН ПЕРЕЖИТЬ WORKTREE.
+            # ВЕРДИКТ ЕДЕТ В GIT ВМЕСТЕ С ЗАДАЧЕЙ.
             #
             # Он пишется в дерево задачи (только там проверки честные — там лежит её
-            # работа), а каталог вердиктов в .gitignore, то есть слиянием он не переносится
-            # и умирает вместе с worktree. Между тем именно по нему считается готовность
-            # СЛЕДУЮЩЕЙ волны (Get-Verdict читает корень) и состояние бэклога в `bcf tasks`.
-            # Пока копии не было, прогон закрывал первую волну и вставал: остальные задачи
-            # навсегда оставались «ждёт», а отчёт называл это «не закрыто» — при том что
-            # работа была сделана и слита. Наблюдалось живьём 2026-08-06, прогон
-            # g_20260806-141305: TASK-01 слита за 7 минут, восемь задач не поехали.
+            # работа) и попадает в коммит выше. PASS приезжает в общую ветку слиянием, и
+            # переносить его отдельно больше не надо: раньше каталог вердиктов был в
+            # .gitignore, поэтому его копировали руками — и вердикт существовал ровно на
+            # одной машине, невидимый остальным участникам.
             #
-            # НО PASS ПЕРЕНОСИТСЯ ТОЛЬКО ПОСЛЕ УДАЧНОГО СЛИЯНИЯ.
+            # PASS НЕ ЗАСЧИТЫВАЕТСЯ ДО УДАЧНОГО СЛИЯНИЯ.
             #
             # Закрытие — это «работа в основном дереве», а не «в своей ветке всё зелёное».
-            # Пока PASS копировался здесь, задача с провалившейся интеграцией объявлялась
+            # Пока PASS переносился здесь, задача с провалившейся интеграцией объявлялась
             # закрытой: 2026-08-06 TASK-02 и TASK-03 получили PASS в основном дереве, их
             # код туда не попал (слияние упало на красных проверках), и следующая волна
-            # честно взялась строить TASK-04 поверх несуществующих стабов.
+            # честно взялась строить TASK-04 поверх несуществующих стабов. Слияние ниже
+            # и есть тот момент, когда PASS становится фактом проекта.
             #
-            # FAIL переносим сразу: он ничего не закрывает, а список ремедиации нужен
-            # человеку и следующей попытке. PASS — ниже, после Merge-TaskWorktree.
-            $vdirRoot = Join-Path $root 'tasks\.verdicts'
+            # FAIL публикуем сразу и отдельным коммитом: слияния у него не будет, а список
+            # ремедиации нужен человеку и следующей попытке.
             if ((Test-Path $vf) -and -not $isPass) {
-                New-Item -ItemType Directory -Force -Path $vdirRoot | Out-Null
-                Copy-Item -LiteralPath $vf -Destination (Join-Path $vdirRoot "$task.md") -Force -ErrorAction SilentlyContinue
+                $pv = Publish-TaskVerdict -Root $root -Task $task -VerdictFile $vf `
+                          -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
+                if (-not $pv.Ok) { Write-GraphLog "$task — вердикт FAIL не опубликован: $($pv.Reason)" }
             }
 
             # Диагностика расщеплённого прогона. Если вердикта в worktree нет, а в
@@ -318,7 +363,8 @@ while ($true) {
             if (-not $isPass) {
                 $vfRoot = Join-Path $root "tasks\.verdicts\$task.md"
                 if ((Test-Path $vfRoot) -and (Select-String -Path $vfRoot -Pattern '^verdict:\s*PASS' -Quiet)) {
-                    Remove-TaskClaim -TaskId $task
+                    Remove-TaskClaim -TaskId $task -Root $root `
+                        -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
                     Remove-TaskWorktree -Root $root -Task $task -KeepBranch
                     return @{ Task = $task; Ok = $false
                               Reason = "РАСЩЕПЛЁННЫЙ ПРОГОН: вердикт PASS лёг в основное дерево вместо worktree — цикл запущен не из своей копии. Работа задачи не потеряна (ветка bcf/task/$task), но слить её автоматически нельзя." }
@@ -341,7 +387,8 @@ while ($true) {
                     Copy-Item -LiteralPath $co -Destination (Join-Path $codir "$task.md") -Force -ErrorAction SilentlyContinue
                     $reason = "требует ревью человека — .bcf/callouts/$task.md (правка попала под friction-триггер)"
                 }
-                Remove-TaskClaim -TaskId $task
+                Remove-TaskClaim -TaskId $task -Root $root `
+                    -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
                 Remove-TaskWorktree -Root $root -Task $task -KeepBranch
                 return @{ Task = $task; Ok = $false; Reason = $reason }
             }
@@ -363,7 +410,12 @@ while ($true) {
                     } catch { }
                 }
 
-                $m = Merge-TaskWorktree -Root $root -Task $task -GeneratedFiles (Get-GraphVar generated) -KeepConflictForArbiter
+                # SHA до слияния запоминается ЗДЕСЬ. Откат по HEAD~1 снимает последний
+                # коммит, каким бы он ни был: в общую ветку между слиянием и проверками
+                # успевает приехать чужая работа.
+                $beforeMerge = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+                $m = Merge-TaskWorktree -Root $root -Task $task -GeneratedFiles (Get-GraphVar generated) -KeepConflictForArbiter `
+                        -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
 
                 if (-not $m.Ok -and $m.Kind -eq 'conflict-open') {
                     # АРБИТР. Ему намеренно не дают роль автора ни одной из сторон:
@@ -382,7 +434,9 @@ while ($true) {
   и напиши в конце ответа строку: НЕСОВМЕСТИМО: <в чём именно>.
 "@
                     Invoke-Node -Prompt $ap -Label "арбитр-$task" -Role arbiter -Recall -RecallScope 'merge' -WorkDir $root -TimeoutSec 1800 | Out-Null
-                    $c = Complete-ArbitratedMerge -Root $root -Task $task
+                    $arb = Resolve-GraphRole -Role 'arbiter'
+                    $c = Complete-ArbitratedMerge -Root $root -Task $task `
+                             -RunId (Get-GraphRunId) -Role 'arbiter' -Model $arb.Model -Backend $arb.Backend
                     if ($c.Ok) { $m = @{ Ok = $true; Kind = 'arbitrated'; Conflicts = @(); Message = $c.Message } }
                     else {
                         Undo-ArbitratedMerge -Root $root
@@ -391,6 +445,14 @@ while ($true) {
                 }
 
                 if (-not $m.Ok) {
+                    # CORE/NFR без файла приёмки — не «слияние не удалось» (это про
+                    # git-механику), а решение, которого ждёт человек. Текст обязан быть
+                    # ровно этой фразой: по ней needs_human и доска задач узнают затык,
+                    # который чинится не починкой кода, а `bcf task accept`.
+                    if ($m.Kind -eq 'needs-acceptance') {
+                        Write-GraphLog "$task — verdict PASS, но класс требует приёмки лидера: $($m.Message)"
+                        return @{ Task = $task; Ok = $false; Reason = $m.Message }
+                    }
                     $why = if ($m.Conflicts.Count) { "конфликт не сведён: $($m.Conflicts -join ', ')" }
                            elseif ($m.Kind -eq 'dirty-tree') { $m.Message }
                            else { "git отверг слияние: $((($m.Message -split "`r?`n") | Select-Object -First 2) -join ' ')" }
@@ -402,8 +464,12 @@ while ($true) {
                 foreach ($cmd in @(Get-GraphVar mergeChecks)) {
                     $chk = Invoke-CommandNode $cmd -Label "слитое-$task-$([Math]::Abs($cmd.GetHashCode()) % 1000)" -WorkDir $root -TimeoutSec 1800
                     if (-not $chk.Ok) {
-                        & git -C $root reset --hard HEAD~1 2>&1 | Out-Null
-                        return @{ Task = $task; Ok = $false; Reason = 'семантический конфликт: проверки на слитом дереве красные' }
+                        $mergeSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+                        $undo = Undo-FailedMerge -Root $root -MergeSha $mergeSha -BeforeSha $beforeMerge
+                        Write-GraphLog "$task — откат слияния: $($undo.Message)"
+                        $why = 'семантический конфликт: проверки на слитом дереве красные'
+                        if (-not $undo.Ok) { $why = "$why; откат не удался — $($undo.Message)" }
+                        return @{ Task = $task; Ok = $false; Reason = $why }
                     }
                 }
 
@@ -438,9 +504,12 @@ while ($true) {
                     } catch { }
                     $lost = @($greenBefore | Where-Object { $_ -and ($_ -notin $greenAfter) })
                     if ($lost.Count) {
-                        & git -C $root reset --hard HEAD~1 2>&1 | Out-Null
-                        return @{ Task = $task; Ok = $false
-                                  Reason = "слияние сломало работавший сквозной путь: $($lost -join ', ')" }
+                        $mergeSha = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+                        $undo = Undo-FailedMerge -Root $root -MergeSha $mergeSha -BeforeSha $beforeMerge
+                        Write-GraphLog "$task — откат слияния: $($undo.Message)"
+                        $why = "слияние сломало работавший сквозной путь: $($lost -join ', ')"
+                        if (-not $undo.Ok) { $why = "$why; откат не удался — $($undo.Message)" }
+                        return @{ Task = $task; Ok = $false; Reason = $why }
                     }
                     $gained = @($greenAfter | Where-Object { $_ -and ($_ -notin $greenBefore) })
                     if ($gained.Count) { Write-GraphLog "задача $task закрыла сквозной путь: $($gained -join ', ')" }
@@ -449,14 +518,11 @@ while ($true) {
             }
 
             # ВОТ ЗДЕСЬ задача действительно закрыта: её работа в основном дереве и прошла
-            # проверки на слитом. Только теперь PASS-вердикт становится фактом проекта —
-            # по нему следующая волна считает готовность, а `bcf tasks` показывает закрытое.
-            if ($outcome.Ok -and (Test-Path $vf)) {
-                New-Item -ItemType Directory -Force -Path $vdirRoot | Out-Null
-                Copy-Item -LiteralPath $vf -Destination (Join-Path $vdirRoot "$task.md") -Force -ErrorAction SilentlyContinue
-            }
+            # проверки на слитом. PASS-вердикт приехал тем же слиянием, что и код, — по
+            # нему следующая волна считает готовность, а `bcf tasks` показывает закрытое.
 
-            Remove-TaskClaim -TaskId $task
+            Remove-TaskClaim -TaskId $task -Root $root `
+                -RunId (Get-GraphRunId) -Role 'worker' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
             Remove-TaskWorktree -Root $root -Task $task -KeepBranch:(-not $outcome.Ok)
             return $outcome
         }
@@ -473,9 +539,11 @@ while ($true) {
         $done[$r.Task] = $true
         if ($r.Ok) {
             $passed += $r.Task
+            Set-QueueBoard -Task $r.Task -State 'закрыта' -Node "интеграция-$($r.Task)"
             Write-GraphLog "✓ $($r.Task) слита$(if ($r.Arbitrated) { ' (через арбитра)' })"
         } else {
             $stuck += [pscustomobject]@{ Task = $r.Task; Reason = $r.Reason }
+            Set-QueueBoard -Task $r.Task -State 'заблокирована' -Node "интеграция-$($r.Task)"
             Write-GraphLog "✗ $($r.Task): $($r.Reason)"
 
             # ПРОВАЛ — САМЫЙ ЦЕННЫЙ МАТЕРИАЛ, И ИМЕННО ОН РАНЬШЕ ПРОПАДАЛ. Цикл писал
@@ -522,6 +590,7 @@ while ($true) {
         $done[$t.Id] = $true
         $stuck += [pscustomobject]@{ Task = $t.Id
             Reason = 'ветка конвейера упала и ничего не вернула — см. журнал прогона (событие «ветка упала»)' }
+        Set-QueueBoard -Task $t.Id -State 'заблокирована' -Node "работа-$($t.Id)"
         Write-GraphLog "✗ $($t.Id): ветка конвейера упала без результата"
     }
 }
@@ -531,6 +600,7 @@ foreach ($t in $tasks) {
     if ($done.ContainsKey($t.Id)) { continue }
     $pend = @($t.Preds | Where-Object { -not (Get-Verdict $_) })
     $stuck += [pscustomobject]@{ Task = $t.Id; Reason = "gate-block: предшественник $($pend -join ', ') не закрыт (не запускался)" }
+    Set-QueueBoard -Task $t.Id -State 'заблокирована' -Node 'gate'
 }
 
 # ---------------------------------------------------------------------------
@@ -779,6 +849,17 @@ $reviewFile = if ($script:GraphCtx.DryPlan) {
     Join-Path $root '.bcf\REVIEW.md'
 }
 $statusFile = if ($script:GraphCtx.DryPlan) { Join-Path $script:GraphCtx.Dir 'run-all.status.dry.json' } else { '' }
+
+# Доска закрывается и уезжает вместе с волной ДО отчёта: отказ отправки обязан попасть в
+# сам отчёт затыком, а не остаться строкой в журнале, которую утром никто не откроет.
+if (-not $script:GraphCtx.DryPlan) {
+    $fin = Complete-TeamRun -Root $root -Run $script:GraphCtx.RunId -Team $team -Stuck @($stuck) `
+        -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
+    if (-not $fin.Publish.Ok) { Write-GraphLog "волна не опубликована: $($fin.Publish.Reason)" }
+    elseif ($fin.Publish.Kind -eq 'pushed') { Write-GraphLog $fin.Publish.Reason }
+    $stuck = @($fin.Stuck)
+}
+
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $tasks.Count -Root $root `
     -ReviewFile $reviewFile -StatusFile $statusFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `
     -AcceptanceP1 $findP1.Count

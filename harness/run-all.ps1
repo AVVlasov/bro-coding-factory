@@ -48,6 +48,9 @@ if (-not $Model -and $harnessCfg -and $harnessCfg.models -and $harnessCfg.models
 }
 $taskIdPrefix = if ($harnessCfg -and $harnessCfg.taskIdPrefix) { [string]$harnessCfg.taskIdPrefix } else { 'TASK' }
 $modelLabel   = if ($Model) { $Model } else { '(backend default)' }
+# Для трейлера Backend: в параллельном режиме тот же источник, что и у графа очереди
+# (queue.graph.ps1: Set-GraphVar codeBackend из agent.adapter).
+$codeBackend  = if ($harnessCfg -and $harnessCfg.agent -and $harnessCfg.agent.adapter) { [string]$harnessCfg.agent.adapter } else { '' }
 
 try {
   [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
@@ -310,6 +313,37 @@ if (-not $queue -or $queue.Count -eq 0) {
 Log "=== ОВЕРНАЙТ run-all старт. Задач в очереди: $($queue.Count) (PerTaskMax=$PerTaskMax, model=$modelLabel). ==="
 Log "Очередь: $((($queue | ForEach-Object { $_.Task }) -join ', '))"
 
+# --- ШИНА КОМАНДЫ: чем прогон начинается ------------------------------------------------
+#
+# Пока publish.remote пуст, здесь не происходит ничего: ни сетевого вызова, ни новой ветки.
+# Заполнен — прогон обязан начаться с чужой работы, а не со своей: fetch и перемотка ветки
+# интеграции. Разошедшиеся линии работы прогон НЕ сводит и не стартует вовсе — свести их
+# имеет право человек, и лучше он сделает это утром, чем фабрика ночью и молча.
+#
+# -DryPlan НЕ СОЗДАЁТ НИЧЕГО (docs/CLI.md): ни fetch, ни ветки волны, ни коммита доски.
+# Тот же условие, что уже стоит в queue.graph.ps1 и в scheduler.ps1 — иначе сухой план
+# сам оставляет за собой git-состояние, которое обязан был только показать.
+. (Join-Path $PSScriptRoot 'lib\team-bus.ps1')
+$runId = 'run_' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+$team = @{ Ok = $true; Wave = ''; Remote = ''; Branch = ''; Reason = 'сухой план: ветка волны не заводится' }
+if (-not $DryPlan) {
+  $team = Start-TeamRun -Root $root
+  if (-not $team.Ok) {
+    Log "ПРОГОН НЕ СТАРТОВАЛ: $($team.Reason)"
+    exit 2
+  }
+  Log $team.Reason
+
+  # Доска задач заводится ДО первого запуска и показывает очередь целиком: наблюдателю
+  # нужна разница между «остальные ждут» и «остальных нет».
+  Reset-TaskStatusBoard -Root $root -Run $runId `
+    -Queued @($queue | Where-Object { -not (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) `
+    -Closed @($queue | Where-Object {      (Verdict-Pass $_.Task) } | ForEach-Object { $_.Task }) | Out-Null
+  # Коммитим сразу: доска меняется весь прогон, и некоммиченной она делает дерево грязным —
+  # то есть отменяет и слияние задачи, и перемотку на старте следующего прогона.
+  Publish-TaskStatus -Root $root -Message "фабрика: доска задач ($runId)" -RunId $runId -Model $Model -Backend $codeBackend | Out-Null
+}
+
 # --- Параллельный режим (MX-04). При TaskConcurrency <= 1 работает старый
 # последовательный путь ниже — он проверен, его не трогаем. ---
 if ($TaskConcurrency -le 0) {
@@ -342,8 +376,9 @@ if ($TaskConcurrency -gt 1 -or $DryPlan) {
     -IsPass { param($t, $wt) Verdict-Pass $t $wt } `
     -GatePreds { param($t) Get-GatePreds $t } `
     -LogFn { param($m) Log $m } `
+    -Run $runId `
     -Concurrency $TaskConcurrency -MaxAgents $maxAgents -PerTaskMax $PerTaskMax `
-    -Model $Model -MergeChecks $mergeChecks -DryPlan:$DryPlan `
+    -Model $Model -Backend $codeBackend -MergeChecks $mergeChecks -DryPlan:$DryPlan `
     -GeneratedFiles @(if ($harnessCfg -and $harnessCfg.generatedFiles) { $harnessCfg.generatedFiles } else { @() })
 
   foreach ($p in $res.Plan) {
@@ -355,7 +390,13 @@ if ($TaskConcurrency -gt 1 -or $DryPlan) {
     exit 0
   }
 
-  $rep = Emit-RunAllReport -Passed $res.Passed -Stuck $res.Stuck -Total $queue.Count -Root $root `
+  # Доска закрывается и уезжает вместе с волной ДО отчёта: отказ отправки обязан попасть
+  # в сам отчёт затыком, а не остаться строкой в журнале.
+  $fin = Complete-TeamRun -Root $root -Run $runId -Team $team -Stuck @($res.Stuck) -Model $Model -Backend $codeBackend
+  if (-not $fin.Publish.Ok) { Log "ВОЛНА НЕ ОПУБЛИКОВАНА: $($fin.Publish.Reason)" }
+  elseif ($fin.Publish.Kind -eq 'pushed') { Log $fin.Publish.Reason }
+
+  $rep = Emit-RunAllReport -Passed $res.Passed -Stuck @($fin.Stuck) -Total $queue.Count -Root $root `
     -ReviewFile $reviewFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
   Log "=== run-all (параллельно) завершён: PASS $($rep.passed)/$($rep.total), не закрыто $($rep.stuck). ==="
   if ($rep.complete) { exit 0 } else { exit 1 }
@@ -390,6 +431,7 @@ while (-not $stopped) {
       $reason = "gate-block: предшественник $($blockedBy -join ', ') не закрыт"
       Log "<<< $task → пропуск ($reason)."
       $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
+      Update-TaskStatus -Root $root -Run $runId -Task $task -State 'заблокирована' -Node 'gate' | Out-Null
       [void]$stuckSet.Add($task); [void]$doneSet.Add($task)
       continue
     }
@@ -399,6 +441,7 @@ while (-not $stopped) {
 
     # Все предшественники PASS (или их нет) → запускаем.
     Log ">>> Задача $task — запуск loop.ps1 -AutoAdvance (потолок $PerTaskMax итераций) ..."
+    Update-TaskStatus -Root $root -Run $runId -Task $task -State 'у фабрики' -Node "работа-$task" | Out-Null
 
     # M-17: ИЗОЛЯЦИЯ ЗАДАЧ. Всё некоммиченное копится на ОДНОМ working-tree → правки
     # незакрытой задачи протекают в следующую и контаминируют её гейты (напр. layout-contract
@@ -416,8 +459,24 @@ while (-not $stopped) {
     [void]$doneSet.Add($task)
 
     if (Verdict-Pass $task) {
-      Log "<<< $task → PASS."
-      $passed += $task
+      # ГЕЙТ ПРИЁМКИ И ЗДЕСЬ. Последовательный прогон работает прямо в основном дереве
+      # (M-17: изоляция снимком, а не отдельной веткой задачи) — Merge-TaskWorktree,
+      # где стоит тот же гейт у графа очереди и параллельного планировщика, сюда не
+      # вызывается вовсе, потому что сливать нечего: код уже лежит на месте. Поэтому
+      # гейт здесь не решает, пускать ли git, а решает, закрыта ли задача административно:
+      # CORE/NFR с зелёным вердиктом, но без tasks/.acceptance/<TASK>.md, не считается
+      # закрытой волной — уходит в needs_human той же дословной причиной, что и на
+      # остальных путях, а её код остаётся в дереве (откатывать нечего и незачем).
+      $gate = Test-BcfTaskAcceptanceGate -TaskId $task -Root $root
+      if (-not $gate.Ok) {
+        Log "<<< $task → verdict PASS, но $($gate.Reason) (класс $($gate.Class)) — ждёт приёмки лидера, не закрыта."
+        $stuck += [pscustomobject]@{ Task = $task; Reason = $gate.Reason }
+        Update-TaskStatus -Root $root -Run $runId -Task $task -State 'заблокирована' -Node "приёмка-$task" | Out-Null
+      } else {
+        Log "<<< $task → PASS."
+        $passed += $task
+        Update-TaskStatus -Root $root -Run $runId -Task $task -State 'закрыта' -Node "работа-$task" | Out-Null
+      }
     } else {
       # Реальная причина остановки из STATE.md (gate-block здесь исключён — преды уже PASS).
       $reason = 'не достиг PASS (лимит/затык)'
@@ -428,6 +487,7 @@ while (-not $stopped) {
       }
       Log "<<< $task → НЕ закрыта ($reason)."
       $stuck += [pscustomobject]@{ Task = $task; Reason = $reason }
+      Update-TaskStatus -Root $root -Run $runId -Task $task -State 'заблокирована' -Node "работа-$task" | Out-Null
       [void]$stuckSet.Add($task)
 
       # M-17: изоляция — откатываем собственную дельту незакрытой задачи (tracked → pre-task snapshot,
@@ -463,6 +523,7 @@ while (-not $stopped) {
       $preds = Get-GatePreds $task
       $pend = @($preds | Where-Object { -not (Verdict-Pass $_) })
       $stuck += [pscustomobject]@{ Task = $task; Reason = "gate-block: предшественник $($pend -join ', ') не закрыт (не запускался)" }
+      Update-TaskStatus -Root $root -Run $runId -Task $task -State 'заблокирована' -Node 'gate' | Out-Null
       [void]$doneSet.Add($task)
     }
     break
@@ -472,6 +533,11 @@ while (-not $stopped) {
 # --- Итоговый отчёт (ОДИН на всю ночь).
 # «Готово» звучит ТОЛЬКО при полностью закрытой очереди; иначе INCOMPLETE + exit 1,
 # чтобы неполный прогон не был принят за успешный ни человеком, ни вызывающим агентом. ---
+$fin = Complete-TeamRun -Root $root -Run $runId -Team $team -Stuck @($stuck) -Model $Model -Backend $codeBackend
+if (-not $fin.Publish.Ok) { Log "ВОЛНА НЕ ОПУБЛИКОВАНА: $($fin.Publish.Reason)" }
+elseif ($fin.Publish.Kind -eq 'pushed') { Log $fin.Publish.Reason }
+$stuck = @($fin.Stuck)
+
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $queue.Count -Root $root `
   -ReviewFile $reviewFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 

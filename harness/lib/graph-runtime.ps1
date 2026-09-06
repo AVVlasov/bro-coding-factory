@@ -38,6 +38,10 @@
 
 Set-StrictMode -Off
 
+# Доска задач (tasks/STATUS.json) обновляется из журнала, поэтому шина команды нужна
+# самому рантайму, а не только оркестраторам.
+. (Join-Path $PSScriptRoot 'team-bus.ps1')
+
 $script:GraphCtx = $null
 
 # ---------------------------------------------------------------------------
@@ -79,6 +83,21 @@ function Initialize-GraphRun {
         $RunId = 'g_' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '_' + ([guid]::NewGuid().ToString('N').Substring(0, 6))
     }
 
+    # Файл графа, который в самом деле ведёт этот прогон (harness/graphs/queue.graph.ps1
+    # и т. п.) — печатается в каждый вердикт строкой graph_hash. $PSCommandPath внутри
+    # ЭТОЙ функции лексически указывает на graph-runtime.ps1 (файл, где функция описана),
+    # а не на вызывающий скрипт графа — это надо взять из стека вызовов. Кадр [1] это тот,
+    # кто физически вызвал Initialize-GraphRun: скрипт графа дот-сорсится в graph.ps1
+    # (harness/graph.ps1: `. $scriptPath`), и call stack по нему не путается, в отличие
+    # от $PSScriptRoot/$PSCommandPath.
+    $graphFile = ''
+    try {
+        $frames = @(Get-PSCallStack)
+        if ($frames.Count -gt 1 -and $frames[1].ScriptName -and $frames[1].ScriptName -match '\.graph\.ps1$') {
+            $graphFile = $frames[1].ScriptName
+        }
+    } catch { }
+
     $graphDir = Join-Path $Root ".bcf\graph\$RunId"
     if (-not (Test-Path $graphDir)) { New-Item -ItemType Directory -Force -Path $graphDir | Out-Null }
 
@@ -100,6 +119,7 @@ function Initialize-GraphRun {
     $script:GraphCtx = @{
         Root           = $Root
         RunId          = $RunId
+        GraphFile      = $graphFile
         Dir            = $graphDir
         Journal        = (Join-Path $graphDir 'journal.jsonl')
         Meta           = $Meta
@@ -137,6 +157,12 @@ function Initialize-GraphRun {
     if (-not $ReadOnly) {
         _GraphJournal @{ event = 'run-start'; runId = $RunId; name = $Meta.name; doctor = [bool]$Meta.doctor; resumeFrom = $ResumeFromRunId
                          concurrency = $MaxConcurrency; budget = $TokenBudget; dryPlan = [bool]$DryPlan }
+        # Наследуется дочерними процессами (Start-Process внутри Invoke-CommandNode,
+        # дальше — `& pwsh` внутри loop.ps1 до verify.ps1): так verify.ps1, запущенный на
+        # три уровня процессов ниже, узнаёт, каким графом он вызван, и печатает graph_hash
+        # в вердикт. Прогон вне графа (ralph loop/night без queue/review) эту переменную
+        # не трогает вовсе — она либо не выставлена, либо пуста от прошлого вызова.
+        $env:BCF_GRAPH_FILE = $graphFile
     }
     return $script:GraphCtx
 }
@@ -425,9 +451,49 @@ function _GraphJournal {
     } catch { $mtx = $null }
     try {
         Add-Content -LiteralPath $script:GraphCtx.Journal -Value $line -Encoding UTF8
+        # Доска задач обновляется ЗДЕСЬ, а не в каждом месте, откуда запускается узел.
+        # Вызов на каждой площадке — это обещание, которое однажды забудут выполнить на
+        # новом узле, и со стороны это выглядит как «задача исчезла».
+        _GraphTaskStatus $Record
     } catch { } finally {
         if ($mtx) { try { $mtx.ReleaseMutex() } catch { }; $mtx.Dispose() }
     }
+}
+
+# Перевод события журнала в состояние задачи на доске.
+#
+# Узел, чья метка называет задачу, означает «задача у фабрики» — и на старте, и на
+# финише: закончившийся узел не закрывает задачу, её закрывает слияние. Дальше состояние
+# ставит оркестратор явно («закрыта», «заблокирована»), а run-finish возвращает всё
+# оставшееся «у фабрики» в очередь.
+function _GraphTaskStatus {
+    param([hashtable]$Record)
+    if (-not $script:GraphCtx -or $script:GraphCtx.DryPlan) { return }
+    $ev = [string]$Record['event']
+    if ($ev -eq 'run-finish') {
+        # Доску мог уже закрыть сам граф (Complete-TeamRun), и она в этот момент уже
+        # закоммичена. Переписать её здесь ещё раз значило бы оставить после прогона
+        # грязное дерево ради одного изменившегося поля времени — а грязное дерево
+        # отменяет перемотку на старте следующей ночи.
+        #
+        # ВЛАДЕНИЕ ДОСКОЙ. Доски может не быть вовсе, или она может принадлежать
+        # ЧУЖОМУ прогону — ночной очереди, второму участнику команды. Граф, чьи узлы не
+        # называют задач (bcf run review, bcf run research), на этой доске не значится:
+        # ни разу не позвал Update-TaskStatus и не заводил её через Reset-TaskStatusBoard,
+        # поэтому «run» в файле — не его. Закрыть чужую доску или завести свою пустую
+        # поверх чужой значит стереть очередь, которую ведёт кто-то другой.
+        $cur = Read-TaskStatus -Root $script:GraphCtx.Root
+        if (-not $cur -or ([string]$cur.run) -ne $script:GraphCtx.RunId) { return }
+        if ([bool]$cur.complete) { return }
+        Complete-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId | Out-Null
+        return
+    }
+    if ($ev -ne 'node-start' -and $ev -ne 'node-finish') { return }
+    if ($Record['dry']) { return }
+    $task = Get-BcfTaskIdFromLabel ([string]$Record['label'])
+    if (-not $task) { return }
+    Update-TaskStatus -Root $script:GraphCtx.Root -Run $script:GraphCtx.RunId `
+        -Task $task -State 'у фабрики' -Node ([string]$Record['label']) | Out-Null
 }
 
 function Write-GraphLog {
