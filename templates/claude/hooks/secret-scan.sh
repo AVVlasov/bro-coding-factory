@@ -1,143 +1,88 @@
 #!/usr/bin/env bash
-# secret-scan.sh — перед git commit сканирует staged-дифф на признаки секретов и блокирует
-# коммит, если что-то похоже на ключ доступа или приватный ключ.
+# secret-scan.sh — тонкий предварительный вызов настоящего сканера секретов
+# (`.githooks/pre-commit`, см. его заголовок) ДО того, как Claude Code вообще запустит
+# команду, плюс проверка присутствия флагов, которые обошли бы этот сканер целиком.
+# Сам файл секреты не ищет — это по-прежнему работа `.githooks/pre-commit`.
 #
-# Ставится на PreToolUse Bash (тот же matcher, что pre-bash-guard.sh): перехватывает
-# команду ДО выполнения. Реагирует только на git commit (в любом виде, включая
-# `git -c user.name=... -c user.email=... commit -m ...`, как того требует конвенция
-# коммитов этого харнесса) — на прочих командах молчит и ничего не сканирует.
+# ПОЧЕМУ ТАК. До 2026-09-06 (см. docs/ROADMAP.md, M-05/M-05a) этот хук сам разбирал
+# командную строку `git commit`, чтобы предсказать, что окажется в индексе на момент
+# коммита: -a/-am/--all, `git add ... && git commit ...` в одной строке, `cd` перед `add`,
+# pathspec внутри самого `commit` (`-m msg <файл>`, `--include`, `--only`) — каждый был
+# новым обходом, найденным следующим ревью, потому что разбор командной строки не закрыть
+# в принципе (это в точности инструмент, который угадывает будущее вместо того, чтобы его
+# дождаться). Теперь единственный сканер СЕКРЕТОВ — `.githooks/pre-commit`: git вызывает
+# его сам, уже ПОСЛЕ того, как решил, что попадёт в индекс, независимо от способа
+# стажирования. Держать здесь вторую, самостоятельную логику разбора СОДЕРЖИМОГО — значит
+# вернуть ровно тот же класс дефекта, который эта правка закрывает.
 #
-# ИСТОЧНИК ОБРАЗЦОВ. Регэкспы для облаков/GitHub/Slack/приватных ключей взяты из
-# vendor-конфига gitleaks (github.com/gitleaks/gitleaks, config/gitleaks.toml, правила
-# aws-access-token, gcp-api-key, github-pat/oauth/app-token/refresh-token/fine-grained-pat,
-# slack-bot-token/legacy-bot-token/user-token/app-token/webhook-url, private-key), сверено
-# 2026-09-05. Приватный ключ ловится по строке BEGIN — этого достаточно как сигнала и не
-# требует склеивать многострочное тело ключа из отдельных added-строк диффа.
+# ДВЕ РАЗНЫЕ ВЕЩИ ЖИВУТ В ЭТОМ ФАЙЛЕ, И ТОЛЬКО ОНИ.
 #
-# ПРИСВОЕНИЯ password/secret/api_key/token — СВОЁ правило, УЖЕ принятого в detect-secrets
-# (detect_secrets/plugins/keyword.py): там ключевое слово матчится с произвольным
-# суффиксом (`\w*`), и `password_default`/`password_env` в этом же репозитории (несекретный
-# локальный фолбэк, см. config/memory.config.json) считались бы находкой при каждом
-# коммите, задевающем эту строку. Здесь ключевое слово обязано стоять СРАЗУ перед
-# оператором присваивания — без суффикса.
+# 1. РАННЕЕ предупреждение для простого случая — секрет уже стоит в индексе ОТДЕЛЬНОЙ
+#    командой `git add` до этой, и предстоящий `commit` НЕ трогает stage сам (без
+#    -a/-am/--all, без `--include`/`--only`, без pathspec-аргументов): тогда `git diff
+#    --cached` прямо сейчас — это ровно то, что уедет в коммит, и `.githooks/pre-commit`,
+#    вызванный здесь напрямую, увидит то же самое, что увидел бы при настоящем git commit.
+#    Claude Code в этом случае узнаёт об отказе ДО запуска git, а не из провала самой
+#    команды.
 #
-# ЗНАЧЕНИЕ-ССЫЛКА — НЕ НАХОДКА. `token = process.env.GITHUB_TOKEN`, `apiKey = config.api_key`,
-# `API_KEY = os.environ["OPENAI_API_KEY"]`, `pwd = password or os.getenv("DB_PASSWORD")` — это
-# код, который УЖЕ читает секрет из окружения (то есть сделал ровно то, что советует текст
-# отказа), а не секрет. detect-secrets (KeywordDetector) отбрасывает такие ссылочные значения
-# отдельным фильтром; здесь то же самое — REFERENCE_VALUE_RE проверяет само значение
-# присваивания, а не только ключевое слово слева, и не даёт результата на код, который
-# читает секрет из окружения, а не хранит его текстом. У правила два эффекта одновременно:
-# из символов значения без кавычек убрана точка (значения-литералы ключей точек не содержат,
-# а `os.environ`/`config.api_key` обрываются на первой же точке короче порога), и отдельно
-# отбрасываются значения, начинающиеся с самой ссылки (process.env, os.environ, os.getenv,
-# System.getenv, config./cfg./settings., `${...}`) или с бытового ключевого слова-ссылки на
-# другую переменную с тем же смыслом (`pwd = password`).
+#    Команды со сложным стажированием (-a/-am/--all, `git add` в той же строке, pathspec
+#    внутри commit) этот файл НЕ ПРОВЕРЯЕТ и не пытается угадать — предсказать итоговый
+#    индекс, не исполняя команду, нельзя (ревью нашло на этом ложный `deny`: секрет,
+#    застейдженный ОТДЕЛЬНО от файла в pathspec, блокировал чистый `git commit -m msg --
+#    doc.md`, хотя git сам подставляет хуку временный индекс, ограниченный pathspec —
+#    см. `git help commit`, "COMMIT INFORMATION" / поведение partial commit, сверено
+#    2026-09-06). Код ниже поэтому определяет "простой" случай сам (см. классификатор) и
+#    на всём остальном молчит: `.githooks/pre-commit` поймает такие коммиты сам в момент
+#    настоящего `git commit` (где git уже подготовил правильный индекс) — Claude Code
+#    увидит это как обычную ошибку Bash-команды, не как заблаговременный `deny`.
 #
-# Найденный секрет НЕ печатается — только имя файла, номер строки и имя правила.
+# 2. Отказ по ПРИСУТСТВИЮ флага, а не по угадыванию индекса — `--no-verify`/`-n` и `-c
+#    core.hooksPath=...`. Это НЕ тот же класс дефекта, что разбор командной строки для
+#    предсказания содержимого коммита: git-хук `.githooks/pre-commit` в принципе не может
+#    поймать свой собственный обход (`--no-verify` не даёт git вообще ВЫЗВАТЬ хук; чужой
+#    `-c core.hooksPath=` на время команды подменяет саму систему хуков) — единственная
+#    точка, где это видно, это ЗДЕСЬ, ДО того, как git вообще запустится. Проверяется
+#    ТОЛЬКО присутствие токена — в безопасной, учитывающей кавычки
+#    токенизации (`shlex`, как в реальном шелле) — это не предсказание того, что решит
+#    git, а чтение того, что уже написано в команде. Текст `-m "... --no-verify ..."`
+#    внутри кавычек — это ОДИН токен со значением сообщения, а не отдельный флаг, и не
+#    матчится: см. классификатор ниже и тесты 25-й секции install-secrets.tests.ps1.
+#    То же присутствие проверяется и для СВЯЗКИ коротких флагов в одном токене
+#    (`-nm`/`-anm` и т.п. — git распаковывает их в `-n`/`-a` `-n` + `-m <сообщение>`,
+#    см. `short_bundle_has_no_verify` в классификаторе и раздел 27 install-secrets.
+#    tests.ps1): ревью нашло, что `-nm`/`-anm` уводили секрет мимо хука ровно как
+#    отдельный `-n`, потому что первая версия проверки сравнивала токен целиком с
+#    "-n"/"--no-verify". Остаточная известная граница: КАЖДАЯ форма токена здесь названа
+#    явно (см. классификатор) — сокращённые длинные опции (`git commit --no-verif`,
+#    однозначное сокращение `--no-verify`, которое сам git принимает — см. `git help
+#    commit`) этой проверкой не распознаются; это не разбор командной строки заново, а
+#    известный непокрытый случай, а не молчаливое расхождение с докой (см. docs/SETUP.md).
+#    Остаточная граница: этот файл видит только команды, которые Claude Code просит
+#    выполнить САМ. Человек, набравший `git commit --no-verify` в своём терминале мимо
+#    Claude Code, этим файлом не перехватывается в принципе — см. docs/SETUP.md.
 #
-# СОВЕТ В ТЕКСТЕ ОТКАЗА ЗАВИСИТ ОТ ТОГО, ГДЕ НАХОДКА. Найдено пятым ревью M-05: текст
-# отказа безусловно советовал `git restore --staged <файл>` — это верно только для
-# находки в РЕАЛЬНОМ индексе (`git diff --cached`, застейджено ДО этой команды отдельным
-# `git add`). Находка из широкого/scoped диффа рабочего дерева (-a/-am/--all или add из
-# этой же командной строки) и находка в новом файле ещё НЕ в индексе — `git restore
-# --staged` там ничего не отменяет, файл сам себе не появляется в индексе, пока команда
-# не исполнилась. Поэтому каждая находка размечается источником (staged/unstaged) и
-# текст отказа даёт для каждого источника свой, рабочий совет — см. STAGED_REMEDY/
-# UNSTAGED_REMEDY ниже.
+# `.githooks/pre-commit` НЕ НАЙДЕН (install/init не ставили git-хук либо `core.hooksPath`
+# проекта указывает на чужую систему хуков — см. docs/SETUP.md) — этот файл молчит
+# целиком, включая проверку `--no-verify`/`core.hooksPath`: нечего обходить, когда некому
+# исполнить сканер в момент настоящего коммита.
 #
-# ГРАНИЦА: ФАЙЛ, СОЗДАННЫЙ В ЭТОЙ ЖЕ КОМАНДНОЙ СТРОКЕ. Хук — PreToolUse, он смотрит на
-# командную строку ДО её исполнения. `echo секрет > c.txt && git add c.txt && git commit`
-# создаёт c.txt только в момент выполнения `echo` — на момент проверки файла ещё нет на
-# диске, `git ls-files --others` его не видит, и `git add --dry-run c.txt` не находит,
-# что добавлять. Это не обход разбора pathspec (он отработал бы верно, появись файл раньше),
-# а сама природа PreToolUse: хук не может увидеть то, чего команда ещё не создала. Граница
-# названа в docs/SETUP.md, а не только здесь.
-#
-# ОБХОД ЧЕРЕЗ -a/-am/--all. `git commit -a` (и короткая склейка `-am`) стажирует
-# отслеживаемые правки ИЗНУТРИ самого commit, уже после того, как этот хук успел
-# посмотреть на индекс — секрет, лежащий только в рабочем дереве (git add не делали),
-# при сканировании одного `git diff --cached` проезжает мимо: индекс на момент проверки
-# пуст. Поэтому при -a/-am/--all в командной строке дополнительно сканируется
-# `git diff` (рабочее дерево против индекса, без --cached) — см. HAS_ALL_FLAG ниже.
-#
-# ОБХОД ЧЕРЕЗ `git add ... && git commit ...` В ОДНОЙ КОМАНДНОЙ СТРОКЕ. Тот же класс
-# обхода, что и -a/-am, только без флага commit: этот хук — PreToolUse, он видит
-# командную строку и индекс ДО того, как что-либо из неё выполнилось, поэтому `git add`
-# в НАЧАЛЕ той же строки ещё не сработал в момент проверки, и `git diff --cached` на
-# этот момент пуст независимо от того, что уедет в коммит через долю секунды. Команда
-# разбирается на сегменты по &&/||/;/| — сегмент до commit, начинающийся с `git ... add`,
-# даёт свои аргументы САМОМУ git через `git add --dry-run` (а не собственный разбор
-# pathspec: git уже умеет -A/./glob/.gitignore) — это НЕ исполняет добавление, только
-# спрашивает, что было бы добавлено.
-#
-# ДИФФ РАБОЧЕГО ДЕРЕВА ОГРАНИЧЕН ПУТЯМИ ИЗ `git add --dry-run`, А НЕ ВЕСЬ РЕПОЗИТОРИЙ.
-# Найдено пятым ревью M-05: до этой правки при has_add_stage к --cached диффу
-# безусловно добавлялся ПОЛНЫЙ `git diff` рабочего дерева — тот же вызов, что и для
-# -a/-am/--all. Из-за этого отслеживаемый файл с секретом, который команда вообще не
-# трогает («password = ...» правится локально в cfg.txt, но коммитится только
-# `git add doc.md && git commit`), блокировал коммит doc.md, хотя в этот коммит cfg.txt
-# не попадает. Широкий diff нужен ТОЛЬКО у -a/-am/--all — там git commit сам стажирует
-# ЛЮБУЮ отслеживаемую правку. У `git add <pathspec>` набор файлов уже точно известен:
-# это и есть ответ `git add --dry-run` (ADD_STAGE_PATHS ниже, накопленный по всем
-# add-сегментам команды). Дифф рабочего дерева при has_add_stage запускается с этими
-# путями как pathspec (`git diff -- <ADD_STAGE_PATHS...>`), а не без ограничений.
-# Отслеживаемые файлы из этого списка получают дифф; неотслеживаемые НОВЫЕ файлы — то,
-# чего `git diff` без --no-index вообще не показывает, — сканируются целиком по
-# содержимому отдельно (staged_new_files, тот же список, что и раньше).
-#
-# ФОРМАТ ОТВЕТА PreToolUse. Сверено 2026-09-05 с code.claude.com/docs/en/hooks: для
-# PreToolUse ответ обязан идти через hookSpecificOutput.permissionDecision (значение
-# "deny"), а не через верхнеуровневое поле decision — дока прямо говорит "should use
-# hookSpecificOutput.permissionDecision, not a top-level decision field". Блокировка
-# держится на коде возврата 2 ("Exit 2 means a blocking error... blocks whether or not
-# you print JSON" — сама дока), JSON с permissionDecisionReason и текст на stderr — это
-# то, откуда Claude Code берёт текст причины при показе блокировки.
-#
-# КИРИЛЛИЦА И ДРУГИЕ НЕ-ASCII ИМЕНА. `git ls-files --others` уважает core.quotepath
-# (по умолчанию true у git) и C-квотирует не-ASCII байты имени файла ("\320\272..."),
-# а `git add --dry-run` печатает то же имя как есть, без квотирования. Список
-# неотслеживаемых файлов и ответ --dry-run сверялись строка в строку — при расхождении
-# в квотировании новый файл с не-ASCII именем не находил себя в списке и не сканировался
-# вообще. Все git-вызовы этого файла, которые сравнивают или парсят ИМЕНА файлов,
-# зовутся с -c core.quotepath=false, чтобы то и другое отдавало один и тот же байтовый
-# вид имени.
-#
-# `cd <каталог> && git add ... && git commit ...`. Pathspec в сегменте `add` — это то,
-# что стояло бы в РЕАЛЬНОМ рабочем каталоге на момент выполнения, а не в корне репозитория:
-# относительный путь читается от каталога, куда перевели предыдущие `cd` в той же
-# командной строке. Сегменты до `commit` разбираются по порядку, `cd <путь>` двигает
-# отслеживаемый рабочий каталог (без выражений вида `cd -`/переменных — там смена
-# каталога неоднозначна, и текущий каталог остаётся как был), и `git add --dry-run`
-# запускается с -C именно этим каталогом. Сам ответ --dry-run от этого не меняется:
-# git печатает путь относительно корня репозитория независимо от того, какой -C передан
-# (проверено вручную), поэтому дальнейший разбор пути правкой не тронут.
-#
-# PYTHON НЕ НАЙДЕН. Хук зарегистрирован в settings.json как обязательная проверка перед
-# коммитом — тихий exit 0 без python выключил бы её незаметно на любой машине без python,
-# хотя python в docs/SETUP.md объявлен опциональным (только под память). Без python
-# разобрать JSON от Claude Code по-настоящему нечем, поэтому решение грубое, на grep по
-# сырому входу: если строка похожа на git commit — хук ОТКАЗЫВАЕТ явно, с текстом причины
-# и кодом 2, а не пропускает секрет молча. На любой другой команде (не commit-подобной)
-# по-прежнему тихий exit 0 — иначе хук блокировал бы вообще все Bash-команды в проекте на
-# машине без python, а не только коммиты.
+# python (или python3) не найден в PATH — обе проверки этого файла (классификатор
+# "простой/сложный случай" и поиск флагов-обходов) молча пропускаются, а не превращаются
+# в собственный разбор командной строки на баше (это и был бы тот самый закрытый класс
+# дефекта). `.githooks/pre-commit` в этом случае всё равно отказывает любому коммиту
+# явно (у него то же самое требование к python) — молчание здесь не открывает дыру шире
+# той, что уже есть без python.
 #
 # Контракт:
-#   $CLAUDE_PROJECT_DIR — корень проекта (ставит Claude Code); без него — $PWD
-#   BCF_SECRET_SCAN_DISABLED=1 — выключить хук
-#   python/python3 не найден — commit-подобная команда отказывает явно (код 2), прочие
-#   команды пропускаются молча (см. "PYTHON НЕ НАЙДЕН" выше)
+#   $CLAUDE_PROJECT_DIR — корень проекта; без него — $PWD
+#   Включение/выключение сканера СЕКРЕТОВ (BCF_SECRET_SCAN_DISABLED + запись в
+#   docs/decisions.md) — контракт `.githooks/pre-commit`, не этого файла: он просто
+#   передаёт вызов дальше. У проверки `--no-verify`/`core.hooksPath` отдельного
+#   выключателя нет — это и есть единственный официальный обход (см. выше).
 
 set -u
 export PYTHONIOENCODING=utf-8
 
-[ "${BCF_SECRET_SCAN_DISABLED:-0}" = "1" ] && exit 0
-
-# СО ВХОДА ЧИТАЕМ С ПОТОЛКОМ ВРЕМЕНИ, а не «пока не кончится» — см. pre-task-memory-inject.sh:
-# Claude Code закрывает stdin сразу после JSON, но запуск не из-под Claude Code (тест, рука)
-# может оставить канал открытым, и cat без таймаута ждёт вечно ПЕРЕД любой Bash-командой.
-# Читаем ДО поиска python: без входа нечего проверять независимо от того, нашёлся python
-# или нет, и незачем решать судьбу python-less запуска раньше времени.
 INPUT=""
 if [ ! -t 0 ]; then
   if command -v timeout >/dev/null 2>&1; then
@@ -148,395 +93,215 @@ if [ ! -t 0 ]; then
 fi
 [ -z "$INPUT" ] && exit 0
 
+# "git ... commit" фразой, без точного разбора флагов — точность здесь не нужна: это только
+# решение "стоит ли вообще смотреть на команду дальше", а не разбор аргументов. Ложное
+# срабатывание безвредно (лишний быстрый прогон классификатора), пропуск не фатален
+# (`.githooks/pre-commit` всё равно проверит на настоящем commit, кроме случая --no-verify,
+# см. классификатор ниже — он смотрит на ТУ ЖЕ строку ещё раз, уже правильно).
+printf '%s' "$INPUT" | grep -q '"command"' || exit 0
+printf '%s' "$INPUT" | grep -qiE '\bgit\b.*\bcommit\b' || exit 0
+
+project_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+repo_root="$(cd "$project_dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
+[ -z "$repo_root" ] && exit 0
+
+hook="$repo_root/.githooks/pre-commit"
+[ -f "$hook" ] || exit 0
+
+deny() {
+  # $1 — текст причины (без значения секрета — здесь секрет никогда не виден).
+  local msg="$1"
+  local esc
+  esc=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba; s/\n/\\n/g')
+  printf '%s\n' "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"$esc\"}}"
+  printf '%s\n' "$msg" >&2
+  exit 2
+}
+
 PY=""
 for c in python python3; do
   if command -v "$c" >/dev/null 2>&1; then PY="$c"; break; fi
 done
 
-if [ -z "$PY" ]; then
-  # См. "PYTHON НЕ НАЙДЕН" в заголовке файла. Без python сам JSON не разобрать — грубая
-  # проверка через grep по сырому входу: похоже на git commit — отказ явно, иначе тихий
-  # пропуск (не блокировать ВСЕ Bash-команды в проекте из-за одной непроверяемой).
-  if printf '%s' "$INPUT" | grep -q '"command"' && printf '%s' "$INPUT" | grep -qiE '\bgit\b.*\bcommit\b'; then
-    reason='secret-scan.sh не может проверить коммит на секреты: python (или python3) не найден в PATH. Поставьте python3 или явно отключите проверку BCF_SECRET_SCAN_DISABLED=1, если она сейчас не нужна.'
-    printf '%s\n' "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"$reason\"}}"
-    printf '%s\n' "$reason" >&2
-    exit 2
-  fi
-  exit 0
-fi
-
-start_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-REPO_ROOT=""
-if command -v git >/dev/null 2>&1; then
-  REPO_ROOT="$(cd "$start_dir" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null || true)"
-fi
-
-# JSON — ВО ВРЕМЕННЫЙ ФАЙЛ, А НЕ В ПАЙП. `python - <<HEREDOC` читает СЦЕНАРИЙ из stdin —
-# heredoc для скрипта и пайп с данными в один и тот же stdin несовместимы: последняя
-# переустановка stdin побеждает, и то, что должно было прийти как данные, либо теряется,
-# либо (что хуже) пытается исполниться как программа. Данные — аргументом, скрипт — heredoc.
-tmpf="$(mktemp)"
-trap 'rm -f "$tmpf"' EXIT
-printf '%s' "$INPUT" > "$tmpf"
-
-# Один вызов python: разобрать JSON от Claude Code, узнать, git ли это commit, при
-# необходимости прогнать git diff --cached и решить. Два процесса (разбор JSON отдельно,
-# скан отдельно) означали бы два места, где можно молча разойтись форматом.
-RESULT="$(REPO_ROOT="$REPO_ROOT" START_DIR="$start_dir" "$PY" - "$tmpf" <<'PYEOF'
+# Классификатор: разбирает JSON на stdin через json.load (не regex — кириллица и
+# экранированные кавычки в сообщении коммита не должны ломать разбор), токенизирует
+# tool_input.command через shlex.split (тот же алгоритм, которым POSIX-шелл сам режет
+# команду на токены и группирует кавычки) и печатает ОДНО слово-вердикт:
+#   BYPASS:<причина>  — найден --no-verify/-n или -c core.hooksPath=... — deny немедленно,
+#                       `.githooks/pre-commit` даже не вызывается (незачем: git его и не
+#                       позвал бы).
+#   COMPLEX           — коммит использует -a/-am/--all/--include/--only или несёт
+#                       pathspec-аргумент — этот файл молчит (exit 0), решает
+#                       `.githooks/pre-commit` в момент настоящего коммита.
+#   (пусто/иное)      — простой случай или классификация не удалась — существующее
+#                       поведение: вызвать `.githooks/pre-commit` по текущему индексу.
+# Без python или без валидного JSON скрипт печатает пустую строку и ничего не решает —
+# вызывающий код ниже трактует это как "простой случай" (старое поведение, безопасно и
+# без него).
+verdict=""
+if [ -n "$PY" ]; then
+  # JSON — аргументом командной строки (sys.argv[1]), НЕ через stdin: stdin этого вызова
+  # уже занят heredoc'ом ниже (это САМ текст python-скрипта). Тот же приём, что в
+  # `.githooks/pre-commit` (там - "$repo_root" тем же способом). Пайп в `"$PY" -` вместе
+  # с `<<PYEOF` на той же команде отдал бы python heredoc ВМЕСТО пайпа — heredoc всегда
+  # переопределяет fd0 команды, даже когда она стоит справа от `|`.
+  verdict="$("$PY" - "$INPUT" 2>/dev/null <<'PYEOF'
 import json
-import os
 import re
 import shlex
-import subprocess
 import sys
 
 
-def emit_nothing():
-    sys.exit(0)
+# Ревью нашло: `git commit -nm wip` и `git commit -anm "wip"` уводили секрет мимо
+# git-хука ровно как отдельный `-n` — детектор ниже сравнивал токен ЦЕЛИКОМ с "-n"/
+# "--no-verify" и не видел связку. Короткие опции `git commit` бандлятся в один токен
+# слева направо (`-am` = `-a` + `-m`, сообщение — следующим токеном или остатком этого
+# же); единственная короткая опция `git commit` с буквой "n" во всём списке — сам "-n"
+# (полный список опций без значения и с ним: -q -v -F -m -c -C -s -t -e -S -a -i -p -U
+# -o -n -z -u — см. `git commit -h`, сверено 2026-09-06 живым `git version 2.52.0`), так
+# что буква "n" в связке однозначно означает распакованный "-n", а не что-то ещё. "-m"
+# обрывает разбор связки: git берёт всё, что стоит после "m" В ЭТОМ ЖЕ токене, как
+# ЗНАЧЕНИЕ сообщения, а не как дальнейшие флаги (`-mn` — это `-m "n"`, а НЕ `-m -n`;
+# проверено живьём: `git commit -mn` коммитит с сообщением "n", хук не пропускается) —
+# поэтому буква "n" ищется только СРЕДИ БУКВ ДО ПЕРВОЙ "m" в токене (или по всему токену,
+# если "m" в нём нет вовсе). Проверено живьём (см. tests/install-secrets.tests.ps1,
+# раздел 27): `git commit -nm wip` и `git commit -anm "wip"` реально кладут секрет в
+# HEAD при включённом `.githooks/pre-commit`, если эта функция отсутствует.
+def short_bundle_has_no_verify(t):
+    if not t.startswith("-") or t.startswith("--"):
+        return False
+    # Значение сообщения может быть приклеено к "m" в том же токене, с пробелами и цифрами
+    # (`-anm"wip 1"` после shlex это один токен `-anmwip 1`), поэтому разбираем только
+    # буквенный префикс токена, а не требуем, чтобы токен целиком состоял из букв.
+    m = re.match(r"^-([A-Za-z]*)", t)
+    body = m.group(1) if m else ""
+    if not body:
+        return False
+    if "m" in body:
+        body = body[:body.index("m")]
+    return "n" in body
 
 
-try:
-    with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
-        payload = json.load(f)
-except Exception:
-    emit_nothing()
-
-command = (payload.get('tool_input') or {}).get('command') or ''
-if not command:
-    emit_nothing()
-
-# "git ... commit" как фраза, без точного разбора флагов: -c user.name="Andrey Vlasov"
-# рвёт значение пробелом на два токена, и жёсткий разбор -c/--flag это упускает. Не
-# требует, чтобы "git" и "commit" были соседними словами — только чтобы между ними не
-# было конца команды. Отсекает "docker commit" (нет "git" перед "commit").
-GIT_COMMIT_RE = re.compile(r'\bgit\b(?:\s+\S+)*?\s+commit\b')
-GIT_ADD_RE = re.compile(r'\bgit\b(?:\s+\S+)*?\s+add\b')
-
-if not GIT_COMMIT_RE.search(command):
-    emit_nothing()
-
-repo_root = os.environ.get('REPO_ROOT') or ''
-if not repo_root:
-    emit_nothing()   # не git-репозиторий — сканировать нечего, сам git commit откажет
-
-# Командная строка разбирается на сегменты по операторам оболочки — тем же уровнем
-# строгости, что и весь остальной разбор в этом файле (без полного шелл-парсера): так
-# "git add ..." и "git commit ..." в одной строке не путаются друг с другом при поиске
-# ХВОСТА команды commit (иначе первое попавшееся слово "commit" где угодно в строке,
-# включая чужой текст до git commit, рвало бы разбор -a/-am не в том месте).
-segments = re.split(r'&&|\|\||[;|]|\r?\n', command)
-commit_seg_idx = None
-for i, seg in enumerate(segments):
-    if GIT_COMMIT_RE.search(seg):
-        commit_seg_idx = i   # последний git commit в строке — тот, что реально исполнится
-if commit_seg_idx is None:
-    emit_nothing()   # "git commit" виден только через границу оператора — считаем, что не наш случай
-commit_segment = segments[commit_seg_idx]
-
-# HAS_ALL_FLAG: -a/--all у git commit стажируют отслеживаемые правки прямо в момент
-# коммита — если это пропустить, секрет из рабочего дерева пройдёт хук на пустом
-# --cached и уедет в историю уже после единственной проверки. Берём хвост СЕГМЕНТА
-# commit (не всей команды) после слова commit и ищем в нём "--all" целым словом либо
-# короткий флаг, содержащий "a" (-a, -am, -qam...) — длинные опции ("--author=...")
-# исключены отдельно: они начинаются с двух дефисов, а короткий-флаговый разбор
-# смотрит только на "-X", не "--X".
-commit_tail = re.sub(r'^.*?\bcommit\b', '', commit_segment, count=1, flags=re.S)
-has_all_flag = bool(
-    re.search(r'(?:^|\s)--all(?:\s|$)', commit_tail)
-    or re.search(r'(?:^|\s)-(?!-)[A-Za-z]*a[A-Za-z]*(?:\s|$)', commit_tail)
-)
-
-# ОБХОД ЧЕРЕЗ `git add ... && git commit ...` — см. заголовок файла. Сегменты ДО commit,
-# которые сами являются "git ... add ...", отдают свои аргументы настоящему git через
-# --dry-run: он и разворачивает -A/./glob, и учитывает .gitignore за нас, не нужно
-# повторять его логику pathspec самим.
-#
-# `cd <каталог> && git add ...` — см. "cd <каталог> ..." в заголовке файла. Сегменты до
-# commit разбираются ПО ПОРЯДКУ; `cd` двигает отслеживаемый рабочий каталог, `git add`
-# запоминается вместе с тем, в каком каталоге он оказался бы на момент своего выполнения.
-CD_RE = re.compile(r'^\s*cd\s+(\S.*)$')
-
-
-def resolve_cd(cwd, raw_target):
-    # 'cd -' (предыдущий каталог) и составные/пустые аргументы неоднозначны без полной
-    # истории cd — оставляем cwd как был, не гадаем.
+def main():
     try:
-        parts = shlex.split(raw_target)
+        data = json.loads(sys.argv[1])
+    except Exception:
+        return
+
+    cmd = ""
+    ti = data.get("tool_input") if isinstance(data, dict) else None
+    if isinstance(ti, dict):
+        c = ti.get("command")
+        if isinstance(c, str):
+            cmd = c
+    if not cmd or not re.search(r"\bgit\b.*\bcommit\b", cmd, re.IGNORECASE):
+        return
+
+    try:
+        tokens = shlex.split(cmd, posix=True)
     except ValueError:
-        return cwd
-    if not parts or parts[0] == '-':
-        return cwd
-    target = parts[0]
-    if os.path.isabs(target) or re.match(r'^[A-Za-z]:[\\/]', target):
-        candidate = target
-    else:
-        candidate = os.path.join(cwd, target)
-    return os.path.normpath(candidate)
+        return   # незакрытая кавычка и т.п. — сама команда так не выполнится и у git
 
+    # Разбиваем на операторы шелла: реагируем на конкретный кусок команды, где стоит
+    # commit, а не на всю строку целиком (иначе "git status && git commit --no-verify"
+    # и "git commit -m x && git status --no-verify" стали бы неотличимы от куда более
+    # частого "git commit -m x" без всякого --no-verify).
+    STOP = ("&&", "||", ";", "|")
+    statements = [[]]
+    for t in tokens:
+        if t in STOP:
+            statements.append([])
+        else:
+            statements[-1].append(t)
 
-cwd = os.environ.get('START_DIR') or repo_root
-add_segments = []   # [(сегмент, каталог на момент его выполнения), ...]
-for seg in segments[:commit_seg_idx]:
-    cd_m = CD_RE.match(seg)
-    if cd_m:
-        cwd = resolve_cd(cwd, cd_m.group(1))
-        continue
-    if GIT_ADD_RE.search(seg):
-        add_segments.append((seg, cwd))
-
-staged_new_files = []   # неотслеживаемые файлы, которые git add реально бы добавил
-add_stage_paths = []    # ВСЕ пути (новые и уже отслеживаемые), которые git add реально
-                         # добавил бы — этим списком, а не всем репозиторием, ограничен
-                         # дифф рабочего дерева ниже при has_add_stage (см. "ДИФФ РАБОЧЕГО
-                         # ДЕРЕВА ОГРАНИЧЕН ПУТЯМИ ИЗ git add --dry-run" в заголовке файла).
-if add_segments:
-    try:
-        # -c core.quotepath=false — см. "КИРИЛЛИЦА И ДРУГИЕ НЕ-ASCII ИМЕНА" в заголовке
-        # файла: без этого ls-files C-квотирует не-ASCII имя иначе, чем печатает
-        # `git add --dry-run` ниже, и сравнение по множеству строк ниже никогда не совпадает.
-        untracked_out = subprocess.run(
-            ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'ls-files', '--others', '--exclude-standard'],
-            capture_output=True, encoding='utf-8', errors='replace', timeout=20,
-        ).stdout
-    except Exception:
-        untracked_out = ''
-    untracked_set = set(p for p in untracked_out.split('\n') if p)
-
-    for seg, seg_cwd in add_segments:
-        add_tail = re.sub(r'^.*?\badd\b', '', seg, count=1, flags=re.S).strip()
-        try:
-            add_args = shlex.split(add_tail)
-        except ValueError:
-            continue   # незакрытая кавычка в аргументах — эту команду add не разбираем
-        add_args = [a for a in add_args if a not in ('-v', '--verbose', '-n', '--dry-run')]
-        if not add_args:
-            continue
-        try:
-            # БЕЗ "--" перед аргументами: git-флаги add (-A, -u, .) обязаны остаться
-            # флагами, а не превратиться в буквальный pathspec ("-A" файлом с таким
-            # именем) — "--" здесь как раз это и сделал бы. -C seg_cwd — каталог, в
-            # котором этот add реально оказался бы после предыдущих cd в той же строке
-            # (по умолчанию repo_root, если cd не было); ответ --dry-run от этого не
-            # меняется — git печатает путь относительно корня репозитория независимо
-            # от переданного -C (см. заголовок файла).
-            dr_out = subprocess.run(
-                ['git', '-c', 'core.quotepath=false', '-C', seg_cwd, 'add', '--dry-run'] + add_args,
-                capture_output=True, encoding='utf-8', errors='replace', timeout=20,
-            ).stdout
-        except Exception:
-            continue
-        for line in dr_out.split('\n'):
-            dm = re.match(r"^add '(.+)'$", line)
-            if not dm:
-                continue
-            # --dry-run НИЧЕГО не пишет в индекс (проверено фикстурой в сюите) — только
-            # спрашивает git, что было бы добавлено. Путь идёт в add_stage_paths целиком
-            # (и отслеживаемые правки, и новые файлы) — этим списком, а не безусловным
-            # git diff, ограничен дифф рабочего дерева ниже; неотслеживаемые НОВЫЕ файлы
-            # дополнительно попадают в staged_new_files — им нужно не дифф, а всё
-            # содержимое целиком (см. HAS_ALL_FLAG и заголовок файла).
-            path = dm.group(1)
-            if path not in add_stage_paths:
-                add_stage_paths.append(path)
-            if path in untracked_set:
-                staged_new_files.append(path)
-
-try:
-    # -c core.quotepath=false — тот же повод, что у ls-files выше: без этого заголовок
-    # диффа (+++ b/<путь>) C-квотирует не-ASCII имя, и парсер ниже (который квотирование
-    # не разбирает) отдаёт current_file строкой в кавычках вместо реального пути.
-    cached_diff = subprocess.run(
-        ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '--cached', '-U0', '--no-color'],
-        capture_output=True, encoding='utf-8', errors='replace', timeout=20,
-    ).stdout
-except Exception:
-    emit_nothing()
-
-# UNSTAGED_DIFF — рабочее дерево, ЕЩЁ не в индексе. -a/-am/--all стажирует ЛЮБУЮ
-# отслеживаемую правку внутри самого commit, поэтому там дифф безусловный и полный.
-# has_add_stage — это КОНКРЕТНЫЙ git add с уже известным git'у списком путей
-# (add_stage_paths, ответ --dry-run) — дифф ограничен ИМ, а не всем репозиторием: секрет
-# в файле, который эта команда не добавляет и не коммитит, её не касается (см. "ДИФФ
-# РАБОЧЕГО ДЕРЕВА ОГРАНИЧЕН..." в заголовке файла — пятое ревью M-05). Одновременное
-# -am и add (редкий состав) разрешается в пользу более широкой проверки: -am и так
-# покрывает любой путь из add_stage_paths.
-unstaged_diff = ''
-if has_all_flag:
-    try:
-        unstaged_diff = subprocess.run(
-            ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '-U0', '--no-color'],
-            capture_output=True, encoding='utf-8', errors='replace', timeout=20,
-        ).stdout
-    except Exception:
-        pass   # --cached уже прочитан — не откатываем всю проверку из-за второго вызова
-elif add_stage_paths:
-    try:
-        unstaged_diff = subprocess.run(
-            ['git', '-c', 'core.quotepath=false', '-C', repo_root, 'diff', '-U0', '--no-color', '--'] + add_stage_paths,
-            capture_output=True, encoding='utf-8', errors='replace', timeout=20,
-        ).stdout
-    except Exception:
-        pass
-
-if not cached_diff and not unstaged_diff and not staged_new_files:
-    emit_nothing()   # нечего коммитить — ни staged, ни рабочее дерево, ни новые файлы не тронуты
-
-# --- Образцы: см. заголовок файла для источника и версии сверки -------------------------
-PATTERNS = [
-    ('ключ доступа AWS',            re.compile(r'\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b')),
-    ('ключ Google Cloud API',       re.compile(r'\bAIza[\w-]{35}\b')),
-    ('токен GitHub (classic PAT)',  re.compile(r'\bghp_[0-9A-Za-z]{36}\b')),
-    ('токен GitHub (OAuth)',        re.compile(r'\bgho_[0-9A-Za-z]{36}\b')),
-    ('токен GitHub (App/сервер)',   re.compile(r'\b(?:ghu|ghs)_[0-9A-Za-z]{36}\b')),
-    ('токен GitHub (refresh)',      re.compile(r'\bghr_[0-9A-Za-z]{36}\b')),
-    ('токен GitHub (fine-grained)', re.compile(r'\bgithub_pat_\w{82}\b')),
-    ('токен Slack (bot)',           re.compile(r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}[A-Za-z0-9-]*\b')),
-    ('токен Slack (legacy bot)',    re.compile(r'\bxoxb-[0-9]{8,14}-[A-Za-z0-9]{18,26}\b')),
-    ('токен Slack (user)',          re.compile(r'\bxox[pe](?:-[0-9]{10,13}){3}-[A-Za-z0-9-]{28,34}\b')),
-    ('токен Slack (app-level)',     re.compile(r'(?i)\bxapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+\b')),
-    ('вебхук Slack',                re.compile(r'(?:https?://)?hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}')),
-    ('приватный ключ (PEM)',        re.compile(r'(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----')),
-    # Значение — ИЛИ кавычная строка (qval), ИЛИ голое слово без точки (uval): точка
-    # убрана из символов uval нарочно — литералы ключей точек не содержат, а типичные
-    # ссылки-обходы ("os.environ", "config.api_key", "process.env") обрываются на первой
-    # же точке короче порога в 8 символов и просто не матчатся здесь вообще. См.
-    # REFERENCE_VALUE_RE ниже — второй, независимый барьер для случаев подлиннее.
-    ('присвоение секрета',          re.compile(
-        r"(?i)\b(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token)\b"
-        r"['\"]?\s*[:=]{1,2}\s*"
-        r"(?:(?P<q>['\"])(?P<qval>[^'\"]{8,})(?P=q)|(?P<uval>[A-Za-z0-9][A-Za-z0-9/+_=-]{7,}))"
-    )),
-]
-
-# ЗНАЧЕНИЯ-ССЫЛКИ — см. заголовок файла. Применяется ТОЛЬКО к правилу "присвоение
-# секрета": вендорские образцы (AKIA…, ghp_…, приватный ключ) матчят сам секрет
-# буквально и в фильтре не нуждаются.
-REFERENCE_VALUE_RE = re.compile(
-    r"^(?:"
-    r"process\.env\b|os\.environ\b|os\.getenv\b|getenv\(|System\.getenv\b|System\.Environment\b"
-    r"|\$\{"
-    r"|(?:config|cfg|settings|options|opts)\."
-    r"|password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?key|private[_-]?key|token"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def check_line(content):
-    """Возвращает имя сработавшего правила или None — общая точка для diff и для
-    полного содержимого новых файлов, чтобы фильтр значений-ссылок не жил в двух
-    местах и не разошёлся между ними на следующей правке."""
-    for name, rx in PATTERNS:
-        m = rx.search(content)
-        if not m:
-            continue
-        if name == 'присвоение секрета':
-            val = m.group('qval')
-            if val is None:
-                val = m.group('uval')
-            if val and REFERENCE_VALUE_RE.match(val):
-                continue   # значение — ссылка на переменную/окружение, не литерал
-        return name
-    return None
-
-
-hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
-
-
-def scan_diff_text(diff_text, source):
-    """Разбирает unified diff (-U0) и возвращает находки (файл, строка, правило,
-    источник). Общая точка для --cached и рабочего дерева, чтобы разбор не жил в двух
-    местах и не разошёлся между ними на следующей правке — source ТОЛЬКО помечает,
-    откуда пришла находка (staged/unstaged), для текста отказа ниже."""
-    out = []
-    current_file = None
-    new_line = 0
-    for raw in diff_text.split('\n'):
-        if raw.startswith('+++ '):
-            path = raw[4:].strip()
-            current_file = None if path == '/dev/null' else re.sub(r'^[ab]/', '', path)
-            continue
-        if raw.startswith('@@ '):
-            m = hunk_re.match(raw)
+    bypass = []
+    commit_stmt = None
+    for st in statements:
+        if "git" in st and "commit" in st:
+            commit_stmt = st
+        for i, t in enumerate(st):
+            if t in ("--no-verify", "-n"):
+                bypass.append(f"флаг {t} пропускает git-хук pre-commit целиком (git его в этом случае даже не вызывает)")
+            elif short_bundle_has_no_verify(t):
+                bypass.append(f"связка коротких флагов {t} распаковывается git в том числе в -n/--no-verify (см. `git help commit`) и пропускает git-хук pre-commit целиком")
+            if t == "-c" and i + 1 < len(st) and st[i + 1].startswith("core.hooksPath="):
+                bypass.append(f"-c {st[i + 1]} подменяет систему git-хуков на время этой команды")
+            m = re.match(r"^-c(core\.hooksPath=.*)$", t)
             if m:
-                new_line = int(m.group(1))
+                bypass.append(f"-c {m.group(1)} подменяет систему git-хуков на время этой команды")
+
+    if bypass:
+        # dict.fromkeys — дедуп с сохранением порядка, без set() (порядок вывода стабилен).
+        print("BYPASS:" + " ; ".join(dict.fromkeys(bypass)))
+        return
+
+    if commit_stmt is None:
+        return
+
+    # Аргументы САМОЙ команды commit — всё после ПЕРВОГО токена 'commit' в её операторе
+    # (первого, а не последнего: `-m commit` — валидное сообщение коммита из одного
+    # слова, и оно не должно быть принято за имя подкоманды).
+    idx = commit_stmt.index("commit")
+    after = commit_stmt[idx + 1:]
+
+    # Список того, что этот файл готов пропустить как заведомо не меняющее состав
+    # индекса относительно того, что уже застейджено — НЕ полный список опций
+    # `git commit`. Что угодно, чего здесь нет, трактуется как COMPLEX (безопасное
+    # направление ошибки: пропуск раннего предупреждения, а не ложный deny).
+    ALLOW_FLAG = {
+        "-q", "--quiet", "-v", "--verbose",
+        "--allow-empty", "--allow-empty-message",
+        "--no-edit", "-e", "--edit",
+        "--no-status", "--status",
+    }
+    simple = True
+    i = 0
+    while i < len(after):
+        t = after[i]
+        if t in ("-m", "--message"):
+            i += 2
             continue
-        if raw.startswith('---'):
+        if t.startswith("--message=") or (t.startswith("-m") and len(t) > 2 and not t.startswith("--")):
+            i += 1
             continue
-        if raw.startswith('+'):
-            content = raw[1:]
-            if current_file is not None:
-                name = check_line(content)
-                if name:
-                    out.append((current_file, new_line, name, source))
-            new_line += 1
+        if t in ALLOW_FLAG:
+            i += 1
             continue
-        # '-' (удалённая строка) и служебные строки diff --git/index/rename на новую
-        # нумерацию не влияют — их пропускаем.
-    return out
+        simple = False
+        break
+
+    if not simple:
+        print("COMPLEX")
 
 
-# source='staged' — находка уже в индексе (git diff --cached): её туда занёс отдельный
-# git add ДО этой команды, `git restore --staged` реально её оттуда уберёт. source=
-# 'unstaged' — находка из рабочего дерева (-a/-am/--all или пути add_stage_paths) либо
-# из нового файла: в индексе её ЕЩЁ нет, `git restore --staged` там ничего не отменяет
-# (см. "СОВЕТ В ТЕКСТЕ ОТКАЗА..." в заголовке файла — пятое ревью M-05).
-hits = scan_diff_text(cached_diff, 'staged')
-hits += scan_diff_text(unstaged_diff, 'unstaged')
-
-# Новые (ранее неотслеживаемые) файлы, которые `git add` из командной строки реально
-# добавил бы, — они не проходят через diff-парсер выше (для git нет "before", значит нет
-# и unified diff), поэтому читаются и сканируются целиком, с первой строки. В индексе их
-# тоже ещё нет — source='unstaged'.
-for path in dict.fromkeys(staged_new_files):
-    try:
-        with open(os.path.join(repo_root, path), encoding='utf-8', errors='replace') as f:
-            for lineno, line in enumerate(f, start=1):
-                name = check_line(line)
-                if name:
-                    hits.append((path, lineno, name, 'unstaged'))
-    except Exception:
-        continue
-
-if not hits:
-    emit_nothing()
-
-STAGED_REMEDY = (
-    'уже в индексе — убери находку из индекса (git restore --staged <файл>) '
-    'или замени на переменную окружения.'
-)
-UNSTAGED_REMEDY = (
-    'ещё не в индексе (рабочее дерево, -a/-am/--all или git add из этой же команды) — '
-    'убери секрет из файла или не включай этот путь в add/-a/-am, закоммить остальное отдельно.'
-)
-remedies = []
-if any(h[3] == 'staged' for h in hits):
-    remedies.append(STAGED_REMEDY)
-if any(h[3] == 'unstaged' for h in hits):
-    remedies.append(UNSTAGED_REMEDY)
-
-lines = [f'  {f}:{ln} — {name}' for f, ln, name, _src in hits]
-reason = (
-    'коммит заблокирован: похоже на секрет (само значение не печатается):\n'
-    + '\n'.join(lines) + '\n'
-    + '\n'.join(remedies)
-    + '\nложное срабатывание — переформулируй строку так, чтобы она не совпадала с образцом.'
-)
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'deny',
-        'permissionDecisionReason': reason,
-    },
-}, ensure_ascii=False))
-print(reason, file=sys.stderr)
-sys.exit(2)
+main()
 PYEOF
 )"
-code=$?
-
-if [ -n "$RESULT" ]; then
-  printf '%s\n' "$RESULT"
 fi
-exit "$code"
+
+case "$verdict" in
+  BYPASS:*)
+    reason="${verdict#BYPASS:}"
+    deny "коммит заблокирован Claude Code: $reason. .githooks/pre-commit в этом случае не проверит секреты вообще — используй обычный git commit; если сканер секретов правда нужно выключить, задай BCF_SECRET_SCAN_DISABLED=1 и добавь запись в docs/decisions.md (см. docs/SETUP.md, раздел «Секреты перед коммитом»)."
+    ;;
+  COMPLEX)
+    exit 0
+    ;;
+esac
+
+# cd "$repo_root" ПЕРЕД вызовом хука — обязательно: сам pre-commit резолвит свой репозиторий
+# через `git rev-parse --show-toplevel` БЕЗ -C, то есть от текущего каталога процесса.
+# Claude Code запускает этот wrapper из произвольного cwd (не обязательно из репозитория
+# проекта) — без cd хук резолвил бы toplevel чужого репозитория (тот, что случайно
+# оказался текущим каталогом) или не резолвил вовсе, и сканировал бы не тот индекс молча.
+# cd — в подоболочке $(...), наружу cwd этого файла не меняет.
+#
+# Идиома "поменять местами stdout/stderr": сначала дублируем текущий stderr (2) на текущий
+# stdout (1) — команда подстановки $() перехватывает именно stdout, — затем перенаправляем
+# НОВЫЙ stdout (1) в /dev/null. В захваченном тексте оказывается только то, что скрипт
+# напечатал в stderr (файл:строка, совет, ничего из значения секрета).
+reason="$(cd "$repo_root" && bash "$hook" 2>&1 >/dev/null)"
+code=$?
+[ "$code" -eq 0 ] && exit 0
+
+deny "$reason"

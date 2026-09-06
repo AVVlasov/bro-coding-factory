@@ -137,6 +137,57 @@ if (-not $only -or $only -eq 'claude') {
     }
 }
 
+# --- git-хук pre-commit: единственный сканер секретов ----------------------------------
+#
+# Ставится НЕЗАВИСИМО от --only: секреты в коммите — не часть области claude/config/
+# project, это защита поверх самого `git commit`. `.githooks/pre-commit` — обычный
+# версионируемый файл (Copy-BcfTemplate уважает --force/skip, как и любой другой шаблон),
+# он клонируется вместе с проектом. Активация — `git config core.hooksPath .githooks`:
+# сама настройка core.hooksPath НЕ клонируется (лежит в .git/config, вне версионирования),
+# но это тот же класс разовой локальной настройки, что и `bash` для settings.json выше —
+# каждый участник ставит её у себя через `bcf install`, а содержимое хука при этом уже
+# видит из git, без повторного копирования файла. Причина выбора `.githooks` вместо
+# копии в `.git/hooks/pre-commit` (которая вообще никогда не клонируется и правки хука
+# не доедут до соседа без повторной установки) — docs/SETUP.md.
+#
+# ЕСЛИ У ПРОЕКТА УЖЕ ЕСТЬ СВОЙ pre-commit ИЛИ core.hooksPath УКАЗЫВАЕТ КУДА-ТО ЕЩЁ —
+# не перезаписываем и не дописываем вслепую: чужой хук может быть на любом языке (не
+# обязательно bash), слепая дозапись команды может его сломать так, что заметят не сразу.
+# Вместо этого install отказывается ТОЛЬКО от активации (остальная установка идёт как
+# обычно) и печатает готовую строку для ручной дозаписи — предсказуемее и безопаснее,
+# чем угадывать, куда и как встроить вызов в чужой скрипт.
+$hookConflicts = @()
+if (-not $dry) {
+    $dotGit = Join-Path $project '.git'
+    if (Test-Path $dotGit) {
+        $githooksTo = Join-Path $project '.githooks\pre-commit'
+        Copy-BcfTemplate -From (Join-Path $templates 'git-hooks\pre-commit') -To $githooksTo
+
+        $hooksPathNow = ''
+        $gcOut = & git -C $project config --get core.hooksPath 2>$null
+        if ($LASTEXITCODE -eq 0 -and $gcOut) { $hooksPathNow = ([string]$gcOut).Trim() }
+        $hooksPathNorm = $hooksPathNow.TrimEnd('/', '\')
+        if ($hooksPathNorm.StartsWith('./')) { $hooksPathNorm = $hooksPathNorm.Substring(2) }
+
+        $legacyHook = Join-Path $project '.git\hooks\pre-commit'
+        if ($hooksPathNorm -eq '.githooks') {
+            # уже наша настройка (в т.ч. с прошлого install) — идемпотентно, делать нечего
+        } elseif ($hooksPathNorm) {
+            $hookConflicts += "core.hooksPath уже указывает на '$hooksPathNorm' (чужая система хуков) — .githooks/pre-commit поставлен, но НЕ включён. Допиши в текущий хук вызов: bash `"`$(git rev-parse --show-toplevel)/.githooks/pre-commit`" (не забудь остановить коммит при ненулевом коде), либо перейди на .githooks сам: git config core.hooksPath .githooks"
+        } elseif (Test-Path $legacyHook) {
+            $hookConflicts += ".git/hooks/pre-commit уже существует и не наш — .githooks/pre-commit поставлен, но НЕ включён (core.hooksPath не тронут, чтобы не выключить существующий хук молча). Допиши в конец .git/hooks/pre-commit вызов: bash `"`$(git rev-parse --show-toplevel)/.githooks/pre-commit`" || exit 1"
+        } else {
+            & git -C $project config core.hooksPath .githooks 2>$null | Out-Null
+            $written += 'core.hooksPath = .githooks (git config этой машины, не версионируется)'
+        }
+    } else {
+        $hookConflicts += 'проект не git-репозиторий (нет .git) — .githooks/pre-commit и сканер секретов перед коммитом не поставлены; повтори bcf install после git init.'
+    }
+} else {
+    $written += '.githooks/pre-commit (git-хук: сканер секретов по индексу коммита)'
+    $written += 'core.hooksPath = .githooks (если не занят другим хуком)'
+}
+
 # --- config: конфиги обвязки ----------------------------------------------------------
 if (-not $only -or $only -eq 'config') {
     Copy-BcfTree -From (Join-Path $templates 'config') -To (Join-Path $project 'config')
@@ -234,6 +285,12 @@ if ($legacyDirs.Count -and -not $only) {
     Write-BcfNote 'она осталась от старой раскладки. Роли и хуки теперь читаются из .claude/,'
     Write-BcfNote 'то есть рядом появился ВТОРОЙ набор: правят один, исполняется другой.'
     Write-BcfNote 'сверь их и удали лишнее; на что ссылается config/agents.json — проверь отдельно.'
+}
+
+if ($hookConflicts.Count) {
+    Write-Host ''
+    Write-BcfWarn 'сканер секретов перед коммитом: требуется ручное внимание'
+    foreach ($c in $hookConflicts) { Write-BcfNote $c }
 }
 
 if ($skipped.Count) {
