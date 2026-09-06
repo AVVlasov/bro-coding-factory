@@ -112,6 +112,25 @@ function Set-Critic {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
     Set-Content -LiteralPath (Join-Path $d "$Id.md") -Value $Body -Encoding UTF8
 }
+# Приёмка лидера направления. Задача класса CORE (класс по умолчанию) без файла
+# tasks/.acceptance/<TASK>.md волной не закрывается: её паркует гейт продвижения, и
+# очередь фикстуры перестаёт быть закрытой. Здесь меряется вес ракурса, а не гейт
+# приёмки, поэтому фикстура ставит задачу в состояние принятой лидером.
+function Set-Accepted {
+    param([string]$Project, [string]$TaskId = 'TASK-01')
+    $d = Join-Path $Project 'tasks\.acceptance'
+    New-Item -ItemType Directory -Force -Path $d | Out-Null
+    Set-Content -LiteralPath (Join-Path $d "$TaskId.md") -Encoding UTF8 -Value @"
+# Приёмка $TaskId
+
+Лидер: лидер java
+Когда: 2026-09-05T00:00:00
+Ракурс: gates
+Заметка: фикстура
+
+Вердикт: 0000000000000000000000000000000000000000
+"@
+}
 
 Write-Host ''
 Write-Host "  РАКУРСЫ В ПРОЕКТЕ   песочница: $box" -ForegroundColor Cyan
@@ -568,6 +587,7 @@ Set-Content -LiteralPath (Join-Path $verdictProj 'tasks\TASK-01-card.md') -Encod
 
 - `src/app.ts`
 '@
+Set-Accepted $verdictProj
 
 $verdictRunner = Join-Path $box 'run-verdict.ps1'
 Set-Content -LiteralPath $verdictRunner -Encoding UTF8 -Value @'
@@ -578,6 +598,10 @@ $env:BCF_PROJECT_ROOT = $Root
 $env:BCF_MEMORY_DISABLED = '1'
 . (Join-Path $FactoryHome 'harness\lib\bcf-context.ps1')
 . (Join-Path $FactoryHome 'harness\lib\critics.ps1')
+# Доска задач и ветка волны: их закрывает Complete-TeamRun внутри вырезанного блока.
+# run-all.ps1 в библиотечном режиме до этой строки не доходит, поэтому шину подгружает
+# сам раннер — иначе вызов не разрешается, возврат пуст, и очередь читается незакрытой.
+. (Join-Path $FactoryHome 'harness\lib\team-bus.ps1')
 
 # Два ракурса разного веса. Находка кладётся тому, кого просит режим, — свод считает
 # настоящая Measure-BcfAcceptance, а не тест.
@@ -606,7 +630,13 @@ $region = $src.Substring($from.Extent.StartOffset, $to.Extent.EndOffset - $from.
 # и фаза: всё, что касается вердикта, исполняется настоящим кодом.
 function Write-GraphLog { param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
 function Set-Phase { param([Parameter(ValueFromRemainingArguments = $true)]$Rest) }
-$script:GraphCtx = [pscustomobject]@{ DryPlan = $false; Dir = $Root }
+function Get-GraphVar { param([string]$Name) '' }
+$script:GraphCtx = [pscustomobject]@{ DryPlan = $false; Dir = $Root; RunId = 'g_fixture' }
+# То же, что кладёт себе граф очереди при пустом publish.remote: волна остаётся
+# локальной. Без этой переменной Complete-TeamRun не связывается по параметру Team,
+# возврат остаётся пустым, и @($fin.Stuck) даёт затык из одного $null — очередь
+# фикстуры выглядит незакрытой, хотя закрыта.
+$team = @{ Ok = $true; Wave = ''; Remote = ''; Branch = ''; Reason = 'фикстура: волна локальная' }
 $passed = @('TASK-01')
 $stuck  = @()
 $tasks  = @('TASK-01')
@@ -827,6 +857,7 @@ function New-LensProject {
     # тестера и лишним полем rules. Файла тестера в проекте нет, шаблона java.md в фабрике
     # нет тоже — ракурс остаётся без текста.
     Set-Lenses $p '[{"id":"java","owner":"лидер java","blocking":true,"file":".claude/agents/testers/java.md","rules":7}]'
+    Set-Accepted $p
     if ($CriticText) { Set-Critic $p 'java' $CriticText }
     return $p
 }
@@ -868,6 +899,9 @@ $criticSchema = @{
 }
 $gateFacts  = ''
 $criticTail = ''
+# См. раннер блока вердикта выше: без $team возврат Complete-TeamRun пуст, и очередь
+# фикстуры читается как незакрытая.
+$team = @{ Ok = $true; Wave = ''; Remote = ''; Branch = ''; Reason = 'фикстура: волна локальная' }
 $passed = @('TASK-01')
 $stuck  = @()
 $tasks  = @('TASK-01')
