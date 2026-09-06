@@ -630,8 +630,14 @@ It 'прогон с находками приёмки не называется 
 
     $q = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
     Assert-Match $q 'Schema \$criticSchema' 'критик отвечает свободным текстом — находки нечем сосчитать'
-    Assert-Match $q 'findings = \$findAll\.Count' 'граф не возвращает число находок наверх'
+    Assert-Match $q 'findings = \$blockAll\.Count' 'граф не возвращает число блокирующих находок наверх'
     Assert-Match $q "severity -eq 'P1'" 'находки не разделены по тяжести — вердикт не отличит опечатку от потери данных'
+
+    # Совещательный ракурс виден в итоге отдельным числом: слепив его с блокирующими,
+    # мы вернули бы ровно то, ради чего вес и заводился.
+    Assert-Match $q 'advisory = ' 'находки совещательных ракурсов не поднимаются наверх вовсе'
+    $c = Get-Content -Raw (Join-Path $root 'harness\lib\critics.ps1')
+    Assert-Match $c 'BlockingP1' 'вердикт не отделяет блокирующие P1 от совещательных'
 }
 
 # --- Вопрос, который некому услышать, не задаётся ------------------------------------------
@@ -710,17 +716,21 @@ It 'записка человеку пишется в проект и переж
 # именно это обязано быть написано.
 
 It 'приёмка без ответа критиков не выдаётся за чистую' {
+    # Счёт ответов и текст отчёта переехали в общую библиотеку ракурсов: приёмка и ревью
+    # считают их одинаково. Проверяем там, где они теперь живут.
+    $c = Get-Content -Raw (Join-Path $root 'harness\lib\critics.ps1')
+    Assert-Match $c 'BlockingFailed\s*=' 'не ответившие блокирующие ракурсы не считаются'
+    Assert-Match $c 'Приёмка НЕ ВЫПОЛНЕНА' 'отчёт не отличает «не нашли» от «не смотрели»'
+    # Ответ прозой = схема не доехала = валидации не было. Такой ответ не находки.
+    Assert-Match $c '\$a -is \[string\]' 'строковый ответ критика считается структурой'
+
     $q = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
-    Assert-Match $q '\$criticsFailed = @\(\$acceptance \| Where-Object \{' 'граф не считает не ответивших критиков'
-    Assert-Match $q 'Приёмка НЕ ВЫПОЛНЕНА' 'отчёт не отличает «не нашли» от «не смотрели»'
+    Assert-Match $q '\$measure\.BlockingFailed' 'граф не берёт число не ответивших из свода приёмки'
     Assert-Match $q 'criticsFailed = \$criticsFailed' 'число не поднимается наверх, в вердикт прогона'
 
     $g = Get-Content -Raw (Join-Path $root 'harness\graph.ps1')
     Assert-Match $g "has 'criticsFailed'\) -and \[int\]" 'итог не смотрит на несработавшую приёмку'
     Assert-Match $g 'ПРИЁМКА НЕ ВЫПОЛНЕНА' 'нет отдельного вердикта для несработавшей приёмки'
-
-    # Ответ прозой = схема не доехала = валидации не было. Такой ответ не находки.
-    Assert-Match $q '\$_ -is \[string\]' 'строковый ответ критика считается структурой'
 }
 
 # --- Ветка барьера видит только общее состояние графа --------------------------------------
@@ -731,15 +741,23 @@ It 'приёмка без ответа критиков не выдаётся з
 # «критик: находок 1», отчёт — «Находок нет», итог — «ок»; в промпте не было ни схемы, ни
 # фактов, и никто этого не заметил, потому что всё выглядело зелёным.
 
-It 'критики получают схему и факты через состояние графа, а не через переменные' {
-    $q = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+It 'критики получают схему и промпт через состояние графа, а не через переменные' {
+    # Ветки барьера собирает одна функция на оба графа — она же кладёт в общее состояние
+    # и схему, и готовый промпт. Проверяем её, а не копию в каждом графе.
+    $c = Get-Content -Raw (Join-Path $root 'harness\lib\critics.ps1')
+    Assert-Match $c "Set-GraphVar 'bcfCriticSchema'" 'схема не положена в общее состояние'
+    Assert-Match $c "Set-GraphVar \`$var" 'промпт ракурса не положен в общее состояние'
+    Assert-Match $c "-Schema \(Get-GraphVar 'bcfCriticSchema'\)" 'ветка берёт схему из переменной скрипта'
 
-    Assert-Match $q 'Set-GraphVar criticSchema' 'схема не положена в общее состояние'
-    Assert-Match $q 'Set-GraphVar criticFacts'  'факты проверок не положены в общее состояние'
-    Assert-Match $q '-Schema \(Get-GraphVar criticSchema\)' 'критик по-прежнему берёт схему из переменной скрипта'
-    Assert-NoMatch $q 'Invoke-Node -Role critic[^
-]*-Schema \$criticSchema' 'остался вызов со схемой из переменной — в runspace она пуста'
-    Assert-NoMatch $q '\$gateFacts\$criticTail' 'факты подставляются переменной, которой в ветке нет'
+    # Метку узла-критика строит общая сборка. Литерал метки в самом графе означает, что
+    # ветку снова собирают на месте — со схемой и промптом из переменных, которых в чужом
+    # runspace нет. (Барьер опровергателей в ревью — не критик ракурса и здесь ни при чём.)
+    foreach ($f in @('harness\graphs\queue.graph.ps1', 'harness\graphs\review.graph.ps1')) {
+        $g = Get-Content -Raw (Join-Path $root $f)
+        Assert-Match $g 'Invoke-BcfCriticBarrier' "$f зовёт критиков мимо общей сборки"
+        Assert-NoMatch $g "-Label 'приёмка-" "$f строит ветку приёмки сам, минуя общее состояние"
+        Assert-NoMatch $g "-Label 'искатель-" "$f строит ветку искателя сам, минуя общее состояние"
+    }
 }
 
 It 'мастер сохраняет и убирает состояние .bcf/init.json' {
@@ -800,16 +818,23 @@ It 'шаг 4 называет коллизию владения и задачу 
     Assert-Match $r.Out '2 \+ слияния'
 }
 
-# Число критиков — свойство графа, а не мастера. Записанное в init константой, оно
-# останется тройкой и после того, как в граф добавят четвёртый ракурс.
-It 'критиков на экране столько, сколько ракурсов в графе' {
-    $graph = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\graphs\queue.graph.ps1')
-    $angles = @([regex]::Matches($graph, "-Label\s+'приёмка-([^']+)'") | ForEach-Object { $_.Groups[1].Value })
-    Assert-True ($angles.Count -gt 0) 'в графе не нашлось ни одного узла приёмки — разошёлся разбор'
+# Число критиков — свойство ПРОЕКТА, а не мастера. Записанное в init константой, оно
+# останется четвёркой и после того, как проект заведёт себе пятый ракурс.
+It 'критиков на экране столько, сколько ракурсов у проекта' {
     $p = New-Sandbox 'init-step4-critics'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'config') | Out-Null
+    Set-Content -Encoding UTF8 -LiteralPath (Join-Path $p 'config\review-lenses.json') `
+        -Value '[{"id":"java","owner":"лидер java","blocking":true},{"id":"ui","owner":"дизайнер","blocking":false}]'
     $r = Bcf @('init', '--yes', '--dry', '--project', $p)
-    Assert-Match $r.Out "critic ×$($angles.Count)"
-    foreach ($a in $angles) { Assert-Match $r.Out ([regex]::Escape($a)) "ракурс '$a' не назван" }
+    Assert-Match $r.Out 'critic ×2' 'экран не считает ракурсы проекта'
+    foreach ($a in @('java', 'ui')) { Assert-Match $r.Out ([regex]::Escape($a)) "ракурс '$a' не назван" }
+}
+
+It 'без конфига на экране ракурсы по умолчанию, а не ноль' {
+    $p = New-Sandbox 'init-step4-default'
+    $r = Bcf @('init', '--yes', '--dry', '--project', $p)
+    Assert-Match $r.Out 'critic ×4' 'умолчание фабрики не доехало до экрана'
+    Assert-Match $r.Out 'invariants' 'ракурсы по умолчанию не названы'
 }
 
 It 'init --dry проходит все экраны и ничего не пишет' {
@@ -891,11 +916,26 @@ It 'ставит .claude, config и CLAUDE.md' {
 }
 
 It 'подстановки не оставляют шаблонных плейсхолдеров' {
+    # Тексты ракурсов приёмки подставляются НЕ установкой, а прогоном: их плейсхолдеры
+    # обязаны дожить до промпта. Поэтому у них свой список разрешённых имён — иначе
+    # проверка либо краснеет на исправном файле, либо перестаёт ловить опечатку в имени.
+    $runtime = @('INVARIANT_SOURCES', 'MERGED')
     $p = New-Sandbox 'install-subst'
     Bcf @('install', '--project', $p) | Out-Null
-    $left = @(Get-ChildItem (Join-Path $p '.claude') -Recurse -File |
-              Where-Object { (Get-Content -Raw -LiteralPath $_.FullName) -match '\{\{[A-Z_]+\}\}' })
-    Assert-True ($left.Count -eq 0) "остались плейсхолдеры в: $(($left | ForEach-Object { $_.Name }) -join ', ')"
+
+    $left = @()
+    $strayRuntime = @()
+    foreach ($f in (Get-ChildItem (Join-Path $p '.claude') -Recurse -File)) {
+        $names = @([regex]::Matches((Get-Content -Raw -LiteralPath $f.FullName), '\{\{([A-Z_]+)\}\}') |
+                   ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+        if (-not $names.Count) { continue }
+        if ($f.FullName -match '\\agents\\critics\\') {
+            $bad = @($names | Where-Object { $runtime -notcontains $_ })
+            if ($bad.Count) { $strayRuntime += "$($f.Name): $($bad -join ', ')" }
+        } else { $left += $f.Name }
+    }
+    Assert-True ($left.Count -eq 0) "остались плейсхолдеры в: $($left -join ', ')"
+    Assert-True ($strayRuntime.Count -eq 0) "ракурс просит подстановку, которой прогон не делает: $($strayRuntime -join '; ')"
 }
 
 # Регрессия: обвязка — это файлы, которые владелец правит под себя. Молчаливая

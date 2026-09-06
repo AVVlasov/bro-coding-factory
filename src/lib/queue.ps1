@@ -11,8 +11,11 @@
 # перечислены отдельно (Blocked), а не растворены в общем числе.
 
 # Декларации разбираем ТЕМИ ЖЕ функциями, что и планировщик: собственная копия регекспа
-# однажды разъедется с ним, и разъедется тихо.
+# однажды разъедется с ним, и разъедется тихо. То же и с номерами требований заказчика,
+# и с составом ракурсов приёмки.
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
+. (Join-Path (Get-BcfHarness) 'lib\requirement.ps1')
+. (Join-Path (Get-BcfHarness) 'lib\critics.ps1')
 
 function Get-BcfQueue {
     param([Parameter(Mandatory)][string]$Project, $Config = $null)
@@ -53,6 +56,10 @@ function Get-BcfQueue {
                 Pass  = ((Test-Path $vf) -and (Select-String -Path $vf -Pattern '^verdict:\s*PASS' -Quiet))
                 # Исполнитель — тот же разбор, что у планировщика. Пустая строка значит
                 # «фабрика»: задачи без поля обязаны вести себя как до его появления.
+                # Номера требований заказчика: строка «**Требование:** 3.1.1» в шапке или
+                # жирные номера в секции «## Требования». Пусто — законное состояние:
+                # задача может быть внутренней, и выдумывать ей требование нельзя.
+                Requirements = @(Get-BcfRequirementsFromText -Body ([string]$body))
                 Executor = (Get-BcfExecutorFromText -Body ([string]$body))
                 IsHuman  = $false
                 Ready = $false
@@ -134,19 +141,25 @@ function Get-BcfQueue {
         # Задачи у людей перечислены ОТДЕЛЬНО от Blocked: «фабрика не может» и «фабрику
         # сюда не звали» лечатся разным, и склеенные в одно число они врут обоим.
         HumanHeld   = @($tasks | Where-Object { $_.IsHuman } | ForEach-Object { $_.Id })
+        # Требование → задачи, которые его закрывают. Это тот разрез, которым бэклог
+        # смотрит заказчик: «где 3.1.1» отвечается отсюда, а не перечитыванием задач.
+        Requirements = (Get-BcfRequirementIndex -Tasks $tasks)
     }
 }
 
-# Ракурсы приёмки читаются ИЗ ГРАФА, а не переписываются сюда числом.
+# Ракурсы приёмки читаются ТАМ ЖЕ, ГДЕ ИХ ЧИТАЕТ ГРАФ, а не переписываются сюда числом.
 #
-# «critic ×3» — свойство harness/graphs/queue.graph.ps1, а не мастера. Записанное в
-# init константой, оно останется тройкой и после того, как в граф добавят четвёртый
-# ракурс: экран настройки будет уверенно называть цифру, которой уже нет.
+# «critic ×3» — свойство приёмки, а не мастера. Записанное в init константой, оно
+# останется тройкой и после того, как в проект добавят четвёртый ракурс: экран настройки
+# будет уверенно называть цифру, которой уже нет. Раньше эта функция выкусывала метки
+# регекспом из текста графа — и молча вернула бы пусто в тот день, когда метки в графе
+# перестали быть литералами. Теперь спрашиваем тот же разборщик, что и граф.
 function Get-BcfCriticAngles {
-    $g = Join-Path (Get-BcfHarness) 'graphs\queue.graph.ps1'
-    if (-not (Test-Path $g)) { return @() }
-    $src = Get-Content -Raw -LiteralPath $g -ErrorAction SilentlyContinue
-    if (-not $src) { return @() }
-    return @([regex]::Matches([string]$src, "-Label\s+'приёмка-([^']+)'") |
-             ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    param([string]$Project = '')
+    $root = if ($Project) { $Project } else { $script:BcfProject }
+    if (-not $root) { return @() }
+    try {
+        $set = Get-BcfLenses -Root $root -Kind acceptance
+        return @($set.Lenses | ForEach-Object { [string]$_.Id })
+    } catch { return @() }
 }

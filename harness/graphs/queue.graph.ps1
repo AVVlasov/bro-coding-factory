@@ -693,20 +693,22 @@ if ($passed.Count -and -not $script:GraphCtx.DryPlan) {
     }
 }
 
-$acceptance = @()
+# Свод приёмки. $null здесь значит «приёмка не запускалась» (сливать было нечего либо
+# ни у одного ракурса не нашлось текста), и итог ниже читает именно это, а не ноль находок.
+$measure = $null
 if ($passed.Count) {
-    Set-GraphVar merged ($passed -join ', ')
-    # ВЕТКИ БАРЬЕРА ЖИВУТ В ОТДЕЛЬНЫХ ПРОСТРАНСТВАХ И ВИДЯТ ТОЛЬКО GraphVars.
+    # РАКУРСЫ — ДАННЫЕ ПРОЕКТА, А НЕ КОД ДВИЖКА.
     #
-    # Invoke-Barrier пересоздаёт thunk ИЗ ТЕКСТА в другом runspace, поэтому обычные
-    # переменные скрипта там просто не существуют: `-Schema $criticSchema` превращался в
-    # `-Schema $null` (узел молча возвращал прозу вместо структуры), а блок фактов —
-    # в пустую строку. Наблюдалось 2026-08-08: журнал печатал «критик: находок 1», отчёт —
-    # «Находок нет», итог — «ок»; в промпте не было ни схемы, ни фактов. Общее состояние
-    # графа переживает границу runspace — значит всё, что нужно ветке, кладём туда.
-    Set-GraphVar criticSchema $criticSchema
-    Set-GraphVar criticFacts  $gateFacts
-    Set-GraphVar criticTail   $criticTail
+    # Здесь стояли четыре критика, зашитые строками. Поправить хоть один вопрос можно было
+    # только правкой движка, то есть сразу всем проектам; у ракурса не было владельца, и по
+    # находке было некого спросить; провал ракурса, заведённого «посмотреть», ронял вердикт
+    # наравне с ракурсом, за которым стоит требование заказчика. Теперь состав ракурсов
+    # читается из config/review-lenses.json, а текст каждого — из .claude/agents/critics/.
+    $lensSet = Get-BcfLenses -Root $root -Kind acceptance
+    foreach ($n in @($lensSet.Notes)) { Write-GraphLog "! ракурсы: $n" }
+    $lenses = @($lensSet.Lenses)
+    Write-GraphLog ("ракурсы приёмки: $($lenses.Count) из $(if ($lensSet.FromProject) { 'config/review-lenses.json' } else { 'умолчания фабрики' })" +
+                    ", блокирующих $(@($lenses | Where-Object { $_.Blocking }).Count)")
 
     # Откуда критику брать инварианты — свойство проекта. Перечисляем реально
     # существующие у него файлы: ссылка на отсутствующий документ читается агентом как
@@ -723,93 +725,46 @@ if ($passed.Count) {
     if (-not $invSources.Count) {
         $invSources += '- (ни одного документа с инвариантами в проекте нет — так и скажи в summary и верни пустой список находок: выдумывать инварианты нельзя)'
     }
-    Set-GraphVar invariantsHint ($invSources -join "`n")
-    $acceptance = @(Invoke-Barrier -Thunks @(
-        {
-            # ИНВАРИАНТЫ НАЗЫВАЕТ ПРОЕКТ, А НЕ ДВИЖОК.
-            #
-            # Здесь был перечень инвариантов другого проекта: «один JSON в stdout,
-            # hex-адреса, чтение чужой памяти». В clinic-scheduler ничего этого нет —
-            # и критик честно отвечал «указанные требования отсутствуют в CLAUDE.md и
-            # неприменимы к React/Express-коду». Треть бюджета каждого круга приёмки
-            # уходила в пустоту, а два круга вообще дали находки про этот несуществующий
-            # инвариант. Список инвариантов читается из проекта; движок только спрашивает.
-            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-инварианты' -Prompt @"
-На слитом дереве закрыты задачи: $(Get-GraphVar merged).
-Ракурс: ИНВАРИАНТЫ ЭТОГО ПРОЕКТА.
+    # Значения, которые знает прогон, а не файл критика: список документов проекта с
+    # инвариантами и перечень закрытых задач. Подставляются в текст ракурса по имени.
+    $lensValues = @{
+        INVARIANT_SOURCES = ($invSources -join "`n")
+        MERGED            = ($passed -join ', ')
+    }
 
-Инварианты не перечислены здесь намеренно: их называет проект, а не проверяющий.
-Возьми их сам — в таком порядке источников:
-$(Get-GraphVar invariantsHint)
+    # Текст ракурса берётся из проекта; нет файла — из шаблона фабрики, и об этом строка в
+    # журнале. Собирает промпты общая функция (harness/lib/critics.ps1) — та же, что у
+    # ревью: две копии сборки разошлись бы молча.
+    $built = Build-BcfCriticPrompts -Lenses $lenses -Root $root -Values $lensValues `
+                -Header "На слитом дереве закрыты задачи: $($passed -join ', ')." `
+                -Tail "$gateFacts$criticTail"
+    $lensUsed = @($built.Lenses)
+    $prompts = @($built.Prompts)
 
-Из найденного составь список инвариантов, каждый из которых можно нарушить кодом, и
-найди нарушения В СЛИТОМ КОДЕ. Если инвариант из документа неприменим к этому коду —
-пропусти его молча, не превращай в находку. Каждое нарушение — с файлом и строкой.
-$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
-"@
-        },
-        {
-            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-склейка' -Prompt @"
-На слитом дереве закрыты задачи: $(Get-GraphVar merged).
-Ракурс: СЕМАНТИКА СКЛЕЙКИ. Задачи писались параллельно и разными агентами. Ищи места,
-где куски по отдельности верны, а вместе — нет: рассогласованные сигнатуры, дублирующие
-реализации одного и того же, несогласованные имена ошибок, мёртвые ветки после слияния.
-Каждое — с файлом и строкой.
-$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
-"@
-        },
-        {
-            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-гейты' -Prompt @"
-На слитом дереве закрыты задачи: $(Get-GraphVar merged).
-Ракурс: ЧЕСТНОСТЬ ГЕЙТОВ. Проверь тесты этих задач: есть ли среди них такие, что
-проходят, ничего не проверяя (ассерт на константу, замоканный объект проверки, тест без
-ассертов, `assert!(true)`). Тест, который не проверяет поведение, хуже отсутствующего.
-Каждое — с файлом и строкой.
-$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
-"@
-        },
-        {
-            # ЧЕТВЁРТЫЙ РАКУРС ДОБАВЛЕН ПО РАЗБОРУ clinic-scheduler (2026-08-09).
-            #
-            # Три ракурса выше спрашивают «правилен ли написанный код». За пять кругов
-            # приёмки они дали 30+ находок про стыки и ни одной про то, что оператор не
-            # может записать пациента, у регистратора кнопки оплаты и печати талона —
-            # вечно disabled, а врач видит чужой день. Эти дефекты не в коде, они в
-            # ОТСУТСТВИИ кода: их нельзя найти, читая то, что написано. Нужен вопрос
-            # «может ли человек выполнить работу», заданный явно.
-            Invoke-Node -Role critic -Recall -Schema (Get-GraphVar criticSchema) -Label 'приёмка-сценарий' -Prompt @"
-На слитом дереве закрыты задачи: $(Get-GraphVar merged).
-Ракурс: РАБОТА ПОЛЬЗОВАТЕЛЯ. Не «правилен ли код», а «может ли человек сделать то,
-ради чего продукт существует».
-
-Возьми сквозные пути продукта — в таком порядке источников: config/journeys.json,
-затем docs/PRD.md, затем макеты. Для КАЖДОГО пути пройди его по коду шаг за шагом
-и найди шаг, на котором человек встанет.
-
-Ищи именно это:
-- шаг пути, для которого вообще нет UI (например, нельзя выбрать дату/врача/услугу);
-- кнопку без обработчика или с disabled навсегда — «сделаю позже», оставленное в проде;
-- действие, которое меняет только локальное состояние и не доходит до сервера;
-- экран, который берёт данные не за тот период или не того владельца;
-- заголовок, противоречащий содержимому («смена 09.08» над записями за 10.08);
-- захардкоженное значение, выданное за настоящие данные;
-- ложное утверждение в тексте интерфейса (сообщение об интеграции, которой нет).
-
-Находка обязана называть ШАГ ПУТИ и то, что человек НЕ может сделать. severity P1 —
-если путь не проходится или пользователю показывают неверные данные.
-$(Get-GraphVar criticFacts)$(Get-GraphVar criticTail)
-"@
+    if ($lensUsed.Count) {
+        # ВЕТКИ БАРЬЕРА ЖИВУТ В ОТДЕЛЬНЫХ ПРОСТРАНСТВАХ И ВИДЯТ ТОЛЬКО GraphVars.
+        #
+        # Invoke-Barrier пересоздаёт thunk ИЗ ТЕКСТА в другом runspace, поэтому обычные
+        # переменные скрипта там просто не существуют: `-Schema $criticSchema` превращался
+        # в `-Schema $null` (узел молча возвращал прозу вместо структуры), а блок фактов —
+        # в пустую строку. Наблюдалось 2026-08-08: журнал печатал «критик: находок 1»,
+        # отчёт — «Находок нет», итог — «ок». Промпт и схему в общее состояние графа
+        # кладёт Invoke-BcfCriticBarrier — одним местом на оба графа.
+        $acceptance = @(Invoke-BcfCriticBarrier -Lenses $lensUsed -Prompts $prompts -LabelPrefix 'приёмка' -Schema $criticSchema)
+        $measure = Measure-BcfAcceptance -Lenses $lensUsed -Answers $acceptance
+        foreach ($r in @($measure.Rows)) {
+            $kind = if ($r.Lens.Blocking) { 'блокирующий' } else { 'совещательный' }
+            if ($r.Ok) {
+                Write-GraphLog ("критик $($r.Lens.Id) ($kind): находок $(@($r.Findings).Count)" +
+                                $(if ($r.P1) { " (P1: $($r.P1))" } else { '' }))
+            } else {
+                Write-GraphLog "✗ критик $($r.Lens.Id) ($kind) не ответил"
+            }
         }
-    ))
-    foreach ($a in @($acceptance | Where-Object { $_ })) {
-        $n = @($a.findings).Count
-        $p1 = @($a.findings | Where-Object { $_.severity -eq 'P1' }).Count
-        Write-GraphLog ("критик: находок $n$(if ($p1) { " (P1: $p1)" })")
+    } else {
+        Write-GraphLog "! приёмка не запускалась: ни у одного ракурса нет текста — ни в проекте, ни в шаблонах фабрики"
     }
 }
-
-$findAll = @($acceptance | Where-Object { $_ } | ForEach-Object { @($_.findings) } | Where-Object { $_ })
-$findP1  = @($findAll | Where-Object { $_.severity -eq 'P1' })
 
 # КРИТИК, КОТОРЫЙ НЕ ОТВЕТИЛ, — ЭТО НЕ «НАХОДОК НЕТ».
 #
@@ -823,12 +778,38 @@ $findP1  = @($findAll | Where-Object { $_.severity -eq 'P1' })
 # него не доехала (например, переменная не пережила границу runspace) и никакой валидации
 # не было. Считать такой ответ находками нельзя: `.findings` у строки пусто, и «Находок
 # нет» получится из ничего — ровно это и случилось 2026-08-08.
-$criticsRun    = @($acceptance).Count
-$criticsFailed = @($acceptance | Where-Object {
-    (-not $_) -or ($_ -is [string]) -or ($null -eq $_.PSObject.Properties['findings'])
-}).Count
-$acceptance = @($acceptance | Where-Object { $_ -and -not ($_ -is [string]) -and $_.PSObject.Properties['findings'] })
-if ($criticsFailed) { Write-GraphLog "⚠ приёмка неполна: не ответило критиков — $criticsFailed из $criticsRun" }
+#
+# ВЕРДИКТ СЧИТАЕТСЯ ПО БЛОКИРУЮЩИМ РАКУРСАМ. Совещательный ракурс печатается целиком, но
+# ни его находки, ни его молчание прогон не роняют: иначе ракурс, заведённый «посмотреть»,
+# стоит столько же, сколько требование заказчика, и его перестают заводить.
+$findAll = if ($measure) { @($measure.Findings) } else { @() }
+$findP1   = @($findAll | Where-Object { $_.severity -eq 'P1' })
+$blockP1  = if ($measure) { [int]$measure.BlockingP1 } else { 0 }
+$blockAll = if ($measure) { @($measure.Blocking) } else { @() }
+$criticsRun    = if ($measure) { [int]$measure.Run } else { 0 }
+$criticsFailed = if ($measure) { [int]$measure.BlockingFailed } else { 0 }
+$advisoryFailed = if ($measure) { [int]$measure.AdvisoryFailed } else { 0 }
+if ($criticsFailed) { Write-GraphLog "⚠ приёмка неполна: не ответило блокирующих ракурсов — $criticsFailed из $criticsRun" }
+if ($advisoryFailed) { Write-GraphLog "· не ответило совещательных ракурсов — $advisoryFailed (на вердикт не влияет)" }
+
+# ПРИЁМКА, КОТОРОЙ НЕ БЫЛО, — ЭТО НЕ «ПРИЁМКА БЕЗ НАХОДОК».
+#
+# У не ответившего критика сигнал есть ($criticsFailed выше). У случая «ни у одного ракурса
+# нет текста» его не было: $measure оставался $null, criticsRun и criticsFailed становились
+# нулями, в отчёт уезжало «P1 приёмки: 0», и прогон объявлял COMPLETE — при том что смотреть
+# было некому. Пока тексты лежали строками в этом файле, случай был невозможен; с переездом
+# текстов в проект он появился и выглядит исправным с обоих концов цепочки.
+#
+# Путь не выдуманный: запись внешней рассылки правил
+# {"id":"java","owner":"лидер java","blocking":true,"file":".claude/agents/testers/java.md"}
+# при отсутствующем файле тестера даёт ровно ноль промптов — и ни одной строки о том, что
+# приёмка не выполнялась.
+$acceptanceExpected = [bool]($passed.Count -and -not $script:GraphCtx.DryPlan)
+$acceptanceSkipped  = ($acceptanceExpected -and $criticsRun -eq 0)
+if ($acceptanceSkipped) {
+    Write-GraphLog ("⚠ приёмка НЕ ВЫПОЛНЯЛАСЬ: в дерево слито задач $($passed.Count), " +
+                    'а ракурсов с текстом ноль — смотреть было некому')
+}
 
 # ---------------------------------------------------------------------------
 Set-Phase 'Итог'
@@ -862,29 +843,12 @@ if (-not $script:GraphCtx.DryPlan) {
 
 $rep = Emit-RunAllReport -Passed $passed -Stuck $stuck -Total $tasks.Count -Root $root `
     -ReviewFile $reviewFile -StatusFile $statusFile -Ts (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `
-    -AcceptanceP1 $findP1.Count
+    -AcceptanceP1 $blockP1 -AcceptanceSkipped:$acceptanceSkipped
 
-if ($acceptance.Count) {
-    $body = "`n## Приёмка графа (разные ракурсы, слитое дерево)`n`n"
-    if ($findAll.Count) {
-        $body += "**Находок: $($findAll.Count)** (P1: $($findP1.Count)). Задачи закрыты по гейтам — эти замечания гейтами не ловятся.`n`n"
-        foreach ($f in ($findAll | Sort-Object severity)) {
-            $where = "$($f.file)$(if ($f.line) { ":$($f.line)" })"
-            $body += "- **[$($f.severity)]** $($f.what) — ``$where```n"
-        }
-        $body += "`n"
-    } elseif ($criticsFailed -ge $criticsRun) {
-        $body += "**Приёмка НЕ ВЫПОЛНЕНА**: ни один критик не ответил ($criticsFailed из $criticsRun). " +
-                 "«Находок нет» здесь означало бы, что смотрели и не нашли, — а не смотрели вовсе. " +
-                 "Причина в журнале прогона; чаще всего это протухший путь к CLI или исчерпанная квота.`n`n"
-    } else {
-        $body += "Находок нет.`n`n"
-    }
-    if ($criticsFailed -and $criticsFailed -lt $criticsRun) {
-        $body += "> Внимание: не ответило критиков — $criticsFailed из $criticsRun. Часть ракурсов не проверена.`n`n"
-    }
-    foreach ($a in @($acceptance | Where-Object { $_ })) { $body += "`n---`n`n$($a.summary)`n" }
-    Add-Content -Path $reviewFile -Value $body -Encoding UTF8
+# Раздел приёмки пишет общая функция (harness/lib/critics.ps1): тот же раздел собирает
+# ревью, и две реализации «как показать находки» разъехались бы на первом же изменении.
+if ($measure -and $measure.Run) {
+    Add-Content -Path $reviewFile -Value (Format-BcfAcceptanceReport -Measure $measure -Merged ($passed -join ', ')) -Encoding UTF8
 }
 
 # НАХОДКА, ОСТАВШАЯСЯ В ОТЧЁТЕ, — ЭТО НЕ ЗАКРЫТАЯ НАХОДКА.
@@ -912,12 +876,16 @@ if ($findP1.Count -and -not $script:GraphCtx.DryPlan) {
         if (-not $slug) { $slug = "p1-$i" }
         $file = Join-Path $inbox "$runId-$('{0:d2}' -f $i)-$slug.md"
         $where = "$($f.file)$(if ($f.line) { ":$($f.line)" })"
+        $lensWord = if ($f.blocking) { 'блокирующий' } else { 'совещательный' }
+        $ownerWord = if ($f.owner) { $f.owner } else { 'владелец не назначен' }
         Set-Content -LiteralPath $file -Encoding UTF8 -Value @"
 # Черновик задачи — P1 приёмки $runId
 
 Находка приёмки на слитом дереве. Черновик: перенеси в ``tasks/TASK-<NN>-<slug>.md``,
 допиши «Готовность» и «Проверки», добавь id в ``config/checks.json`` — и только тогда
 очередь возьмёт её в работу.
+
+Ракурс: $($f.lens) ($lensWord), отвечает $ownerWord.
 
 ## Что не так
 
@@ -949,8 +917,20 @@ $($f.what)
 }
 
 Write-GraphLog ("итог: PASS $($rep.passed)/$($rep.total), не закрыто $($rep.stuck) (человек: $($rep.needsHuman), каскад: $($rep.gateBlocked))" +
-                $(if ($findAll.Count) { "; приёмка: находок $($findAll.Count), P1 $($findP1.Count)" } else { '' }))
+                $(if ($findAll.Count) { "; приёмка: находок $($findAll.Count) (блокирующих $($blockAll.Count), P1 $blockP1)" } else { '' }))
+# В вердикт прогона уезжают ТОЛЬКО блокирующие ракурсы: `findings` читает graph.ps1 и
+# по ним решает, звучит ли слово «ок». Совещательные едут отдельными полями — они видны
+# в отчёте и в журнале, но зелёный прогон не краснеет от ракурса, заведённого «посмотреть».
 return @{ complete = $rep.complete; passed = $rep.passed; total = $rep.total; stuck = $rep.stuck; waves = $wave
-          findings = $findAll.Count; findingsP1 = $findP1.Count
-          criticsRun = $criticsRun; criticsFailed = $criticsFailed }
+          findings = $blockAll.Count; findingsP1 = $blockP1
+          advisory = $(if ($measure) { @($measure.Advisory).Count } else { 0 })
+          advisoryP1 = $(if ($measure) { [int]$measure.AdvisoryP1 } else { 0 })
+          criticsRun = $criticsRun; criticsFailed = $criticsFailed; advisoryFailed = $advisoryFailed
+          # criticsExpected отвечает на вопрос, который ноль в criticsRun сам по себе не
+          # различает: приёмка не запускалась потому, что сливать было нечего, или потому,
+          # что смотреть было некому. Второе — не зелёный прогон.
+          criticsExpected = $acceptanceExpected
+          criticsReason = $(if ($acceptanceSkipped) {
+              'слито задач ' + $passed.Count + ', а ракурсов с текстом ноль: ни в .claude/agents/critics/, ни в шаблонах фабрики'
+          } else { '' }) }
 

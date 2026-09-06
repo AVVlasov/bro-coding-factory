@@ -79,6 +79,9 @@ function Verdict-Pass($t, $atRoot) {
 # каждый по отдельности работает, а увидеть расхождение можно только сверив вывод с
 # вердиктами руками.
 . (Join-Path $PSScriptRoot 'lib\claims.ps1')
+# Номера требований заказчика — тем же разборщиком, что у `bcf tasks`: отчёт, считающий
+# закрытые пункты иначе, чем экран бэклога, спорит с ним на сдаче.
+. (Join-Path $PSScriptRoot 'lib\requirement.ps1')
 $predRegex = [regex]::Escape($taskIdPrefix) + '-\d+'
 function Get-GatePreds($t) {
   return @(Get-TaskPredecessors -TaskId $t -Root $root -Prefix $taskIdPrefix)
@@ -122,7 +125,12 @@ function Emit-RunAllReport {
         # них не знал: круг приёмки печатал «COMPLETE» и следом список из трёх P1.
         # Находка уровня «пользователь видит неверные данные» — это не примечание к
         # готовности, это её отсутствие.
-        [int]$AcceptanceP1 = 0)
+        [int]$AcceptanceP1 = 0,
+        # Приёмка ОЖИДАЛАСЬ, но не выполнялась: в дерево слито хоть что-то, а смотреть
+        # оказалось некому — ни у одного ракурса нет текста. Ноль находок при нулевой
+        # приёмке неотличим от чистой приёмки, если не сказать об этом отдельно; так
+        # прогон и объявлял COMPLETE, ни разу никого не спросив.
+        [bool]$AcceptanceSkipped = $false)
 
   $gateBlocked = @($Stuck | Where-Object { $_.Reason -like 'gate-block*' })
   $needsHuman  = @($Stuck | Where-Object { $_.Reason -notlike 'gate-block*' })
@@ -153,7 +161,7 @@ function Emit-RunAllReport {
     }
   } catch { $journeyState = 'unknown'; $journeySummary = $_.Exception.Message }
 
-  $complete = $queueClosed -and ($journeyState -eq 'ok') -and ($AcceptanceP1 -eq 0)
+  $complete = $queueClosed -and ($journeyState -eq 'ok') -and ($AcceptanceP1 -eq 0) -and (-not $AcceptanceSkipped)
 
   $reasonOf = @{}
   foreach ($s in $Stuck) { $reasonOf[$s.Task] = $s.Reason }
@@ -166,10 +174,15 @@ function Emit-RunAllReport {
 
   # run-all.status.json — машиночитаемый сигнал для вызывающего агента/автоматизации.
   $statusObj = [ordered]@{
+    factory_version = (Get-BcfFactoryVersion)
+    graph_hash      = (Get-BcfFileHash -Path ([string]$env:BCF_GRAPH_FILE))
     complete       = $complete
     queue_closed   = $queueClosed
     journeys       = $journeyState
     acceptance_p1  = $AcceptanceP1
+    # Вызывающий агент читает этот файл вместо попапа: «приёмка не выполнялась» обязана
+    # быть в нём отдельным полем, иначе ноль находок читается как чистая приёмка.
+    acceptance_skipped = $AcceptanceSkipped
     when         = $Ts
     total        = $Total
     passed       = @($Passed).Count
@@ -193,6 +206,12 @@ function Emit-RunAllReport {
   $gateLines = if ($gateBlocked.Count) { ($gateBlocked | ForEach-Object { "- **$($_.Task)** — $($_.Reason)" }) -join "`n" } else { "- (нет)" }
   $statusLine = if ($complete) {
     "**Статус:** COMPLETE — все $Total задач закрыты (PASS) И сквозные сценарии продукта зелёные."
+  } elseif ($queueClosed -and $AcceptanceSkipped) {
+    "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ПРИЁМКА НЕ ВЫПОЛНЯЛАСЬ — все $Total задач закрыты (PASS), " +
+    "но слитое дерево не смотрел ни один ракурс: текста нет ни в проекте (``.claude/agents/critics/``), " +
+    "ни в шаблонах фабрики. «Находок нет» здесь означало бы, что смотрели и не нашли, — а не смотрел " +
+    "никто. Проверь ``config/review-lenses.json``: ракурс со ссылкой на несуществующий файл пропускается. " +
+    "НЕ принимать за «готово»."
   } elseif ($queueClosed -and $journeyState -eq 'not-configured') {
     "**Статус:** ОЧЕРЕДЬ ЗАКРЫТА, ПРОДУКТ НЕ ПРОВЕРЕН — все $Total задач закрыты (PASS), " +
     "но сквозные сценарии не заведены (config/journeys.json). Это НЕ «готово»: закрытая очередь " +
@@ -222,6 +241,51 @@ function Emit-RunAllReport {
                        "проверено состояние дерева, а не работа пользователя.`n`n" }
     default          { "## Сквозные сценарии продукта`nСостояние неизвестно: $journeySummary`n`n" }
   }
+  # ТРЕБОВАНИЯ ЗАКАЗЧИКА — ДРУГОЙ СЧЁТ, ЧЕМ ЗАДАЧИ.
+  #
+  # «Закрыто 12 из 14» — счёт нарезки, а не счёт обязательств. Заказчик спрашивает про
+  # пункт 3.1.1, и ответ «задача TASK-07 закрыта» ему ничего не говорит, пока кто-то
+  # помнит, что 3.1.1 это и есть TASK-07. Пункт считается закрытым, только когда закрыты
+  # ВСЕ задачи, которые его назвали: половина требования — это незакрытое требование.
+  #
+  # ИМЕНА ЛОКАЛЬНЫХ ПЕРЕМЕННЫХ ЗДЕСЬ НЕ СВОБОДНЫ. У функции есть параметр [string]$Ts (время
+  # прогона), а PowerShell не различает регистр: локальная $ts перезаписывала ЕГО, и типовое
+  # ограничение [string] молча склеивало список задач в строку через пробел. Следствий было
+  # два, и оба тихие: требование, названное двумя задачами, не закрывалось никогда
+  # («НЕ закрыто: TASK-01 TASK-02 (всего задач: 1)» — счёт по длине строки), а шапка отчёта
+  # печатала «Когда: TASK-01 TASK-02» вместо времени. Отсюда $reqTaskIds, а не $ts.
+  $reqBlock = ''
+  try {
+    $reqTasks = @{}
+    foreach ($t in (@($Passed) + @($Stuck | ForEach-Object { $_.Task }))) {
+      if (-not $t) { continue }
+      foreach ($r in @(Get-TaskRequirements -TaskId ([string]$t) -Root $Root)) {
+        if (-not $reqTasks.ContainsKey($r)) { $reqTasks[$r] = @() }
+        $reqTasks[$r] += [string]$t
+      }
+    }
+    if ($reqTasks.Count) {
+      $passSet = @{}
+      foreach ($p in @($Passed)) { $passSet[[string]$p] = $true }
+      $lines = @()
+      $closedReq = 0
+      foreach ($r in ($reqTasks.Keys | Sort-Object)) {
+        $reqTaskIds = @($reqTasks[$r] | Select-Object -Unique)
+        $open = @($reqTaskIds | Where-Object { -not $passSet.ContainsKey($_) })
+        if ($open.Count) { $lines += "- **$r** — НЕ закрыто: $($open -join ', ') (всего задач: $($reqTaskIds.Count))" }
+        else { $closedReq++; $lines += "- **$r** — закрыто: $($reqTaskIds -join ', ')" }
+      }
+      $reqBlock = "## Требования заказчика`n`nЗакрыто пунктов: $closedReq из $($reqTasks.Count).`n" +
+                  ($lines -join "`n") + "`n`n"
+    }
+  } catch {
+    # Пустой catch оставлял отчёт без раздела молча, и «требований нет» читалось там, где на
+    # самом деле «разбор упал». Отказ печатается на месте раздела: заказчик должен видеть, что
+    # ответа про пункты договора в этом отчёте нет, а не думать, что пунктов не было.
+    $reqBlock = "## Требования заказчика`n`n**Раздел не собран:** $($_.Exception.Message)`n" +
+                "Номера требований в этом отчёте не считаны — сверяй пункты по задачам вручную.`n`n"
+  }
+
   $rootHint = if ($needsHuman.Count) {
     "## Корень: почини это первым`n" +
     (($needsHuman | ForEach-Object {
@@ -231,11 +295,18 @@ function Emit-RunAllReport {
     "`n`nПосле фикса перезапусти прогон — закрытые PASS пропустятся, каскад-гейт подтянется.`n`n"
   } else { "" }
 
+  # Чем получен отчёт: версия фабрики и хэш файла графа. Те же две строки стоят в вердикте
+  # задачи — по ним видно, одной ли обвязкой получены вердикт и итог, или вердикт остался
+  # от прошлой версии.
+  $provenance = (Get-BcfProvenanceLines) -join "`n"
+
   Set-Content -Path $ReviewFile -Encoding UTF8 -Value (
     "# Ralph overnight run-all — итог`n`n" +
     "**Когда:** $Ts`n$statusLine`n**Закрыто (PASS):** $(@($Passed).Count) / $Total`n`n" +
+    "```````n$provenance`n```````n`n" +
     $rootHint +
     $journeyBlock +
+    $reqBlock +
     "## PASS`n$passLines`n`n" +
     "## Требуют вмешательства (сама задача застряла/упала)`n$humanLines`n`n" +
     "## Заблокированы каскад-гейтом (закроются после фикса предшественника)`n$gateLines`n`n" +

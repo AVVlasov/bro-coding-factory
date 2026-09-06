@@ -65,7 +65,11 @@ function _cells($t, $state) {
     # Колонка исполнителя всегда заполнена: пустая клетка читается как «неизвестно»,
     # а неизвестности тут нет — задача без поля принадлежит фабрике.
     $who = if ($t.Executor) { $t.Executor } else { 'фабрика' }
-    return @($t.Id, $state, (_trim $t.Title 24), (_trim $files 26), (_trim $who 14))
+    # Требования: прочерк, а не пустота. Пустая клетка читается как «не посмотрели»,
+    # прочерк — как «в задаче их не написано», а это разные вещи при сдаче заказчику.
+    $req = if (@($t.Requirements).Count) { (@($t.Requirements) | Select-Object -First 2) -join ', ' } else { '—' }
+    if (@($t.Requirements).Count -gt 2) { $req += " +$(@($t.Requirements).Count - 2)" }
+    return @($t.Id, $state, (_trim $t.Title 20), (_trim $files 22), (_trim $req 14), (_trim $who 12))
 }
 
 $rows = New-BcfRows
@@ -78,10 +82,20 @@ foreach ($t in $human)   { Add-BcfRow $rows (_cells $t 'у человека'); $
 foreach ($t in $waiting) { Add-BcfRow $rows (_cells $t "ждёт $($t.Preds -join ',')"); $colors += 'DarkGray' }
 foreach ($t in $closed)  { Add-BcfRow $rows (_cells $t 'PASS');    $colors += 'DarkCyan' }
 
-# Ширины сжаты под пятую колонку так, чтобы вся таблица осталась уже прежних 99 знаков:
+# Ширины сжаты под шестую колонку так, чтобы вся таблица осталась уже прежних 99 знаков:
 # в узком окне обрезается ЗАГОЛОВОК, и колонка «исполнитель» превращается в «исполните».
-Write-BcfTable -Headers @('id', 'состояние', 'что', 'владеет файлами', 'исполнитель') `
-               -Widths @(10, 15, 25, 27, 15) -Rows $rows -RowColors $colors
+Write-BcfTable -Headers @('id', 'состояние', 'что', 'владеет файлами', 'требования', 'исполнитель') `
+               -Widths @(10, 13, 20, 22, 14, 12) -Rows $rows -RowColors $colors
+
+# Требования заказчика — тот разрез бэклога, которым его читает не фабрика, а заказчик.
+# Строка печатается только когда номера в задачах есть: у внутреннего проекта их нет, и
+# пустой раздел про требования выглядел бы как незаполненная обязанность.
+$withReq = @($items | Where-Object { @($_.Requirements).Count })
+if ($withReq.Count) {
+    $allReq = @($withReq | ForEach-Object { $_.Requirements } | Select-Object -Unique)
+    Write-Host ''
+    Write-BcfNote "требований заказчика названо: $($allReq.Count) — в $($withReq.Count) задачах из $($items.Count)"
+}
 
 if ($human.Count) {
     Write-Host ''

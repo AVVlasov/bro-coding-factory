@@ -1,0 +1,13 @@
+{
+  "$comment": "Ракурсы приёмки. Читают оба графа: queue (приёмка слитого дерева) и review (поиск дефектов в правке). Каждый ракурс — отдельный вызов агента на каждый круг: лишний ракурс стоит денег, ненужный удаляй. id — имя ракурса и имя файла с его текстом (.claude/agents/critics/<id>.md); файла нет — движок берёт текст из шаблона фабрики и пишет об этом в журнал. owner — с кого спрашивать по находке этого ракурса. blocking: true — провал ракурса роняет вердикт прогона; false — ракурс совещательный, находки печатаются, вердикт не меняется. kind — какому графу ракурс задаётся (acceptance, review); поля нет — ракурс идёт в оба. Лишние поля (например rules) разбор игнорирует: этот же файл пишет внешняя рассылка правил.",
+
+  "lenses": [
+    { "id": "invariants",  "owner": "", "blocking": true, "kind": "acceptance", "file": ".claude/agents/critics/invariants.md" },
+    { "id": "seams",       "owner": "", "blocking": true, "kind": "acceptance", "file": ".claude/agents/critics/seams.md" },
+    { "id": "correctness", "owner": "", "blocking": true, "kind": "review",     "file": ".claude/agents/critics/correctness.md" },
+    { "id": "failures",    "owner": "", "blocking": true, "kind": "review",     "file": ".claude/agents/critics/failures.md" },
+    { "id": "boundaries",  "owner": "", "blocking": true, "kind": "review",     "file": ".claude/agents/critics/boundaries.md" },
+    { "id": "gates",       "owner": "", "blocking": true, "file": ".claude/agents/critics/gates.md" },
+    { "id": "journey",     "owner": "", "blocking": true, "file": ".claude/agents/critics/journey.md" }
+  ]
+}

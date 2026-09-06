@@ -182,6 +182,17 @@ function Get-BcfGitForWindowsBash {
     return ''
 }
 
+# Две строки для шапки вердикта и отчёта. Граф передаёт путь к своему скрипту через
+# BCF_GRAPH_FILE; когда задача шла циклом, а не графом, это так и сказано — пустая
+# строка читалась бы как «граф был, но не записался».
+function Get-BcfProvenanceLines {
+    param([string]$GraphFile = '')
+    $gf = if ($GraphFile) { $GraphFile } else { [string]$env:BCF_GRAPH_FILE }
+    $hash = Get-BcfFileHash -Path $gf
+    $graphLine = if ($hash) { "$hash ($(Split-Path $gf -Leaf))" } else { 'нет (прогон без графа)' }
+    return @("factory_version: $(Get-BcfFactoryVersion)", "graph_hash: $graphLine")
+}
+
 # Какой bash звать под Windows.
 #
 # `bash` из PATH — НЕ тот, о котором думает автор хука. Первым там обычно стоит

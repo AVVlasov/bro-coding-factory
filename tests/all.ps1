@@ -23,7 +23,8 @@ $suites = @(
     @{ Name = 'шина команды';      File = Join-Path $PSScriptRoot 'team-bus.tests.ps1' },
     @{ Name = 'приёмка и отчёт';   File = Join-Path $PSScriptRoot 'acceptance-report.tests.ps1' },
     @{ Name = 'общая память';       File = Join-Path $PSScriptRoot 'memory-team.tests.ps1' },
-    @{ Name = 'установка и секреты'; File = Join-Path $PSScriptRoot 'install-secrets.tests.ps1' }
+    @{ Name = 'установка и секреты'; File = Join-Path $PSScriptRoot 'install-secrets.tests.ps1' },
+    @{ Name = 'ракурсы в проекте'; File = Join-Path $PSScriptRoot 'critics-in-project.tests.ps1' }
 )
 
 $results = @()

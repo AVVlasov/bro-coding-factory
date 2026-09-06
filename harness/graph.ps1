@@ -338,7 +338,17 @@ if (-not $Yes -and -not $DryPlan) {
 . (Join-Path $PSScriptRoot 'lib\claims.ps1')
 . (Join-Path $PSScriptRoot 'lib\worktree.ps1')
 . (Join-Path $PSScriptRoot 'lib\graph-runtime.ps1')
-    . (Join-Path $PSScriptRoot 'lib\graph-memory.ps1')
+. (Join-Path $PSScriptRoot 'lib\graph-memory.ps1')
+. (Join-Path $PSScriptRoot 'lib\critics.ps1')
+
+# ЧЕМ И ПО КАКОМУ ГРАФУ ПОЛУЧЕН ВЕРДИКТ — часть самого вердикта.
+#
+# Вердикт задачи пишет verify.ps1 в дочернем процессе, и до сих пор в нём не было ни слова
+# о том, какой версией фабрики и каким графом он получен. Разбор чужого прогона начинался
+# с вопроса «на чём это вообще гонялось», и ответа не было ни в одном файле прогона. Путь
+# к скрипту графа уезжает потомкам переменной окружения, а хэш от него считает
+# Get-BcfProvenanceLines там, где вердикт пишется.
+$env:BCF_GRAPH_FILE = $scriptPath
 
 # --- ПРЕФЛАЙТ ОКРУЖЕНИЯ ---
 #
@@ -438,10 +448,21 @@ if ($failed) {
     $val = { param($n) if ($result -is [hashtable]) { $result[$n] } else { $result.$n } }
 
     if ((& $has 'complete') -and -not (& $val 'complete')) {
-        # Очередь закрылась не вся. Узлы при этом могли отработать все до одного —
-        # именно поэтому судить по узлам нельзя.
-        $verdict = 'НЕПОЛНО'; $vColor = 'Yellow'; $code = 1
-        $detail = "закрыто $(& $val 'passed') из $(& $val 'total'), осталось $(& $val 'stuck')"
+        $stuckN = if (& $has 'stuck') { [int](& $val 'stuck') } else { 0 }
+        if ($stuckN -gt 0) {
+            # Очередь закрылась не вся. Узлы при этом могли отработать все до одного —
+            # именно поэтому судить по узлам нельзя.
+            $verdict = 'НЕПОЛНО'; $vColor = 'Yellow'; $code = 1
+            $detail = "закрыто $(& $val 'passed') из $(& $val 'total'), осталось $stuckN"
+        } else {
+            # ОЧЕРЕДЬ ЗАКРЫЛАСЬ ВСЯ, А «ГОТОВО» ВСЁ РАВНО НЕ ЗВУЧИТ. Отчёт считает готовность
+            # шире, чем сумму задач: в неё входят сквозные сценарии продукта и приёмка на
+            # слитом дереве. Печатать здесь «НЕПОЛНО — закрыто 1 из 1, осталось 0» значит
+            # назвать виноватой очередь, которая как раз закрылась, и спрятать настоящую
+            # причину. Причину называют проверки ниже — они дописывают её поверх этого слова.
+            $verdict = 'ГОТОВНОСТЬ НЕ ПОДТВЕРЖДЕНА'; $vColor = 'Yellow'; $code = 1
+            $detail = "закрыто $(& $val 'passed') из $(& $val 'total'), но готовность не подтверждена — .bcf/REVIEW.md"
+        }
     } elseif ((& $has 'ok') -and -not (& $val 'ok')) {
         $verdict = 'ПРОВАЛ'; $vColor = 'Red'; $code = 1
         if (& $has 'reason') { $detail = [string](& $val 'reason') }
@@ -458,13 +479,32 @@ if ($failed) {
     # это отсутствием находок — тот же обман, что и «ок» поверх найденных дефектов.
     # 2026-08-08: у codex сменился хэш сборки в пути, все три критика упали, отчёт написал
     # «Находок нет», итог — «ок».
-    if ((& $has 'criticsFailed') -and [int](& $val 'criticsFailed') -gt 0 -and $verdict -eq 'ок') {
+    # СМОТРЕТЬ БЫЛО НЕКОМУ — ТОЖЕ НЕ «ЧИСТАЯ ПРИЁМКА», И ЭТО ДРУГОЙ СЛУЧАЙ.
+    # Выше критик не ответил; здесь его не звали вовсе, потому что ни у одного ракурса не
+    # нашлось текста: пустой config/review-lenses.json, запись внешней рассылки правил со
+    # ссылкой на несуществующий файл, снесённый каталог .claude/agents/critics/. Оба конца
+    # цепочки при этом выглядят исправно — находок ноль, очередь закрыта, — и прогон
+    # объявлял COMPLETE, ни разу никого не спросив. Граф отвечает на это парой полей:
+    # criticsExpected говорит, что приёмка ожидалась, criticsRun — сколько ракурсов смотрело.
+    # $refinable — слова, которые уточняющая проверка имеет право заменить своим: зелёное «ок»
+    # и «готовность не подтверждена», у которого причина ещё не названа. «НЕПОЛНО» и «ПРОВАЛ»
+    # не трогаются: незакрытая очередь и упавший граф — факты крупнее находки приёмки.
+    $refinable = @('ок', 'ГОТОВНОСТЬ НЕ ПОДТВЕРЖДЕНА')
+
+    if ((& $has 'criticsExpected') -and (& $val 'criticsExpected') -and
+        (& $has 'criticsRun') -and [int](& $val 'criticsRun') -eq 0 -and $verdict -in $refinable) {
+        $verdict = 'ПРИЁМКА НЕ ВЫПОЛНЕНА'; $vColor = 'Yellow'; $code = 1
+        $detail = if ((& $has 'criticsReason') -and (& $val 'criticsReason')) { [string](& $val 'criticsReason') }
+                  else { 'ни один ракурс не смотрел: текста нет ни в проекте, ни в шаблонах фабрики' }
+    }
+
+    if ((& $has 'criticsFailed') -and [int](& $val 'criticsFailed') -gt 0 -and $verdict -in $refinable) {
         $cf = [int](& $val 'criticsFailed'); $cr = if (& $has 'criticsRun') { [int](& $val 'criticsRun') } else { 0 }
         $verdict = 'ПРИЁМКА НЕ ВЫПОЛНЕНА'; $vColor = 'Yellow'; $code = 1
         $detail = "задачи закрыты, но не ответило критиков — $cf из $cr; смотреть было некому"
     }
 
-    if ((& $has 'findings') -and [int](& $val 'findings') -gt 0 -and $verdict -eq 'ок') {
+    if ((& $has 'findings') -and [int](& $val 'findings') -gt 0 -and $verdict -in $refinable) {
         $p1 = if (& $has 'findingsP1') { [int](& $val 'findingsP1') } else { 0 }
         $verdict = 'ЗАМЕЧАНИЯ'; $vColor = 'Yellow'; $code = 1
         $detail = "задачи закрыты все, приёмка нашла $(& $val 'findings')$(if ($p1) { ", из них P1: $p1" }) — .bcf/REVIEW.md"

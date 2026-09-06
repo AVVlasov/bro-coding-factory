@@ -654,10 +654,11 @@ It 'VERIFY.PS1: FACTORY_VERSION И GRAPH_HASH ЛЕЖАТ ВНУТРИ ТЕЛА �
     # то, что они вообще работают.
     $verifySrc = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\verify.ps1')
 
-    Assert-True $verifySrc.Contains('$FactoryVersion = Get-BcfFactoryVersion') `
-        'версия фабрики не считывается Get-BcfFactoryVersion'
-    Assert-True $verifySrc.Contains('$GraphHash = Get-BcfFileHash -Path $env:BCF_GRAPH_FILE') `
-        'хэш файла графа не считывается Get-BcfFileHash по BCF_GRAPH_FILE'
+    # Обе строки считает одна функция на всю обвязку (Get-BcfProvenanceLines): её же зовут
+    # run-all.ps1 и отчёт прогона. Второе вычисление в verify.ps1 клало в вердикт две пары
+    # строк об одном и том же, и они разошлись бы при первой правке одной из них.
+    Assert-True $verifySrc.Contains('$provenance = (Get-BcfProvenanceLines)') `
+        'провенанс не считывается Get-BcfProvenanceLines'
 
     $bodyIdx = $verifySrc.IndexOf('$verdictBody = @"')
     Assert-True ($bodyIdx -ge 0) 'не нашёл объявление $verdictBody — конструкция изменилась, поправь тест'
@@ -665,17 +666,17 @@ It 'VERIFY.PS1: FACTORY_VERSION И GRAPH_HASH ЛЕЖАТ ВНУТРИ ТЕЛА �
     Assert-True ($closeIdx -gt $bodyIdx) 'не нашёл закрытие here-string тела вердикта'
     $body = $verifySrc.Substring($bodyIdx, $closeIdx - $bodyIdx)
 
-    Assert-True $body.Contains('factory_version: $FactoryVersion') 'factory_version: не внутри тела вердикта ($verdictBody)'
-    Assert-True $body.Contains('graph_hash: $GraphHashLine') 'graph_hash: не внутри тела вердикта ($verdictBody)'
+    Assert-True $body.Contains('$provenance') 'строк провенанса нет внутри тела вердикта ($verdictBody)'
+    Assert-Eq (([regex]::Matches($verifySrc, 'factory_version: \$')).Count) 0 `
+        'factory_version: печатается ещё и вторым местом — в вердикте будут две строки об одном'
+    Assert-Eq (([regex]::Matches($verifySrc, 'graph_hash: \$')).Count) 0 `
+        'graph_hash: печатается ещё и вторым местом — в вердикте будут две строки об одном'
 
     # Присвоение обязано стоять РАНЬШЕ объявления $verdictBody — иначе тело вердикта
     # увидит переменную ещё не проставленной (обращение к необъявленной/пустой $null).
-    $assignIdx = $verifySrc.IndexOf('$FactoryVersion = Get-BcfFactoryVersion')
+    $assignIdx = $verifySrc.IndexOf('$provenance = (Get-BcfProvenanceLines)')
     Assert-True ($assignIdx -ge 0 -and $bodyIdx -gt $assignIdx) `
-        '$FactoryVersion присваивается ПОСЛЕ объявления $verdictBody — вердикт получит незаполненное значение'
-    $hashLineAssignIdx = $verifySrc.IndexOf('$GraphHashLine = if ($GraphHash)')
-    Assert-True ($hashLineAssignIdx -ge 0 -and $bodyIdx -gt $hashLineAssignIdx) `
-        '$GraphHashLine присваивается ПОСЛЕ объявления $verdictBody — вердикт получит незаполненное значение'
+        '$provenance присваивается ПОСЛЕ объявления $verdictBody — вердикт получит незаполненное значение'
 
     # Место записи ровно одно (Set-Content ... -Value $verdictBody) — если появится второе,
     # эта проверка тела перестаёт быть доказательством того, что реально едет в файл.

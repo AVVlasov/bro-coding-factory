@@ -71,11 +71,10 @@ $env:BCF_HARNESS_ROOT = Get-BcfHarnessRoot
 # Версия фабрики и хэш файла графа — печатаются в КАЖДЫЙ вердикт (factory_version:,
 # graph_hash:), чтобы разбор дефекта видел, каким движком и по какому графу задача была
 # проверена, не поднимая журнал прогона (он живёт в .bcf/ и не переживает уборку
-# состояния — коммит с вердиктом переживает). graph_hash пуст для прогонов вне графа
-# (`bcf run loop`/`night`): гейт применялся не к файлу графа, а к линейному циклу.
-$FactoryVersion = Get-BcfFactoryVersion
-$GraphHash = Get-BcfFileHash -Path $env:BCF_GRAPH_FILE
-$GraphHashLine = if ($GraphHash) { $GraphHash } else { '-' }
+# состояния — коммит с вердиктом переживает). Для прогонов вне графа (`bcf run
+# loop`/`night`) graph_hash так и говорит: гейт применялся не к файлу графа, а к циклу.
+# Считает обе строки одна функция на всю обвязку — Get-BcfProvenanceLines ниже, там же,
+# где собирается тело вердикта; её же зовут run-all.ps1 и отчёт прогона.
 if (-not $env:BCF_PROJECT_ROOT) { $env:BCF_PROJECT_ROOT = $root }
 
 # --- Harness config (config/harness.json + config/agents.json) — источник специфики. ---
@@ -1240,15 +1239,19 @@ if ([string]::IsNullOrWhiteSpace($testerLines)) { $testerLines = "  (тесте�
 $evidence = Collect-Evidence -Repo $root -TaskFiles $taskFiles -VerifyWorkDir $workDir
 $evidenceMd = Format-EvidenceMd -Evidence $evidence
 
+# Чем получен этот вердикт: версия фабрики и хэш файла графа, если задача шла графом.
+# Без этих двух строк разбор чужого вердикта начинается с вопроса «на чём это гонялось»,
+# и ответа нет ни в одном файле прогона.
+$provenance = (Get-BcfProvenanceLines) -join "`n"
+
 $verdictBody = @"
 # Verdict — $Task
 verdict: $verdict
 date: $today
+$provenance
 diff_fingerprint: $fp
 diff_base: $diffBase$(if ($explicitBase) { ' (задана человеком: приёмка уже приземлившейся работы)' })
 verified_by: harness/verify.ps1 — Фазы C-E (всё через opencode; кодинг/тестеры/судья — $Model, vision — $VisionModel, судья — $JudgeModel)
-factory_version: $FactoryVersion
-graph_hash: $GraphHashLine
 plan:
   testers: $($testers -join ', ')
   checks: $checksLine
