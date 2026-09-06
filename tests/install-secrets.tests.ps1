@@ -796,6 +796,95 @@ Check 'docs/ARCHITECTURE.md: слово написано целиком кири
 Check 'docs/CONFIG.md: слово написано целиком кириллицей' ($cfgTxt -match 'дифф')
 
 # ---------------------------------------------------------------------------
+Section '25. secret-scan.sh (Claude Code): --no-verify/-n и -c core.hooksPath=<чужой> денаятся сразу — единственная точка, где это вообще видно'
+# ---------------------------------------------------------------------------
+# Ревью нашло: `--no-verify`/`-n` не дают git вообще ВЫЗВАТЬ `.githooks/pre-commit`, а
+# `-c core.hooksPath=<чужой>` подменяет систему хуков на время команды — git-хук в
+# принципе не может поймать свой собственный обход. Единственная точка, где это видно —
+# ЗДЕСЬ, ДО того, как git вообще запустится: секции ниже проверяют, что wrapper денаит
+# по присутствию флага в учитывающей кавычки токенизации (shlex), а не угадывает индекс.
+# Мутация проверена вручную перед сдачей: с закомментированной веткой `if bypass:` в
+# secret-scan.sh все три формы ниже перестают денаить (`--no-verify` реально уезжает в
+# HEAD на этой же фикстуре) — восстановлено сразу после проверки, в дифф не входит.
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+foreach ($form in @(
+    @{ Label = 'git commit --no-verify -am wip';              Cmd = 'git commit --no-verify -am wip';                      Expect = '--no-verify' }
+    @{ Label = 'git add X && git commit -n -m secret';        Cmd = 'git add newsecret.txt && git commit -n -m secret';    Expect = 'флаг -n' }
+    @{ Label = 'git -c core.hooksPath=... commit -am bypass'; Cmd = 'git -c core.hooksPath=/nonexistent commit -am bypass'; Expect = 'core.hooksPath' }
+)) {
+    $r = Invoke-ClaudeHookWrapper -ProjectDir $p -Command $form.Cmd
+    Check "$($form.Label): secret-scan.sh денаит (обошла бы .githooks/pre-commit целиком)" (
+        $r.Code -eq 2 -and $r.Out -match '"permissionDecision"\s*:\s*"deny"'
+    ) "код $($r.Code): $($r.Out)"
+    Check "$($form.Label): причина называет обход" ($r.Out -match [regex]::Escape($form.Expect)) $r.Out
+}
+
+# Негативный случай: текст сообщения коммита СОДЕРЖИТ подстроку "--no-verify" внутри
+# кавычек -m — это значение сообщения, не отдельный флаг, и не должно денаить. Регрессия
+# старого механизма (M-05, ревью 5): именно так когда-то ловился текст «-a» в сообщении.
+Set-Content -LiteralPath (Join-Path $p 'doc.md') -Value 'обычный документ' -Encoding UTF8
+& $gitExe -C $p add doc.md 2>&1 | Out-Null
+$r25neg = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m "отказ от --no-verify" doc.md'
+Check 'текст «--no-verify» внутри -m не даёт ложного deny' (-not $r25neg.Out.Trim()) $r25neg.Out
+Check 'код возврата 0 на негативном случае' ($r25neg.Code -eq 0) "код $($r25neg.Code): $($r25neg.Out)"
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Контроль на НАСТОЯЩЕМ git: --no-verify — поведение самого git (хуки не вызываются
+# вообще), не дефект этого проекта; git-хук `.githooks/pre-commit` в принципе не может
+# перехватить собственный обход. Задокументированная остаточная граница (docs/SETUP.md):
+# secret-scan.sh видит только команды, которые выполняет сам Claude Code, а не всё, что
+# человек наберёт в своём терминале мимо него.
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r25real = Invoke-RealCommit -ProjectDir $p -Command 'git commit --no-verify -am bypass'
+Check 'контроль: настоящий git commit --no-verify пропускает секрет мимо git-хука (задокументированная граница, не наш дефект)' (
+    $r25real.Code -eq 0
+) $r25real.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
+Section '26. secret-scan.sh (Claude Code): обещание "не проверяет pathspec" реализовано в коде, не только в комментарии'
+# ---------------------------------------------------------------------------
+# Ревью нашло: `git commit -m docs -- doc.md` при секрете, застейдженном в ДРУГОМ файле
+# (вне pathspec), wrapper денаил, хотя настоящий git ту же команду коммитит зелёным —
+# git подставляет хуку временный индекс, ограниченный pathspec (см. заголовок
+# secret-scan.sh). Мутация проверена вручную: с закомментированной строкой
+# `print("COMPLEX")` ложный deny из этого раздела возвращается на той же фикстуре —
+# восстановлено сразу после проверки, в дифф не входит.
+Set-Content -LiteralPath (Join-Path $p 'secret.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add secret.txt 2>&1 | Out-Null
+Set-Content -LiteralPath (Join-Path $p 'doc.md') -Value 'обычный документ' -Encoding UTF8
+& $gitExe -C $p add doc.md 2>&1 | Out-Null
+$r26a = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m docs -- doc.md'
+Check 'pathspec мимо застейдженного (в другом файле) секрета: wrapper молчит (не ложный deny)' (
+    $r26a.Code -eq 0 -and -not $r26a.Out.Trim()
+) "код $($r26a.Code): $($r26a.Out)"
+$r26aReal = Invoke-RealCommit -ProjectDir $p -Command 'git commit -m docs -- doc.md'
+Check 'контроль: настоящий git commit с тем же pathspec проходит зелёным (doc.md чист)' ($r26aReal.Code -eq 0) $r26aReal.Out
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Регресс-контроль: если pathspec указывает НА САМ секретный файл, wrapper теперь молчит
+# (сужен до простого случая) — ловит `.githooks/pre-commit` на настоящем commit (раздел 11
+# это уже покрывает через реальный git commit).
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+$r26b = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m wip creds.txt'
+Check 'pathspec на сам секретный файл: wrapper молчит, а не угадывает (ловит .githooks/pre-commit, см. раздел 11)' (
+    $r26b.Code -eq 0 -and -not $r26b.Out.Trim()
+) "код $($r26b.Code): $($r26b.Out)"
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# Регресс-контроль: простой случай (без -a/-am/pathspec) по-прежнему ловится РАНО — сужение
+# до "простого случая" не выключило основной сценарий раздела 19.
+Set-Content -LiteralPath (Join-Path $p 'creds.txt') -Value "aws_key = `"$fakeAwsKey`"" -Encoding UTF8
+& $gitExe -C $p add creds.txt 2>&1 | Out-Null
+$r26c = Invoke-ClaudeHookWrapper -ProjectDir $p -Command 'git commit -m note'
+Check 'простой случай (без -a/pathspec) по-прежнему ловится рано (регресс не внесён)' (
+    $r26c.Code -eq 2 -and $r26c.Out -match 'creds\.txt:1'
+) "код $($r26c.Code): $($r26c.Out)"
+& $gitExe -C $p restore --staged creds.txt 2>&1 | Out-Null
+Reset-Fixture -ProjectDir $p -Sha $cleanSha
+
+# ---------------------------------------------------------------------------
 Restore-TestEnv
 Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue
 
