@@ -458,13 +458,35 @@ if ($taskFiles.Count -gt 0) {
   else {
     $diffFull = (git diff HEAD -- $taskFiles 2>$null | Out-String)
     if ([string]::IsNullOrWhiteSpace($diffFull)) {
-      # diff против HEAD пуст — работа уже закоммичена (раннер не коммитит по задачам,
-      # значит весь v5-коммит). Берём базой HEAD~1: покажет, что последний коммит
-      # (+ незакоммиченное) сделал с файлами задачи. Без этого тестеры и судья
-      # верифицируют против пустоты.
-      $diffBase = 'HEAD~1'
-      $diffFull = (git diff HEAD~1 -- $taskFiles 2>$null | Out-String)
-      Log "diff против HEAD пуст (работа закоммичена) — база дифа переключена на HEAD~1."
+      # diff против HEAD пуст — работа уже закоммичена. Сначала пробуем точку расхождения
+      # с веткой интеграции (integration.branch, по умолчанию main): в ветке задачи может
+      # лежать несколько коммитов (работа агента, слияние main, служебные правки), и HEAD~1
+      # тогда указывает не на работу, а на служебный коммит. Живой случай 2026-09-09,
+      # eye-of-god TASK-05: работа в 0a7329c, сверху merge main и снятый вердикт, HEAD~1
+      # дал пустой диф и FAIL «задача не изменила ни строки» при готовой ветке.
+      $intBranch = 'main'
+      if ($Cfg -and $Cfg.integration -and $Cfg.integration.branch -and "$($Cfg.integration.branch)".Trim()) {
+        $intBranch = "$($Cfg.integration.branch)".Trim()
+      }
+      $mergeBase = ''
+      git rev-parse --verify --quiet "$intBranch^{commit}" *> $null
+      if ($LASTEXITCODE -eq 0) {
+        $mergeBase = (git merge-base HEAD $intBranch 2>$null | Out-String).Trim()
+        $headSha = (git rev-parse HEAD 2>$null | Out-String).Trim()
+        if ($mergeBase -and $mergeBase -eq $headSha) { $mergeBase = '' }
+      }
+      if ($mergeBase) {
+        $diffBase = $mergeBase
+        $diffFull = (git diff $mergeBase -- $taskFiles 2>$null | Out-String)
+        Log "diff против HEAD пуст (работа закоммичена) — база дифа: точка расхождения с $intBranch ($($mergeBase.Substring(0,8)))."
+      }
+      if ([string]::IsNullOrWhiteSpace($diffFull)) {
+        # Ветка не расходится с интеграционной (или расхождение не трогает файлы задачи):
+        # показываем, что сделал последний коммит (+ незакоммиченное).
+        $diffBase = 'HEAD~1'
+        $diffFull = (git diff HEAD~1 -- $taskFiles 2>$null | Out-String)
+        Log "diff против HEAD пуст (работа закоммичена) — база дифа переключена на HEAD~1."
+      }
     }
   }
   $diffStat = (git diff --stat $diffBase -- $taskFiles 2>$null | Out-String)
