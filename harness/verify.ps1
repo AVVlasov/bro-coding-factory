@@ -537,8 +537,21 @@ if ($emptyDiff) {
 # гейт выключает: объём не объявлен, мерить не с чем (и об этом сказано выше).
 $scopeViolations = @()
 if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
+  # База объёма: точка расхождения с веткой интеграции, если она есть. Против HEAD ветки
+  # задачи откат чужого файла к состоянию main выглядел бы правкой вне объёма (живой случай
+  # 2026-09-09 10:17: одиннадцать тестов, возвращённых к main, попали в нарушения).
+  $scopeBase = $diffBase
+  $intBranchScope = 'main'
+  if ($Cfg -and $Cfg.integration -and $Cfg.integration.branch -and "$($Cfg.integration.branch)".Trim()) {
+    $intBranchScope = "$($Cfg.integration.branch)".Trim()
+  }
+  git rev-parse --verify --quiet "$intBranchScope^{commit}" *> $null
+  if ($LASTEXITCODE -eq 0) {
+    $mbScope = (git merge-base HEAD $intBranchScope 2>$null | Out-String).Trim()
+    if ($mbScope) { $scopeBase = $mbScope }
+  }
   $changedAll = @()
-  $changedAll += @(git diff --name-only $diffBase 2>$null | Where-Object { $_ -and $_.Trim() })
+  $changedAll += @(git diff --name-only $scopeBase 2>$null | Where-Object { $_ -and $_.Trim() })
   $changedAll += @(git ls-files --others --exclude-standard 2>$null | Where-Object { $_ -and $_.Trim() })
   $changedAll = @($changedAll | ForEach-Object { $_.Trim().Replace('\', '/') } | Select-Object -Unique)
   $generated = @()
