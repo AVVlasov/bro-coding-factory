@@ -2137,6 +2137,32 @@ It 'ярус задачи читается из шапки, роли и кома
     Assert-True ((Get-BcfBackendInvocation -Cfg $cfg -Backend 'opencode').Format -eq 'opencode') 'opencode без записи в graph.backends должен получить команду по умолчанию'
 }
 
+It 'слоты яруса: лимит держится по живым pid, мёртвый слот отпускается' {
+    . (Join-Path $root 'harness\lib\tiers.ps1')
+    $env:BCF_FLEET_DIR = Join-Path $sandboxRoot 'fleet-tiers'
+    try {
+        $cfg = [pscustomobject]@{ tiers = [pscustomobject]@{ 'сложная' = [pscustomobject]@{ concurrency = 2 } } }
+        Assert-True ((Get-BcfTierLimit -Cfg $cfg -Tier 'сложная') -eq 2) 'лимит яруса не прочитан'
+        Assert-True ((Get-BcfTierLimit -Cfg $cfg -Tier 'лёгкая') -eq 0) 'ярус без лимита должен давать 0'
+        $s1 = Enter-BcfTierSlot -Tier 'сложная' -Limit 2 -OwnerPid $PID
+        Assert-True ([bool]$s1 -and (Test-Path $s1)) 'первый слот не занят'
+        # Мёртвый pid: слот считается свободным и убирается.
+        $dir = Get-BcfTierSlotDir -Tier 'сложная'
+        Set-Content -LiteralPath (Join-Path $dir '999999.slot') -Value '999999' -Encoding UTF8
+        $alive = @(Get-BcfTierSlotsAlive -Tier 'сложная')
+        Assert-True ($alive.Count -eq 1) "живых слотов должно быть 1, а не $($alive.Count)"
+        Assert-True (-not (Test-Path (Join-Path $dir '999999.slot'))) 'мёртвый слот не убран'
+        # Повторный вход тем же pid возвращает тот же слот, а не второй.
+        $again = Enter-BcfTierSlot -Tier 'сложная' -Limit 2 -OwnerPid $PID
+        Assert-True ($again -eq $s1) 'повторный вход выдал второй слот'
+        # Лимит 1 при занятом слоте: ждать не будем, MaxWaitSec 0 даёт пустой ответ.
+        $other = Enter-BcfTierSlot -Tier 'сложная' -Limit 1 -OwnerPid ($PID + 1) -MaxWaitSec 0
+        Assert-True (-not $other) 'при занятом лимите слот выдан лишнему'
+        Exit-BcfTierSlot -SlotFile $s1
+        Assert-True (-not (Test-Path $s1)) 'слот не отпущен'
+    } finally { Remove-Item Env:\BCF_FLEET_DIR -ErrorAction SilentlyContinue }
+}
+
 It 'разбор потока claude даёт активность по tool_use и итог с токенами' {
     . (Join-Path $root 'harness\lib\adapters\claude-render.ps1')
     $ev = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/a.ts"}}]}}' | ConvertFrom-Json

@@ -51,6 +51,71 @@ function Resolve-BcfTier {
     return [pscustomobject]$out
 }
 
+# Слоты яруса: сколько задач яруса идут одновременно (tiers.<ярус>.concurrency). Слот это
+# файл <pid>.slot в каталоге установки фабрики (общий для всех worktree проекта), живость
+# по pid; без лимита в конфиге слот не нужен. Постановка владельца 2026-09-09: «у opus
+# пять параллельных запусков», при одной qwen и одном GPU.
+function Get-BcfTierSlotDir {
+    param([Parameter(Mandatory)][string]$Tier)
+    $base = if ($env:BCF_FLEET_DIR) { $env:BCF_FLEET_DIR.TrimEnd('\', '/') } else { Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) '.bcf\fleet' }
+    $safe = ($Tier -replace '[^\p{L}\p{Nd}_-]', '_')
+    return (Join-Path $base "tiers\$safe")
+}
+
+function Get-BcfTierLimit {
+    param($Cfg, [string]$Tier)
+    if (-not $Tier -or -not $Cfg -or -not $Cfg.PSObject.Properties['tiers'] -or -not $Cfg.tiers) { return 0 }
+    $p = $Cfg.tiers.PSObject.Properties[$Tier]
+    if (-not $p -or -not $p.Value -or -not $p.Value.PSObject.Properties['concurrency']) { return 0 }
+    return [int]$p.Value.concurrency
+}
+
+function Get-BcfTierSlotsAlive {
+    param([Parameter(Mandatory)][string]$Tier)
+    $dir = Get-BcfTierSlotDir -Tier $Tier
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $alive = @()
+    foreach ($f in Get-ChildItem -LiteralPath $dir -Filter '*.slot' -File -ErrorAction SilentlyContinue) {
+        $pid_ = 0
+        if ($f.BaseName -match '^\d+$') { $pid_ = [int]$f.BaseName }
+        $ok = $false
+        if ($pid_ -gt 0) { try { $null = Get-Process -Id $pid_ -ErrorAction Stop; $ok = $true } catch { $ok = $false } }
+        if ($ok) { $alive += $f.FullName } else { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    return $alive
+}
+
+# Ждёт свободный слот яруса и занимает его файлом с pid. Возвращает путь файла слота или ''
+# (лимита нет). $OnWait зовётся раз в $LogEverySec с текстом ожидания.
+function Enter-BcfTierSlot {
+    param([Parameter(Mandatory)][string]$Tier, [int]$Limit, [int]$OwnerPid = $PID, [int]$MaxWaitSec = 43200, [int]$LogEverySec = 60, [scriptblock]$OnWait = $null)
+    if ($Limit -le 0) { return '' }
+    $dir = Get-BcfTierSlotDir -Tier $Tier
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $mine = Join-Path $dir "$OwnerPid.slot"
+    $waited = 0; $nextLog = 0
+    while ($true) {
+        $alive = @(Get-BcfTierSlotsAlive -Tier $Tier)
+        if ($alive -contains $mine) { return $mine }
+        if ($alive.Count -lt $Limit) {
+            Set-Content -LiteralPath $mine -Value "$OwnerPid $(Get-Date -Format o)" -Encoding UTF8
+            # Гонка двух стартов: перечитываем и уступаем, если нас стало больше лимита и мы младше.
+            $after = @(Get-BcfTierSlotsAlive -Tier $Tier | Sort-Object { (Get-Item $_).CreationTimeUtc })
+            if ($after.Count -le $Limit -or ($after | Select-Object -First $Limit) -contains $mine) { return $mine }
+            Remove-Item -LiteralPath $mine -Force -ErrorAction SilentlyContinue
+        }
+        if ($waited -ge $MaxWaitSec) { return '' }
+        if ($OnWait -and $waited -ge $nextLog) { & $OnWait "ярус «$Tier»: занято $($alive.Count) из $Limit, жду слот ($waited с)"; $nextLog = $waited + $LogEverySec }
+        Start-Sleep -Seconds 10
+        $waited += 10
+    }
+}
+
+function Exit-BcfTierSlot {
+    param([string]$SlotFile)
+    if ($SlotFile -and (Test-Path -LiteralPath $SlotFile)) { Remove-Item -LiteralPath $SlotFile -Force -ErrorAction SilentlyContinue }
+}
+
 # Команда бэкенда и его переменные окружения, как их собирает граф (graph-runtime.ps1):
 # значение берётся из процесса, затем из User и Machine, потому что CLAUDE_CODE_OAUTH_TOKEN
 # лежит в пользовательском окружении и в дочерний pwsh сам не приходит.

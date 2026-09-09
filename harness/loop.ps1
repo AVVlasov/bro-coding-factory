@@ -648,6 +648,17 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
     elseif ($tierInfo.Profile -and $tierInfo.Profile -ne 'local' -and -not (Test-Path (Join-Path $root '.bcf\PROMPT.md'))) { $iterPrompt = Join-Path $PSScriptRoot 'PROMPT.md' }
     if ($i -eq 1) { Log "Ярус «$tierName»: исполнитель $($tierInfo.Worker.Backend)/$iterModel, формат $iterFormat, промпт $(Split-Path $iterPrompt -Leaf)" }
   }
+  # Слот яруса: не больше tiers.<ярус>.concurrency задач яруса одновременно на машине.
+  # Берётся один раз на цикл и держится до конца; ожидание пишется в журнал, чтобы граф
+  # не принял тишину за зависший узел.
+  if ($tierName -and -not $script:tierSlotFile) {
+    $tierLimit = Get-BcfTierLimit -Cfg $Cfg -Tier $tierName
+    if ($tierLimit -gt 0) {
+      $script:tierSlotFile = Enter-BcfTierSlot -Tier $tierName -Limit $tierLimit -OnWait { param($m) Log $m }
+      if ($script:tierSlotFile) { Log "Ярус «$tierName»: слот занят ($(@(Get-BcfTierSlotsAlive -Tier $tierName).Count) из $tierLimit)" }
+      else { Log "Ярус «$tierName»: слот не дождался, иду без него" }
+    }
+  }
   if ($iterModel) { $resolvedAgentCmd = $iterAgentTpl -replace '\{model\}', $iterModel }
   else            { $resolvedAgentCmd = (($iterAgentTpl -replace '--model\s+\{model\}', '') -replace '\{model\}', '').Trim() -replace '\s{2,}', ' ' }
   # claude -p читает промпт со stdin: позиционный аргумент упёрся бы в лимит командной
@@ -1644,4 +1655,5 @@ try {
   }
 } catch { Log "[memory ingest] предупреждение: $($_.Exception.Message)" }
 
+if ($script:tierSlotFile) { Exit-BcfTierSlot -SlotFile $script:tierSlotFile; $script:tierSlotFile = '' }
 Log "=== Ralph loop завершён ==="
