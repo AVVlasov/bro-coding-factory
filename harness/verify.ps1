@@ -1455,6 +1455,25 @@ Set-Content -LiteralPath $verdictFile -Value $verdictBody -Encoding UTF8
 # экране всё выглядело нормально.
 if (Test-Path $verdictFile) {
   Log "Вердикт записан: $verdictFile → $verdict"
+  # Приёмка судьёй яруса. Правило владельца 2026-09-09 («судит результат работы sonnet опус,
+  # qwen судит sonnet»), включено владельцем явно 2026-09-09 23:50 («да, включай автоприёмку
+  # по вердикту судьи яруса»). Условие: PASS гейтов и PASS судьи яруса на бэкенде claude.
+  # Файл tasks/.acceptance/<ID>.md пишется от имени судьи яруса, гейт слияния его принимает.
+  # Ярус с внешним судьёй (meta, fable) приёмку получает от мета-слоя после его разбора.
+  if ($verdict -eq 'PASS' -and $tierJudgeAccepts -and $judgeVerdict -eq 'PASS') {
+    try {
+      if (-not (Get-Command ConvertTo-BcfAcceptanceText -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lib\claims.ps1') }
+      $accSha = (& git -C $root hash-object -- $verdictFile 2>$null | Out-String).Trim()
+      if (-not $accSha) { $accSha = 'нет-git' }
+      $accLeader = "судья яруса «$judgeTierName» ($JudgeModel)"
+      $accBody = ConvertTo-BcfAcceptanceText -TaskId $Task -Leader $accLeader -Lens '' -Note 'приёмка по вердикту судьи яруса (правило владельца 2026-09-09)' -VerdictSha $accSha -When (Get-Date -Format 'o')
+      $accDir = Get-BcfAcceptanceDir -Root $root
+      New-Item -ItemType Directory -Force -Path $accDir | Out-Null
+      $accPath = Join-Path $accDir "$Task.md"
+      Set-Content -LiteralPath $accPath -Value $accBody -Encoding UTF8
+      Log "Приёмка судьёй яруса записана: $accPath ($accLeader)"
+    } catch { Log "Приёмка судьёй яруса не записана: $($_.Exception.Message)" }
+  }
 } else {
   Log "ОШИБКА: вердикт НЕ записан ($verdictFile) — цикл не увидит результат верификации и будет считать, что её не было."
 }

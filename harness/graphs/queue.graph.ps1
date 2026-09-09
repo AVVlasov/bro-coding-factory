@@ -355,6 +355,20 @@ while ($true) {
                 if (-not $pv.Ok) { Write-GraphLog "$task — вердикт FAIL не опубликован: $($pv.Reason)" }
             }
 
+            # Приёмка судьёй яруса (verify.ps1 пишет tasks/.acceptance/<task>.md в worktree по
+            # правилу владельца 2026-09-09) переносится в основное дерево до слияния: гейт
+            # приёмки читает основное дерево, а не worktree.
+            if ($isPass) {
+                $wtAcc = Join-Path (Split-Path (Split-Path $vf -Parent) -Parent) ".acceptance\$task.md"
+                $rootAcc = Join-Path $root "tasks\.acceptance\$task.md"
+                if ((Test-Path $wtAcc) -and -not (Test-Path $rootAcc)) {
+                    $pa = Publish-TaskVerdict -Root $root -Task $task -VerdictFile $wtAcc -RelDir 'tasks/.acceptance' `
+                              -RunId (Get-GraphRunId) -Role 'judge' -Model (Get-GraphVar codeModel) -Backend (Get-GraphVar codeBackend)
+                    if ($pa.Ok) { Write-GraphLog "$task — приёмка судьи яруса перенесена в основное дерево" }
+                    else { Write-GraphLog "$task — приёмка судьи яруса не перенесена: $($pa.Reason)" }
+                }
+            }
+
             # Диагностика расщеплённого прогона. Если вердикта в worktree нет, а в
             # основном дереве он есть и он PASS — значит цикл считал своим корнем не то
             # дерево, и «не достиг PASS» будет ЛОЖЬЮ: задача отработала. Молчаливая
