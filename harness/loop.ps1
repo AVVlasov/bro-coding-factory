@@ -138,8 +138,14 @@ $sprawlForced    = $false
 $SprawlFileLimit = 40   # >40 файлов в HEAD-диффе (без .bcf/)
 $SprawlIterLimit = 5    # и >5 итераций без PASS
 
+# Профиль цикла: `local` берёт короткий промпт PROMPT.local.md (локальная модель, малый
+# контекст, один шаг за итерацию), иначе полный PROMPT.md. Источник: env BCF_PROFILE,
+# затем config/harness.json → profile. Файл проекта .bcf/PROMPT.md перекрывает оба.
+$profile = if ($env:BCF_PROFILE) { [string]$env:BCF_PROFILE } elseif ($Cfg -and $Cfg.PSObject.Properties['profile'] -and $Cfg.profile) { [string]$Cfg.profile } else { '' }
 $promptFile = Join-Path $root ".bcf\PROMPT.md"
-if (-not (Test-Path $promptFile)) { $promptFile = Join-Path $PSScriptRoot "PROMPT.md" }
+if (-not (Test-Path $promptFile)) {
+  $promptFile = if ($profile -eq 'local') { Join-Path $PSScriptRoot "PROMPT.local.md" } else { Join-Path $PSScriptRoot "PROMPT.md" }
+}
 $stateFile  = Join-Path $root ".bcf\STATE.md"
 $logFile    = Join-Path $root ".bcf\loop.log"
 $stopFile   = Join-Path $root ".bcf\STOP"
@@ -428,6 +434,7 @@ Get-ChildItem env: | Where-Object { $_.Name -like 'OPENCODE_*' } | ForEach-Objec
 if ($ocEnvCleared.Count -gt 0) { Log "Очищены унаследованные env-переменные: $($ocEnvCleared -join ', ')" }
 
 Log "=== Ralph loop старт. Task=$(if($Task){$Task}else{'(из CURRENT-FOCUS)'}) Model=$(if($Model){$Model}else{'(дефолт бэкенда)'}) Max=$MaxIterations Timeout=${IterTimeoutSec}s NoProgress=$NoProgressLimit ==="
+Log "Профиль: $(if ($profile) { $profile } else { 'полный' }); промпт: $promptFile ($((Get-Item -LiteralPath $promptFile).Length) байт)"
 Append-Event -EventType 'loop-started' -TaskId $Task -Phase 'loop' `
   -Payload @{ max_iterations = $MaxIterations; iter_timeout_sec = $IterTimeoutSec; no_progress_limit = $NoProgressLimit; model = $Model; session_id = (Get-EventBusSession) }
 
@@ -1354,7 +1361,7 @@ $culprit
           if (($sameFailSetCount + 1) -ge $FailSetStall) {
             $consec = $sameFailSetCount + 1
             Log "FAILING-SET STALL: один и тот же набор падающих тестов $consec verify подряд → гейт не сходится. Set: $failSig"
-            Set-Content $stateFile "# Ralph STATE`n`n## Итерация $i — FAILING-SET STALL`n`nОдин и тот же набор тестов падает $consec verify-итераций подряд, хотя код менялся:`n$failSig`n`nВероятно НЕВЫПОЛНИМЫЙ/флаки-гейт или проблема ТЕСТ-ИНФРЫ: проверь таймауты фикстур vs реальные времена интеграций (mock мгновенен, реальный сервис — нет), порядок/порт-контеншн, корректность предусловий. Нужно ревью человека/Глаза бога, а не дальнейший грайнд." -Encoding UTF8
+            Set-Content $stateFile "# Ralph STATE`n`n## Итерация $i — FAILING-SET STALL`n`nОдин и тот же набор тестов падает $consec verify-итераций подряд, хотя код менялся:`n$failSig`n`nВероятно НЕВЫПОЛНИМЫЙ/флаки-гейт или проблема ТЕСТ-ИНФРЫ: проверь таймауты фикстур vs реальные времена интеграций (mock мгновенен, реальный сервис — нет), порядок/порт-контеншн, корректность предусловий. Нужно ревью человека или мета-слоя, а не дальнейший грайнд." -Encoding UTF8
             Append-Event -EventType 'loop-paused' -TaskId $focus -Phase 'loop' -Iteration $i `
               -Payload @{ reason = 'failing-set-stall'; fail_set = $failSig; consecutive = $consec }
             Notify-Stop 'warn' "${focus}: гейт не сходится (failing-set stall)" "Один и тот же набор тестов падает $consec verify подряд, хотя агент менял код. Вероятно невыполнимый/флаки-гейт или проблема тест-инфры (таймауты фикстур vs реальные времена, mock↔real, порт-контеншн). Нужно ревью, не грайнд."

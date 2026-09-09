@@ -2025,6 +2025,27 @@ It 'models sync пишет opencode.json с лимитами моделей LM S
     Assert-True ($n.limit.context -eq 262144) "лимит модели роли с OpenRouter не записан: $($n.limit.context)"
 }
 
+# Локальный профиль: промпт обязан быть коротким и без ритуалов полного цикла, иначе
+# смысл профиля теряется молча (промпт разрастается правками, никто не меряет).
+It 'PROMPT.local.md короткий, без plan.json и без скриптов памяти, с VERIFY-REQUEST' {
+    $f = Join-Path $root 'harness\PROMPT.local.md'
+    $t = Get-Content -Raw -LiteralPath $f
+    Assert-True ($t.Length -le 4500) "промпт локального профиля разросся: $($t.Length) знаков (потолок 4500)"
+    Assert-Match $t 'VERIFY-REQUEST' 'нет запроса верификации'
+    Assert-NoMatch $t 'plan\.json|contract\.json' 'в локальном промпте ритуалы плана и контракта'
+    Assert-NoMatch $t 'memory/history' 'ссылка на несуществующий скрипт памяти'
+    $full = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\PROMPT.md')
+    Assert-NoMatch $full 'python memory/history/ask\.py' 'полный промпт зовёт несуществующий скрипт памяти'
+}
+
+It 'loop.ps1 выбирает PROMPT.local.md по профилю local' {
+    $t = Get-Content -Raw -LiteralPath (Join-Path $root 'harness\loop.ps1')
+    Assert-Match $t 'BCF_PROFILE' 'цикл не читает переменную профиля'
+    Assert-Match $t 'PROMPT\.local\.md' 'цикл не знает локальный промпт'
+    $r = Get-Content -Raw -LiteralPath (Join-Path $root 'src\commands\run.ps1')
+    Assert-Match $r "'\^--profile\$'" 'bcf run не разбирает --profile'
+}
+
 It 'models list без LM Studio показывает ярусы и не падает' {
     $p = New-Sandbox 'models-list'
     $env:BCF_LMSTUDIO_URL = 'http://127.0.0.1:9'

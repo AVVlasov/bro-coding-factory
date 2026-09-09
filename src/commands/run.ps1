@@ -75,6 +75,9 @@ for ($i = 0; $i -lt $script:BcfArgs.Count; $i++) {
         '^--concurrency$'    { $conc = Get-BcfFlagNumber -Flag '--concurrency' -Index ($i + 1) -T ([int]); break }
         '^--resume$'         { $resume = Get-BcfFlagValue -Flag '--resume' -Index ($i + 1); break }
         '^--max-iterations$' { $maxIter = Get-BcfFlagNumber -Flag '--max-iterations' -Index ($i + 1) -T ([int]); break }
+        # --profile local: короткий промпт цикла для локальной модели (harness/PROMPT.local.md).
+        # Уходит в движок переменной окружения, чтобы не менять сигнатуры loop.ps1 и run-all.ps1.
+        '^--profile$'        { $env:BCF_PROFILE = Get-BcfFlagValue -Flag '--profile' -Index ($i + 1); $i++; break }
         '^-'                 { $passthru += $a; break }
         default {
             if (-not $mode) { $mode = $a } elseif (-not $task) { $task = $a } else { $passthru += $a }
