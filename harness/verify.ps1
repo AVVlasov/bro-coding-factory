@@ -429,6 +429,18 @@ if ($mFiles.Success) {
   }
   $taskFiles = @($taskFiles | Select-Object -Unique)
 }
+# Объём задачи для гейта «правки только в своих файлах»: все пути из секции «Файлы», включая
+# ещё не созданные (помечены «(новый)»), и каталоги, записанные как `dir/` или `dir/*`.
+# Живой случай 2026-09-09, eye-of-god TASK-05: агент сверх задачи переписал импорты в
+# двадцати файлах ядра и tsconfig, гейты были зелёные, вердикт PASS, владелец не принял.
+$taskScopeFiles = @()
+$taskScopeDirs  = @()
+if ($mFiles.Success) {
+  foreach ($pm in [regex]::Matches($mFiles.Value, '([A-Za-z0-9_][A-Za-z0-9_./-]+\.[A-Za-z0-9]+)')) { $taskScopeFiles += $pm.Groups[1].Value }
+  foreach ($pm in [regex]::Matches($mFiles.Value, '`([A-Za-z0-9_][A-Za-z0-9_./-]+?)/\*?`')) { $taskScopeDirs += ($pm.Groups[1].Value.TrimEnd('/') + '/') }
+  $taskScopeFiles = @($taskScopeFiles | Select-Object -Unique)
+  $taskScopeDirs  = @($taskScopeDirs  | Select-Object -Unique)
+}
 
 # ВНИМАНИЕ: имена переменных в PowerShell НЕЧУВСТВИТЕЛЬНЫ К РЕГИСТРУ — $diffBase и $DiffBase
 # это одна переменная. Параметр забираем в отдельное имя ДО присваивания рабочей базы,
@@ -517,6 +529,33 @@ if ($emptyDiff) {
   }
   else {
     Log "diff ПУСТ и против HEAD, и против HEAD~1 — задача не изменила ни строки в своих файлах."
+  }
+}
+# --- Гейт объёма: изменённые файлы вне секции «Файлы» задачи. Считается против той же базы,
+# что и диф задачи (tracked) плюс неотслеживаемые файлы. Не считаются: сама задача,
+# вердикты, состояние обвязки, файлы из generatedFiles конфига. Пустая секция «Файлы»
+# гейт выключает: объём не объявлен, мерить не с чем (и об этом сказано выше).
+$scopeViolations = @()
+if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
+  $changedAll = @()
+  $changedAll += @(git diff --name-only $diffBase 2>$null | Where-Object { $_ -and $_.Trim() })
+  $changedAll += @(git ls-files --others --exclude-standard 2>$null | Where-Object { $_ -and $_.Trim() })
+  $changedAll = @($changedAll | ForEach-Object { $_.Trim().Replace('\', '/') } | Select-Object -Unique)
+  $generated = @()
+  if ($Cfg -and $Cfg.generatedFiles) { $generated = @($Cfg.generatedFiles | ForEach-Object { "$_".Replace('\', '/').TrimEnd('/') }) }
+  $ignoredPrefixes = @('.bcf/', 'tasks/.verdicts/', 'tasks/.claims/', 'tasks/.acceptance/', 'tasks/.bugs/', 'tasks/CURRENT-FOCUS.md', 'tasks/STATUS.json', 'node_modules/')
+  $taskRel = $tf.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+  foreach ($f in $changedAll) {
+    if ($f -eq $taskRel) { continue }
+    if ($taskScopeFiles -contains $f) { continue }
+    $skip = $false
+    foreach ($d in $taskScopeDirs) { if ($f.StartsWith($d)) { $skip = $true; break } }
+    if (-not $skip) { foreach ($d in $ignoredPrefixes) { if ($f.StartsWith($d)) { $skip = $true; break } } }
+    if (-not $skip) { foreach ($g in $generated) { if ($f -eq $g -or $f.StartsWith($g + '/')) { $skip = $true; break } } }
+    if (-not $skip) { $scopeViolations += $f }
+  }
+  if ($scopeViolations.Count -gt 0) {
+    Log "ОБЪЁМ: изменены файлы вне секции «Файлы» задачи ($($scopeViolations.Count)): $(($scopeViolations | Select-Object -First 12) -join ', ')$(if ($scopeViolations.Count -gt 12) { ' …' })"
   }
 }
 $diffLines = $diffFull -split "`n"
@@ -1199,6 +1238,11 @@ $gateFailures = @()
 # определению. Без этой строки задача, не сделавшая ничего, получает PASS «все гейты
 # зелёные» — и закрывается вместе со своей причиной существования.
 if ($emptyDiff) { $gateFailures += 'пустой diff: задача не изменила ни строки в своих файлах' }
+# ВТОРОЙ ГЕЙТ — «РАБОТА ТОЛЬКО В СВОИХ ФАЙЛАХ». Правка вне секции «Файлы» это не бонус, а
+# расползание объёма: она меняет то, что никто не просил, и ломает владение файлами у соседних
+# задач. Список файлов уходит в вердикт как ремедиация: откатить или расширить секцию через
+# постановщика.
+if ($scopeViolations.Count -gt 0) { $gateFailures += 'объём: правки вне секции «Файлы»: ' + (($scopeViolations | Select-Object -First 12) -join ', ') }
 if ($checksFailed) { $gateFailures += 'checks' }
 if ($missingTesters.Count) { $gateFailures += 'testers-missing:' + ($missingTesters -join '|') }
 if ($lintFailed)   { $gateFailures += 'lint:' + (($lintViolations | ForEach-Object { $_.rule }) -join '|') }
