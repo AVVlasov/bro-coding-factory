@@ -5,6 +5,7 @@
 #   bcf task why <ID>              почему эта задача не может пойти в работу
 #   bcf task show <ID>             файл задачи, вердикт, разведка — одним экраном
 #   bcf task accept <ID> --as <имя> [--lens <ракурс>] [--note "..."]   приёмка лидером
+#   bcf task split <ID> --for local  нарезать задачу на подзадачи под локальную модель
 #
 # ЗАЧЕМ. Создание задачи — САМОЕ ЧАСТОЕ ежедневное действие: очередь не берётся из
 # воздуха. Делать это руками значит каждый раз вспоминать формат имени, обязательные
@@ -403,9 +404,71 @@ switch ($sub) {
     exit 0
 }
 
+'split' {
+    # bcf task split <ID> --for local: планировщик (roles.planner, большая модель) режет задачу
+    # на подзадачи под слабую модель; файлы пишет фабрика (harness/lib/split.ps1), родитель
+    # выходит из очереди, зависимые задачи переводятся на последнюю подзадачу.
+    $id = ($rest | Select-Object -First 1)
+    if (-not $id) { Write-BcfFail 'нужен id: bcf task split TASK-06 --for local'; exit 2 }
+    $id = $id.ToUpper()
+    $profileName = if ($forWhom) { $forWhom } else { 'local' }
+    $t = @(Get-AllTasks | Where-Object { $_.Id -eq $id }) | Select-Object -First 1
+    if (-not $t) { Write-BcfFail "задача $id не найдена в $tasksRel/"; exit 2 }
+    if ($t.Pass) { Write-BcfFail "$id уже закрыта вердиктом PASS, резать нечего"; exit 2 }
+    if (-not $cfg) { Write-BcfFail 'config/harness.json не найден — bcf init'; exit 2 }
+    $role = 'planner'
+    if (-not ($cfg.graph -and $cfg.graph.roles -and $cfg.graph.roles.PSObject.Properties[$role] -and $cfg.graph.roles.$role.backend)) {
+        Write-BcfFail 'роль planner не назначена (config/harness.json → graph.roles.planner) — резать некому'
+        exit 2
+    }
+    $brief = Get-Content -Raw -LiteralPath $t.File.FullName
+    $prodPaths = @($cfg.productPaths) -join ', '
+    $prompt = @"
+Ты планировщик кодовой фабрики. Разрежь задачу на подзадачи, каждую из которых закроет
+СЛАБАЯ локальная модель с окном 32k токенов, делая один шаг за итерацию и не читая
+репозиторий шире названных файлов.
+
+ЗАДАЧА ${id}:
+$brief
+
+Продуктовый код проекта: $prodPaths
+
+Правила нарезки:
+1. Подзадача правит один-два файла (плюс один файл теста), у неё одна-две проверяемые
+   командой строки «Готовности» и одна команда проверки. Работы на 20–40 минут слабой модели.
+2. Порядок цепочкой: типы и контракт → чтение данных → вычисление → запись и команда.
+   Каждая следующая подзадача зависит от предыдущей ("input": ["prev"]).
+3. Файлы берутся ТОЛЬКО из секции «Файлы» задачи; ничего вне неё. Если задача требует
+   фикстуры, отдельная подзадача создаёт их первой.
+4. В summary подзадачи напиши ТОЧНО: какие функции и типы создать (имена, сигнатуры), где
+   читать входные данные, какой формат на выходе. Слабая модель не додумывает: чего нет
+   в summary, того не будет. Ссылайся на файл родителя за смыслом, но не заставляй его
+   искать по репозиторию.
+5. Команды проверки только те, что уже есть в секции «Проверки» родителя, или их
+   подмножество (тест одного файла).
+6. 3–7 подзадач. Не дроби ниже одного файла и не склеивай два модуля в одну.
+
+Ответ: ТОЛЬКО JSON-массив в блоке ```json, без текста вокруг. Элемент:
+{"title": "…", "summary": "…", "files": ["path/a.ts", "path/a.test.ts"],
+ "input": ["prev"], "readiness": ["…", "…"], "checks": ["npm run build", "node --test …"],
+ "requirement": "ПТ4"}
+"@
+    $graphPs1 = Join-Path (Get-BcfHarness) 'graph.ps1'
+    $argsJson = (@{ task = $id; role = $role; prompt = $prompt; profile = $profileName; prefix = $prefix; tasksRel = $tasksRel } | ConvertTo-Json -Depth 6 -Compress)
+    Write-BcfTitle "НАРЕЗКА  $id" "роль $role · бэкенд $($cfg.graph.roles.$role.backend) · подзадачи под профиль $profileName"
+    & pwsh -NoProfile -File $graphPs1 'split' -ArgsJson $argsJson -Yes -ProjectRoot $project
+    $code = $LASTEXITCODE
+    Write-Host ''
+    $subs = @(Get-ChildItem $tasksDir -Filter "$prefix-*.md" -File | Where-Object { (Select-String -Path $_.FullName -Pattern "^Родитель:\s*$([regex]::Escape($id))\s*$" -Quiet) })
+    if ($subs.Count -eq 0) { Write-BcfFail 'подзадачи не появились — смотри журнал: bcf board'; exit $(if ($code) { $code } else { 1 }) }
+    Write-BcfOk "подзадач: $($subs.Count) — $(($subs | ForEach-Object { ($_.BaseName -split '-')[0..1] -join '-' }) -join ', ')"
+    Write-BcfNote "проверить: bcf tasks   ·   запустить: bcf run night --profile $profileName"
+    exit 0
+}
+
 default {
     Write-BcfFail $(if ($sub) { "неизвестная подкоманда: $sub" } else { 'нужна подкоманда' })
-    Write-BcfNote 'доступно: new "<название>" [--for <имя>] | why <ID> | show <ID> | accept <ID> --as <имя>'
+    Write-BcfNote 'доступно: new "<название>" [--for <имя>] | why <ID> | show <ID> | accept <ID> --as <имя> | split <ID> --for local'
     exit 2
 }
 }

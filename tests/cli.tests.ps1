@@ -2046,6 +2046,66 @@ It 'loop.ps1 выбирает PROMPT.local.md по профилю local' {
     Assert-Match $r "'\^--profile\$'" 'bcf run не разбирает --profile'
 }
 
+# Нарезка под локальную модель: подзадачи получают верхнеуровневые номера (очередь берёт
+# только их), родитель уходит из очереди, зависимые задачи переводятся на последнюю
+# подзадачу. Без этого подзадача с точкой в номере никогда бы не поехала сама.
+It 'Write-BcfSubtasks пишет подзадачи, выводит родителя из очереди и переводит вход зависимых' {
+    . (Join-Path $root 'harness\lib\team-bus.ps1')
+    . (Join-Path $root 'harness\lib\split.ps1')
+    $p = New-Sandbox 'split'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'tasks'), (Join-Path $p 'config') | Out-Null
+    Set-Content -LiteralPath (Join-Path $p 'tasks\TASK-06-konvejer.md') -Encoding UTF8 -Value @"
+# TASK-06 — Конвейер
+
+Исполнитель: фабрика
+Класс: CORE
+Требование: ПТ16
+
+Текст.
+
+## Файлы
+
+- ``src/shop.ts``
+- ``test/shop.test.ts``
+
+## Вход
+
+- TASK-05
+
+## Готовность
+
+1. тест зелёный
+
+## Проверки
+
+``````
+npm test
+``````
+"@
+    Set-Content -LiteralPath (Join-Path $p 'tasks\TASK-25-ekran.md') -Encoding UTF8 -Value "# TASK-25 — Экран`n`n## Файлы`n`n- ``src/screen.ts```n`n## Вход`n`n- TASK-06, TASK-16`n"
+    Set-Content -LiteralPath (Join-Path $p 'config\checks.json') -Encoding UTF8 -Value '{ "_default": ["npm run build"], "TASK-06": ["npm test"] }'
+    $items = @(
+        [pscustomobject]@{ title = 'Типы поста'; summary = 'export interface Post'; files = @('src/shop.ts'); input = @('-'); readiness = @('npm run build зелёный'); checks = @('npm run build') },
+        [pscustomobject]@{ title = 'Разбор журнала'; summary = 'readGraphJournal'; files = @('src/shop.ts', 'test/shop.test.ts'); input = @('prev'); readiness = @('node --test test/shop.test.js зелёный'); checks = @('node --test test/shop.test.js') }
+    )
+    $res = Write-BcfSubtasks -Root $p -ParentId 'TASK-06' -Items $items
+    Assert-True ($res.Created.Count -eq 2) "создано $($res.Created.Count) подзадач"
+    Assert-True ($res.Created[0].Id -eq 'TASK-26' -and $res.Created[1].Id -eq 'TASK-27') "номера подзадач: $($res.Created.Id -join ', ')"
+    $f1 = Get-Content -Raw -LiteralPath $res.Created[0].Path
+    Assert-Match $f1 '(?m)^Родитель: TASK-06' 'нет строки Родитель'
+    Assert-Match $f1 '(?m)^- TASK-05' 'первая подзадача не унаследовала вход родителя'
+    $f2 = Get-Content -Raw -LiteralPath $res.Created[1].Path
+    Assert-Match $f2 '(?m)^- TASK-26' 'вторая подзадача не зависит от первой'
+    $parent = Get-Content -Raw -LiteralPath (Join-Path $p 'tasks\TASK-06-konvejer.md')
+    Assert-Match $parent '(?m)^Исполнитель: подзадачи TASK-26, TASK-27' 'родитель не выведен из очереди'
+    $dep = Get-Content -Raw -LiteralPath (Join-Path $p 'tasks\TASK-25-ekran.md')
+    Assert-Match $dep '(?m)^- TASK-27, TASK-16' 'вход зависимой задачи не переведён на последнюю подзадачу'
+    $checks = Get-Content -Raw -LiteralPath (Join-Path $p 'config\checks.json') | ConvertFrom-Json
+    Assert-True (@($checks.'TASK-27').Count -eq 1) 'проверки подзадачи не записаны в checks.json'
+    $r = Bcf @('tasks', '--project', $p)
+    Assert-Match $r.Out 'TASK-26' 'bcf tasks не видит подзадачу'
+}
+
 It 'models list без LM Studio показывает ярусы и не падает' {
     $p = New-Sandbox 'models-list'
     $env:BCF_LMSTUDIO_URL = 'http://127.0.0.1:9'
