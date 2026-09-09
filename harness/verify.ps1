@@ -1249,12 +1249,54 @@ if ($DryRun) {
   exit 0
 }
 
-Log "Запуск судьи $JudgeName (backend, model=$JudgeModel) ..."
+# Судья по ярусу задачи (lib/tiers.ps1): бэкенд claude зовётся напрямую с токеном из
+# пользовательского окружения; бэкенд meta значит внешний судья мета-слоя (модель, которой
+# нет в CLI), вердикт по гейтам, решение судьи дописывает мета-слой.
+. (Join-Path $PSScriptRoot 'lib\tiers.ps1')
+$judgeTierName = Get-BcfTaskTier -TaskFile $tf.FullName -Cfg $Cfg
+$judgeTier = if ($judgeTierName -and $Cfg) { Resolve-BcfTier -Cfg $Cfg -Tier $judgeTierName } else { $null }
+$judgeBackend = 'opencode'
+if ($judgeTier -and $judgeTier.Judge) {
+  $judgeBackend = [string]$judgeTier.Judge.Backend
+  if ($judgeTier.Judge.Model) { $JudgeModel = [string]$judgeTier.Judge.Model }
+  Log "Ярус «$judgeTierName»: судья $judgeBackend/$JudgeModel"
+}
+function Invoke-ClaudeJudge($promptText, $label) {
+  $pf = Join-Path $workDir "$Task-$label.prompt.txt"
+  $of = Join-Path $workDir "$Task-$label.out.txt"
+  $ef = Join-Path $workDir "$Task-$label.err.txt"
+  Set-Content -LiteralPath $pf -Value $promptText -Encoding UTF8
+  $inv = Get-BcfBackendInvocation -Cfg $Cfg -Backend 'claude'
+  $cmd = ($inv.Command -replace '--output-format\s+stream-json', '--output-format json') -replace '\{model\}', $JudgeModel
+  $cmd = $cmd -replace '--permission-mode\s+\S+', '--permission-mode plan'
+  $utf8Prefix = "[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;`$OutputEncoding=[Text.Encoding]::UTF8;"
+  $inner = "$utf8Prefix$($inv.EnvPrefix) Get-Content -Raw -LiteralPath '$pf' | & $cmd"
+  $proc = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $inner) `
+    -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $of -RedirectStandardError $ef
+  if (-not $proc.WaitForExit($StepTimeoutSec * 1000)) {
+    try { $proc.Kill($true) } catch { }
+    return "[${label}: TIMEOUT после ${StepTimeoutSec}s — отчёт неполный, считать недостаточным доказательством]"
+  }
+  $raw = if (Test-Path $of) { Get-Content -Raw -LiteralPath $of } else { '' }
+  try {
+    $j = $raw | ConvertFrom-Json -ErrorAction Stop
+    if ($j.is_error) { return "[${label}: ошибка бэкенда — $([string]$j.result)]" }
+    return [string]$j.result
+  } catch { return $raw }
+}
+Log "Запуск судьи $JudgeName (backend=$judgeBackend, model=$JudgeModel) ..."
 # Invoke-Opencode не принимает $JudgeModel параметром (он берёт $Model глобал),
 # поэтому временно подменяем $Model для этого вызова.
 $_savedModel = $Model
 $Model = $JudgeModel
-$judgeOut = Invoke-Opencode $judgePrompt $JudgeName
+if ($judgeBackend -eq 'meta') {
+  $judgeOut = "Verdict: **NEEDS-MORE-EVIDENCE**`n`nСудья этого яруса внешний: мета-слой (модель $JudgeModel, в CLI её нет). Вердикт ниже детерминированный, по гейтам; решение судьи дописывает мета-слой в tasks/.acceptance или в notes вердикта."
+  Log "Судья яруса внешний (meta/$JudgeModel): LLM-судья фабрики пропущен, вердикт по гейтам."
+} elseif ($judgeBackend -eq 'claude') {
+  $judgeOut = Invoke-ClaudeJudge $judgePrompt $JudgeName
+} else {
+  $judgeOut = Invoke-Opencode $judgePrompt $JudgeName
+}
 $Model = $_savedModel
 Log "Судья завершён."
 

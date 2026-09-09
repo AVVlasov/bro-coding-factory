@@ -2106,6 +2106,49 @@ npm test
     Assert-Match $r.Out 'TASK-26' 'bcf tasks не видит подзадачу'
 }
 
+# Ярусы задач: исполнитель и судья берутся по строке «Ярус:», бэкенд claude получает свой
+# токен из пользовательского окружения, бэкенд meta у судьи значит внешнего судью.
+It 'ярус задачи читается из шапки, роли и команда бэкенда собираются по конфигу' {
+    . (Join-Path $root 'harness\lib\tiers.ps1')
+    $p = New-Sandbox 'tiers'
+    Set-Content -LiteralPath (Join-Path $p 'TASK-07-x.md') -Encoding UTF8 -Value "# TASK-07 — X`n`nИсполнитель: фабрика`nЯрус: сложная`n`n## Файлы`n`n- ``src/a.rs```n`n## Вход`n`nЯрус: лёгкая`n"
+    Set-Content -LiteralPath (Join-Path $p 'TASK-08-y.md') -Encoding UTF8 -Value "# TASK-08 — Y`n`n## Файлы`n`n- ``src/b.rs```n"
+    $cfg = [pscustomobject]@{
+        tiers = [pscustomobject]@{
+            default = 'средняя'
+            'сложная' = [pscustomobject]@{ worker = [pscustomobject]@{ backend = 'claude'; model = 'opus' }; judge = [pscustomobject]@{ backend = 'meta'; model = 'fable' } }
+            'средняя' = [pscustomobject]@{ worker = [pscustomobject]@{ backend = 'claude'; model = 'sonnet' }; judge = [pscustomobject]@{ backend = 'claude'; model = 'opus' } }
+            'лёгкая'  = [pscustomobject]@{ worker = [pscustomobject]@{ backend = 'opencode'; model = 'lmstudio/qwen' }; judge = [pscustomobject]@{ backend = 'claude'; model = 'sonnet' }; profile = 'local' }
+        }
+        graph = [pscustomobject]@{ backends = [pscustomobject]@{ claude = [pscustomobject]@{ command = 'claude -p --output-format stream-json --model {model}'; format = 'claude'; env = @('BCF_TEST_TOKEN_X') } } }
+    }
+    Assert-True ((Get-BcfTaskTier -TaskFile (Join-Path $p 'TASK-07-x.md') -Cfg $cfg) -eq 'сложная') 'ярус из шапки не прочитан или взят из секции ниже'
+    Assert-True ((Get-BcfTaskTier -TaskFile (Join-Path $p 'TASK-08-y.md') -Cfg $cfg) -eq 'средняя') 'ярус по умолчанию не взят из конфига'
+    $t = Resolve-BcfTier -Cfg $cfg -Tier 'сложная'
+    Assert-True ($t.Worker.Model -eq 'opus' -and $t.Judge.Backend -eq 'meta') 'роли яруса «сложная» разобраны неверно'
+    Assert-True ((Resolve-BcfTier -Cfg $cfg -Tier 'лёгкая').Profile -eq 'local') 'профиль яруса не прочитан'
+    Assert-True ($null -eq (Resolve-BcfTier -Cfg $cfg -Tier 'нет-такого')) 'неизвестный ярус должен давать $null'
+    $env:BCF_TEST_TOKEN_X = 'секрет-1'
+    try {
+        $inv = Get-BcfBackendInvocation -Cfg $cfg -Backend 'claude'
+    } finally { Remove-Item Env:\BCF_TEST_TOKEN_X -ErrorAction SilentlyContinue }
+    Assert-True ($inv.Format -eq 'claude') 'формат бэкенда claude не распознан'
+    Assert-Match $inv.EnvPrefix "BCF_TEST_TOKEN_X='секрет-1'" 'переменная окружения бэкенда не попала в префикс'
+    Assert-True ((Get-BcfBackendInvocation -Cfg $cfg -Backend 'opencode').Format -eq 'opencode') 'opencode без записи в graph.backends должен получить команду по умолчанию'
+}
+
+It 'разбор потока claude даёт активность по tool_use и итог с токенами' {
+    . (Join-Path $root 'harness\lib\adapters\claude-render.ps1')
+    $ev = '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/a.ts"}}]}}' | ConvertFrom-Json
+    Assert-True ((Get-ClaudeActivity $ev) -eq 'Edit — src/a.ts') "активность tool_use: $(Get-ClaudeActivity $ev)"
+    $ev2 = '{"type":"assistant","message":{"content":[{"type":"text","text":"готово"}]}}' | ConvertFrom-Json
+    Assert-True ((Get-ClaudeActivity $ev2) -eq 'пишет ответ') 'активность text'
+    $out = & { Render-ClaudeLine '{"type":"result","is_error":false,"result":"ок","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":0},"total_cost_usd":0.01}' 6>&1 | Out-String }
+    Assert-Match $out 'токенов 115' "итог не посчитал кэш: $out"
+    $bad = & { Render-ClaudeLine 'не json' 6>&1 | Out-String }
+    Assert-True ([string]::IsNullOrWhiteSpace($bad)) 'не-JSON строка должна молча пропускаться'
+}
+
 It 'models list без LM Studio показывает ярусы и не падает' {
     $p = New-Sandbox 'models-list'
     $env:BCF_LMSTUDIO_URL = 'http://127.0.0.1:9'

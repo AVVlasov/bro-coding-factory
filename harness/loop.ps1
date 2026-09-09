@@ -100,6 +100,8 @@ Initialize-EventBus -RalphRoot (Get-BcfStateDir $root)
 
 # Рендер JSON-событий бэкенд-агента → live в loop-окно (адаптер бэкенда, default opencode).
 . (Join-Path $PSScriptRoot 'lib\adapters\oc-render.ps1')
+. (Join-Path $PSScriptRoot 'lib\adapters\claude-render.ps1')
+. (Join-Path $PSScriptRoot 'lib\tiers.ps1')
 
 # Memory bridge: vector-memory recall + retrospector + finding-gate.
 # Loop вызывает агента subprocess'ом → хуки IDE не срабатывают; мостик вшивает их явно.
@@ -625,11 +627,35 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
   # байт каждые 3 сек, парсит JSON-события сам и печатает в окно цветом.
   # Команда агента из шаблона config (agent.command). {model} → $Model; если модель пуста,
   # выкидываем '--model {model}' целиком (бэкенд берёт дефолт). Промпт ($p) — позиционным арг.
-  if ($Model) { $resolvedAgentCmd = $AgentCmdTpl -replace '\{model\}', $Model }
-  else        { $resolvedAgentCmd = (($AgentCmdTpl -replace '--model\s+\{model\}', '') -replace '\{model\}', '').Trim() -replace '\s{2,}', ' ' }
-  $runCmd      = "& $resolvedAgentCmd `$p"
+  # Ярус задачи (строка `Ярус:` в шапке, lib/tiers.ps1): исполнитель, его бэкенд и промпт
+  # берутся из config/harness.json → tiers; без яруса остаются agent.command и models.code.
+  $iterAgentTpl  = $AgentCmdTpl
+  $iterModel     = $Model
+  $iterFormat    = 'opencode'
+  $iterEnvPrefix = ''
+  $iterPrompt    = $promptFile
+  $tierName = if ($tf) { Get-BcfTaskTier -TaskFile $tf.FullName -Cfg $Cfg } else { '' }
+  $tierInfo = if ($tierName -and $Cfg) { Resolve-BcfTier -Cfg $Cfg -Tier $tierName } else { $null }
+  if ($tierInfo -and $tierInfo.Worker) {
+    $inv = Get-BcfBackendInvocation -Cfg $Cfg -Backend $tierInfo.Worker.Backend
+    if ($inv) {
+      $iterAgentTpl  = $inv.Command
+      $iterModel     = $tierInfo.Worker.Model
+      $iterFormat    = $inv.Format
+      $iterEnvPrefix = $inv.EnvPrefix
+    }
+    if ($tierInfo.Profile -eq 'local' -and -not (Test-Path (Join-Path $root '.bcf\PROMPT.md'))) { $iterPrompt = Join-Path $PSScriptRoot 'PROMPT.local.md' }
+    elseif ($tierInfo.Profile -and $tierInfo.Profile -ne 'local' -and -not (Test-Path (Join-Path $root '.bcf\PROMPT.md'))) { $iterPrompt = Join-Path $PSScriptRoot 'PROMPT.md' }
+    if ($i -eq 1) { Log "Ярус «$tierName»: исполнитель $($tierInfo.Worker.Backend)/$iterModel, формат $iterFormat, промпт $(Split-Path $iterPrompt -Leaf)" }
+  }
+  if ($iterModel) { $resolvedAgentCmd = $iterAgentTpl -replace '\{model\}', $iterModel }
+  else            { $resolvedAgentCmd = (($iterAgentTpl -replace '--model\s+\{model\}', '') -replace '\{model\}', '').Trim() -replace '\s{2,}', ' ' }
+  # claude -p читает промпт со stdin: позиционный аргумент упёрся бы в лимит командной
+  # строки Windows (~32 КБ) на промпте с STATE и ремедиацией.
+  $runCmd = if ($iterFormat -eq 'claude') { "`$p | $(if ($resolvedAgentCmd -match '^\s*&') { $resolvedAgentCmd } else { "& $resolvedAgentCmd" })" }
+            elseif ($resolvedAgentCmd -match '^\s*&') { "$resolvedAgentCmd `$p" } else { "& $resolvedAgentCmd `$p" }
   $utf8Prefix  = "[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;`$OutputEncoding=[Text.Encoding]::UTF8;"
-  $inner       = "$utf8Prefix `$p = Get-Content -Raw -LiteralPath '$promptFile'; $runCmd"
+  $inner       = "$utf8Prefix$iterEnvPrefix `$p = Get-Content -Raw -LiteralPath '$iterPrompt'; $runCmd"
   $ocOutFile   = Join-Path $root ".bcf\iter-$i.out.jsonl"
   $ocErrFile   = Join-Path $root ".bcf\iter-$i.err.log"
   Remove-Item $ocOutFile, $ocErrFile -ErrorAction SilentlyContinue
@@ -707,6 +733,16 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
             }
             foreach ($ln in $lines) {
               if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+              if ($iterFormat -eq 'claude') {
+                try {
+                  $cev = $ln | ConvertFrom-Json -ErrorAction Stop
+                  $act = Get-ClaudeActivity $cev
+                  if ($act) { $lastActivity = $act; $lastActivityTs = (Get-Date).ToUniversalTime() }
+                } catch { }
+                Render-ClaudeLine $ln -Color
+                $eventsRendered++
+                continue
+              }
               # Параллельно с рендером — вытаскиваем «что делает агент» для heartbeat'а.
               try {
                 $ev = $ln | ConvertFrom-Json -ErrorAction Stop
