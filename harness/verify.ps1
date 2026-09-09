@@ -569,6 +569,30 @@ if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
     $mbScope = (git merge-base HEAD $intBranchScope 2>$null | Out-String).Trim()
     if ($mbScope) { $scopeBase = $mbScope }
   }
+  # Объём берётся из версии файла задачи В БАЗЕ, а не из рабочей копии: агент, дописавший
+  # себе секцию «Файлы», иначе проходит гейт своим же текстом (2026-09-09, TASK-27: агент
+  # добавил в задачу фикстуры TASK-02 и создал их). Правка файла задачи это нарушение объёма.
+  $taskRelForScope = $tf.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+  $baseTaskBody = ''
+  try { $baseTaskBody = (git show "${scopeBase}:${taskRelForScope}" 2>$null | Out-String) } catch { $baseTaskBody = '' }
+  if ($baseTaskBody -and $baseTaskBody.Trim()) {
+    $mBase = [regex]::Match($baseTaskBody, '(?ms)^##[^\r\n]*Файлы.*?(?=^##\s|\z)')
+    if ($mBase.Success) {
+      $baseFiles = @(); $baseDirs = @()
+      foreach ($pm in [regex]::Matches($mBase.Value, '([A-Za-z0-9_][A-Za-z0-9_./-]+\.[A-Za-z0-9]+)')) { $baseFiles += $pm.Groups[1].Value }
+      foreach ($pm in [regex]::Matches($mBase.Value, '`([A-Za-z0-9_][A-Za-z0-9_./-]*[A-Za-z0-9_-])`')) { $baseFiles += $pm.Groups[1].Value }
+      foreach ($pm in [regex]::Matches($mBase.Value, '`([A-Za-z0-9_][A-Za-z0-9_./-]+?)/\*?`')) { $baseDirs += ($pm.Groups[1].Value.TrimEnd('/') + '/') }
+      $taskScopeFiles = @($baseFiles | Select-Object -Unique)
+      $taskScopeDirs  = @($baseDirs  | Select-Object -Unique)
+      Log "Объём задачи взят из базы $($scopeBase.Substring(0, [Math]::Min(8, $scopeBase.Length))): файлов $($taskScopeFiles.Count), каталогов $($taskScopeDirs.Count)."
+    }
+  }
+  $taskFileEdited = $false
+  if ($baseTaskBody -and $baseTaskBody.Trim()) {
+    $curNorm = ($taskBody -replace "`r`n", "`n").Trim()
+    $baseNorm = ($baseTaskBody -replace "`r`n", "`n").Trim()
+    $taskFileEdited = ($curNorm -ne $baseNorm)
+  }
   $changedAll = @()
   $changedAll += @(git diff --name-only $scopeBase 2>$null | Where-Object { $_ -and $_.Trim() })
   $changedAll += @(git ls-files --others --exclude-standard 2>$null | Where-Object { $_ -and $_.Trim() })
@@ -577,6 +601,7 @@ if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
   if ($Cfg -and $Cfg.generatedFiles) { $generated = @($Cfg.generatedFiles | ForEach-Object { "$_".Replace('\', '/').TrimEnd('/') }) }
   $ignoredPrefixes = @('.bcf/', 'tasks/.verdicts/', 'tasks/.claims/', 'tasks/.acceptance/', 'tasks/.bugs/', 'tasks/CURRENT-FOCUS.md', 'tasks/STATUS.json', 'node_modules/')
   $taskRel = $tf.FullName.Substring($root.Length).TrimStart('\', '/').Replace('\', '/')
+  if ($taskFileEdited) { $scopeViolations += "$taskRel (файл задачи переписан: объём задаёт постановщик, не агент)" }
   foreach ($f in $changedAll) {
     if ($f -eq $taskRel) { continue }
     if ($taskScopeFiles -contains $f) { continue }
