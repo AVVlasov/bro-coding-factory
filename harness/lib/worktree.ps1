@@ -63,6 +63,15 @@ function New-TaskWorktree {
         & git -C $Root worktree prune 2>&1 | Out-Null
     }
 
+    # Каталог без `.git` (остаток снятого прогона: node_modules, README, .bcf) тоже мешает:
+    # `git worktree add` в непустой каталог отказывает, и узел падает «worktree не создан».
+    # Живой случай 2026-09-09: TASK-07, TASK-16 и TASK-34 трижды за вечер.
+    if ((Test-Path -LiteralPath $path) -and -not (Test-Path (Join-Path $path '.git'))) {
+        Write-Host "  ⚠ каталог $path без .git остался от снятого прогона — убираю" -ForegroundColor Yellow
+        & git -C $Root worktree prune 2>&1 | Out-Null
+        try { & cmd /c "rmdir /s /q `"$path`"" 2>&1 | Out-Null } catch { }
+        Remove-Item -Recurse -Force -LiteralPath $path -ErrorAction SilentlyContinue
+    }
     $exists = (& git -C $Root branch --list $branch 2>$null | Out-String).Trim()
     if ($exists) {
         & git -C $Root worktree add $path $branch 2>&1 | Out-Null

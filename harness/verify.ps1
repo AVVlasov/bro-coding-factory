@@ -1289,6 +1289,7 @@ Log "Запуск судьи $JudgeName (backend=$judgeBackend, model=$JudgeMode
 # поэтому временно подменяем $Model для этого вызова.
 $_savedModel = $Model
 $Model = $JudgeModel
+$tierJudgeAccepts = ($judgeBackend -eq 'claude')
 if ($judgeBackend -eq 'meta') {
   $judgeOut = "Verdict: **NEEDS-MORE-EVIDENCE**`n`nСудья этого яруса внешний: мета-слой (модель $JudgeModel, в CLI её нет). Вердикт ниже детерминированный, по гейтам; решение судьи дописывает мета-слой в tasks/.acceptance или в notes вердикта."
   Log "Судья яруса внешний (meta/$JudgeModel): LLM-судья фабрики пропущен, вердикт по гейтам."
