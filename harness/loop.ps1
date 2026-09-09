@@ -1040,6 +1040,18 @@ $culprit
     $prodUntrackedArgs = @('-C', $root, 'ls-files', '--others', '--exclude-standard', '--') + $productPaths
     $prodUntracked = @((& git @prodUntrackedArgs 2>$null | Where-Object { $_ -and $_.Trim() }))
     if ($prodUntracked.Count -gt 0) { $prodChanges = @($prodChanges + $prodUntracked | Select-Object -Unique) }
+    # Файлы из секции «Файлы» задачи считаются продуктовыми, даже если лежат вне productPaths:
+    # задача на фикстуры тестов (2026-09-09, TASK-27) создала шесть файлов, детектор их не
+    # видел, verify пропускался «код не менялся», и задача не могла получить вердикт.
+    try {
+      if (-not (Get-Command Get-TaskDeclaredFiles -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lib\claims.ps1') }
+      $declared = @(Get-TaskDeclaredFiles -TaskId $focus -Root $root | Where-Object { $_ })
+      if ($declared.Count -gt 0 -and $preIterTreeRef) {
+        $declChanged = @(& git -C $root diff --name-only $preIterTreeRef -- $declared 2>$null | Where-Object { $_ -and $_.Trim() })
+        $declChanged += @(& git -C $root ls-files --others --exclude-standard -- $declared 2>$null | Where-Object { $_ -and $_.Trim() })
+        if ($declChanged.Count -gt 0) { $prodChanges = @($prodChanges + $declChanged | Select-Object -Unique) }
+      }
+    } catch { }
     if ((-not $forceRerun) -and $preIterTreeRef -and $prevIsNotPass) {
       if (-not $prodChanges -or $prodChanges.Count -eq 0) {
         $skipVerify = $true

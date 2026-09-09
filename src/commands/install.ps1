@@ -215,7 +215,10 @@ if (-not $only -or $only -eq 'project') {
 # Каталог заявок (`tasks/.claims/`) не игнорируется по той же причине: заявка, которой
 # не видно у соседа, не заявка.
 $giPath = Join-Path $project '.gitignore'
-$giAdd = @('.bcf/', 'tasks/.bugs/', 'tasks/CURRENT-FOCUS.md')
+# Шаблоны с якорем в корень: `.bcf/` без косой черты в начале прячет и каталоги фикстур
+# вида packages/core/test/fixtures/repo/.bcf/, а с ними тестовые данные проекта
+# (2026-09-09, TASK-27: агент правил .gitignore, чтобы фикстуры попали в git).
+$giAdd = @('/.bcf/', '/tasks/.bugs/', '/tasks/CURRENT-FOCUS.md')
 $gi = if (Test-Path $giPath) { @(Get-Content -LiteralPath $giPath) } else { @() }
 
 # Установка поверх проекта, где вердикты уже спрятаны прежней версией: строку надо снять,
