@@ -593,6 +593,13 @@ if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
     $baseNorm = ($baseTaskBody -replace "`r`n", "`n").Trim()
     $taskFileEdited = ($curNorm -ne $baseNorm)
   }
+  # Цикл передаёт дерево на своём старте (BCF_SCOPE_BASE): ветка задачи к тому моменту уже
+  # вобрала main и ветки входов, их файлы это не правки задачи. Точка расхождения с main
+  # остаётся запасной базой, когда цикл ничего не передал.
+  if ($env:BCF_SCOPE_BASE) {
+    git rev-parse --verify --quiet "$($env:BCF_SCOPE_BASE)^{commit}" *> $null
+    if ($LASTEXITCODE -eq 0) { $scopeBase = $env:BCF_SCOPE_BASE; Log "База объёма: дерево на старте цикла $($scopeBase.Substring(0, 8))." }
+  }
   $changedAll = @()
   $changedAll += @(git diff --name-only $scopeBase 2>$null | Where-Object { $_ -and $_.Trim() })
   $changedAll += @(git ls-files --others --exclude-standard 2>$null | Where-Object { $_ -and $_.Trim() })

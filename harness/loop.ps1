@@ -434,6 +434,14 @@ Get-ChildItem env: | Where-Object { $_.Name -like 'OPENCODE_*' } | ForEach-Objec
 if ($ocEnvCleared.Count -gt 0) { Log "Очищены унаследованные env-переменные: $($ocEnvCleared -join ', ')" }
 
 Log "=== Ralph loop старт. Task=$(if($Task){$Task}else{'(из CURRENT-FOCUS)'}) Model=$(if($Model){$Model}else{'(дефолт бэкенда)'}) Max=$MaxIterations Timeout=${IterTimeoutSec}s NoProgress=$NoProgressLimit ==="
+# База объёма для verify: дерево на старте цикла. Ветка задачи к этому моменту уже вобрала
+# main и ветки входов (цепочка подзадач), и их файлы не должны считаться правками задачи.
+# Живой случай 2026-09-10: TASK-35 в worktree поверх ветки TASK-34 получила семь «нарушений
+# объёма» из фикстур TASK-34, которых в main ещё не было.
+try {
+  $loopStartRef = (& git -C $root rev-parse HEAD 2>$null | Out-String).Trim()
+  if ($loopStartRef) { $env:BCF_SCOPE_BASE = $loopStartRef; Log "База объёма для verify: $($loopStartRef.Substring(0, 8)) (дерево на старте цикла)" }
+} catch { }
 Log "Профиль: $(if ($profile) { $profile } else { 'полный' }); промпт: $promptFile ($((Get-Item -LiteralPath $promptFile).Length) байт)"
 Append-Event -EventType 'loop-started' -TaskId $Task -Phase 'loop' `
   -Payload @{ max_iterations = $MaxIterations; iter_timeout_sec = $IterTimeoutSec; no_progress_limit = $NoProgressLimit; model = $Model; session_id = (Get-EventBusSession) }
