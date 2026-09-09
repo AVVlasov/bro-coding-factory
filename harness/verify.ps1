@@ -427,7 +427,25 @@ if ($mFiles.Success) {
     $p = $pm.Groups[1].Value
     if (Test-Path (Join-Path $root $p)) { $taskFiles += $p }
   }
+  # Пути без расширения (заявки tasks/.claims/TASK-01, каталоги фикстур) видны только в
+  # обратных кавычках: без них первый разбор их не ловил, и файл из секции «Файлы»
+  # попадал в нарушения объёма (2026-09-09, TASK-27).
+  foreach ($pm in [regex]::Matches($mFiles.Value, '`([A-Za-z0-9_][A-Za-z0-9_./-]*[A-Za-z0-9_-])`')) {
+    $p = $pm.Groups[1].Value
+    if ($p -match '\*$') { continue }
+    if ((Test-Path (Join-Path $root $p) -PathType Leaf) -and $taskFiles -notcontains $p) { $taskFiles += $p }
+  }
   $taskFiles = @($taskFiles | Select-Object -Unique)
+}
+# Новые файлы задачи ещё не в индексе: `git diff HEAD` их не видит, и задача, создавшая
+# только новые файлы, получала «пустой diff» и FAIL (2026-09-09, TASK-27: шесть файлов
+# фикстур). Intent-to-add показывает их дифу, ничего не коммитя.
+if ($taskFiles.Count -gt 0) {
+  $untrackedTask = @(git ls-files --others --exclude-standard -- $taskFiles 2>$null | Where-Object { $_ -and $_.Trim() })
+  if ($untrackedTask.Count -gt 0) {
+    git add -N -- $untrackedTask 2>$null | Out-Null
+    Log "Новых файлов задачи вне индекса: $($untrackedTask.Count) — добавлены как intent-to-add для дифа."
+  }
 }
 # Объём задачи для гейта «правки только в своих файлах»: все пути из секции «Файлы», включая
 # ещё не созданные (помечены «(новый)»), и каталоги, записанные как `dir/` или `dir/*`.
@@ -437,6 +455,7 @@ $taskScopeFiles = @()
 $taskScopeDirs  = @()
 if ($mFiles.Success) {
   foreach ($pm in [regex]::Matches($mFiles.Value, '([A-Za-z0-9_][A-Za-z0-9_./-]+\.[A-Za-z0-9]+)')) { $taskScopeFiles += $pm.Groups[1].Value }
+  foreach ($pm in [regex]::Matches($mFiles.Value, '`([A-Za-z0-9_][A-Za-z0-9_./-]*[A-Za-z0-9_-])`')) { $taskScopeFiles += $pm.Groups[1].Value }
   foreach ($pm in [regex]::Matches($mFiles.Value, '`([A-Za-z0-9_][A-Za-z0-9_./-]+?)/\*?`')) { $taskScopeDirs += ($pm.Groups[1].Value.TrimEnd('/') + '/') }
   $taskScopeFiles = @($taskScopeFiles | Select-Object -Unique)
   $taskScopeDirs  = @($taskScopeDirs  | Select-Object -Unique)
