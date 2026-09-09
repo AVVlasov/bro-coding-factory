@@ -36,6 +36,7 @@ $COMMANDS = [ordered]@{
     'report'   = @{ file = 'report.ps1';   help = 'итог прогона одним экраном | --export <yyyy-MM> — отчёт за месяц' }
     'cost'     = @{ file = 'cost.ps1';     help = 'расход: токены → деньги, подписки против API' }
     'memory'   = @{ file = 'memory.ps1';   help = 'векторная память: init | status | ask | stats' }
+    'models'   = @{ file = 'models.ps1';   help = 'ярусы моделей и лимиты: list | sync → opencode.json проекта' }
     'research' = @{ file = 'research.ps1'; help = 'разведка задачи до работы — только чтение' }
     'prd'      = @{ file = 'prd.ps1';      help = 'опрос по продукту → docs/PRD.md' }
     'meta'     = @{ file = 'meta.ps1';     help = 'мета-слой: реестр проектов, аудит, вики, шаблоны' }

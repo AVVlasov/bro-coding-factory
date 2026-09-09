@@ -1,0 +1,69 @@
+{
+  "$comment": "Ярусы моделей и их лимиты. Читает bcf models: sync пишет лимиты в opencode.json проекта, чтобы opencode знал окно каждой известной модели и сжимал историю до переполнения; doctor печатает ярус и лимиты каждой роли. Ключ это идентификатор модели без провайдера (как его отдаёт API провайдера). tier: local (на этой машине, зажата железом), free (бесплатный тариф, лимит запросов), paid (за токены), subscription (подписка, тариф по сессиям). local.context это рекомендуемое окно при загрузке (lms load --context-length) с учётом VRAM, local.parallel сколько слотов. Значения limit это то, что объявляется opencode; для local контекст объявляется по загруженному окну (sync читает его из LM Studio), здесь стоит верхняя граница модели.",
+  "updated": "2026-09-09",
+  "models": {
+    "qwen/qwen3.8-27b": {
+      "tier": "local",
+      "limit": { "context": 262144, "output": 32768 },
+      "reasoning": true,
+      "local": { "context": 98304, "parallel": 1, "vramGb": 22.7, "note": "128k занимает 23,9 из 24,4 ГБ VRAM на RTX 5090 и гоняет память через PCIe; 96k оставляет запас" },
+      "roles": ["worker-local", "retrospector"]
+    },
+    "google/gemma-4-26b-a4b": {
+      "tier": "local",
+      "limit": { "context": 131072, "output": 16384 },
+      "reasoning": false,
+      "local": { "context": 65536, "parallel": 1 },
+      "roles": ["retrospector"]
+    },
+    "text-embedding-bge-m3": {
+      "tier": "local",
+      "embedding": true,
+      "limit": { "context": 8192, "output": 0 },
+      "local": { "context": 8192, "parallel": 1 },
+      "roles": ["embeddings"]
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b:free": {
+      "tier": "free",
+      "limit": { "context": 1000000, "output": 65536 },
+      "reasoning": true,
+      "note": "Проба 2026-09-09: чистый код за 10 с, но на роли исполнителя молчит по 60-120 с на ответ, итерации упираются в лимит",
+      "roles": ["critic", "planner-free"]
+    },
+    "nex-agi/nex-n2.5-pro:free": {
+      "tier": "free",
+      "limit": { "context": 262144, "output": 235929 },
+      "reasoning": false,
+      "note": "Проба 2026-09-09: 7 с на ответ, откат импортов в 20 файлах за 4 итерации",
+      "roles": ["worker", "small_model"]
+    },
+    "minimax/minimax-m3": {
+      "tier": "paid",
+      "limit": { "context": 1048576, "output": 512000 },
+      "reasoning": true,
+      "note": "Лимиты из openrouter.ai/api/v1/models 2026-09-09. Бесплатный слаг :free OpenRouter закрыл 2026-09-08",
+      "roles": ["worker"]
+    },
+    "openai/gpt-5.5": {
+      "tier": "paid",
+      "limit": { "context": 1050000, "output": 128000 },
+      "reasoning": true,
+      "note": "Лимиты из openrouter.ai/api/v1/models 2026-09-09",
+      "roles": ["critic"]
+    },
+    "opus": {
+      "tier": "subscription",
+      "limit": null,
+      "reasoning": true,
+      "note": "Бэкенд claude: окно задаёт сам CLI, в opencode.json не пишется",
+      "roles": ["planner", "arbiter"]
+    },
+    "sonnet": {
+      "tier": "subscription",
+      "limit": null,
+      "reasoning": true,
+      "note": "Бэкенд claude: окно задаёт сам CLI, в opencode.json не пишется",
+      "roles": ["worker", "critic"]
+    }
+  }
+}

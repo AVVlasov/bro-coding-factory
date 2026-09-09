@@ -1989,6 +1989,53 @@ It 'без обёртки mvnw.cmd быстрая проверка предла�
     Assert-NoMatch $tc 'mvnw' 'предложена обёртка, которой в проекте нет'
 }
 
+# --- Ярусы моделей ---------------------------------------------------------------------
+Write-Host '  модели' -ForegroundColor White
+
+# Класс дефекта: opencode без объявленного окна не сжимает историю, и локальная модель
+# получает «context size, try increasing it» (LM Studio 2026-09-09). sync обязан писать
+# limit для каждой модели LM Studio, брать окно из загрузки, а reasoning из яруса.
+It 'models sync пишет opencode.json с лимитами моделей LM Studio и ролей' {
+    $p = New-Sandbox 'models-sync'
+    New-Item -ItemType Directory -Force -Path (Join-Path $p 'config') | Out-Null
+    $harness = @{
+        graph = @{ roles = @{ worker = @{ backend = 'opencode'; model = 'lmstudio/qwen/qwen3.8-27b' }; critic = @{ backend = 'opencode'; model = 'openrouter/nex-agi/nex-n2.5-pro:free' } } }
+        models = @{ code = 'lmstudio/qwen/qwen3.8-27b' }
+    } | ConvertTo-Json -Depth 6
+    Set-Content -LiteralPath (Join-Path $p 'config\harness.json') -Value $harness -Encoding UTF8
+    $list = @{ data = @(
+        @{ id = 'qwen/qwen3.8-27b'; state = 'loaded'; loaded_context_length = 98304; max_context_length = 131072; type = 'llm' },
+        @{ id = 'text-embedding-bge-m3'; state = 'loaded'; type = 'embeddings' },
+        @{ id = 'some/unknown-7b'; state = 'not-loaded'; max_context_length = 32768; type = 'llm' }
+    ) } | ConvertTo-Json -Depth 5
+    $lf = Join-Path $p 'lms.json'
+    Set-Content -LiteralPath $lf -Value $list -Encoding UTF8
+    $r = Bcf @('models', 'sync', '--project', $p, '--from-file', $lf)
+    Assert-True ($r.Code -eq 0) "код возврата $($r.Code): $($r.Out)"
+    $oc = Get-Content -Raw -LiteralPath (Join-Path $p 'opencode.json') | ConvertFrom-Json
+    $q = $oc.provider.lmstudio.models.'qwen/qwen3.8-27b'
+    Assert-True ($q.limit.context -eq 98304) "окно qwen взято не из загрузки: $($q.limit.context)"
+    Assert-True ($q.limit.output -eq 32768) "вывод qwen не из яруса: $($q.limit.output)"
+    Assert-True ($q.reasoning -eq $true) 'reasoning qwen не объявлен'
+    Assert-True ($q.interleaved.field -eq 'reasoning_content') 'поле reasoning_content не объявлено'
+    Assert-True ($null -eq $oc.provider.lmstudio.models.'text-embedding-bge-m3') 'эмбеддинги попали в список чат-моделей'
+    $u = $oc.provider.lmstudio.models.'some/unknown-7b'
+    Assert-True ($u.limit.context -eq 32768) "неизвестная модель без окна из max_context_length: $($u.limit.context)"
+    $n = $oc.provider.openrouter.models.'nex-agi/nex-n2.5-pro:free'
+    Assert-True ($n.limit.context -eq 262144) "лимит модели роли с OpenRouter не записан: $($n.limit.context)"
+}
+
+It 'models list без LM Studio показывает ярусы и не падает' {
+    $p = New-Sandbox 'models-list'
+    $env:BCF_LMSTUDIO_URL = 'http://127.0.0.1:9'
+    try {
+        $r = Bcf @('models', 'list', '--project', $p)
+    } finally { Remove-Item Env:\BCF_LMSTUDIO_URL -ErrorAction SilentlyContinue }
+    Assert-True ($r.Code -eq 0) "код возврата $($r.Code)"
+    Assert-Match $r.Out 'qwen/qwen3.8-27b' 'ярус local не показан'
+    Assert-Match $r.Out 'LM Studio не отвечает' 'отсутствие LM Studio не названо'
+}
+
 # --- Итог ----------------------------------------------------------------------------
 Write-Host ''
 if ($script:fail) {
