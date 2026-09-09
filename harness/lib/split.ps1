@@ -105,6 +105,7 @@ function Write-BcfSubtasks {
 Класс: $cls
 Требование: $reqLine
 $(if ($epic) { "Эпик: $epic`n" })Родитель: $ParentId
+Ярус: $(if ($Profile -eq 'local') { 'лёгкая' } else { 'средняя' })
 
 $([string]$it.summary)
 
