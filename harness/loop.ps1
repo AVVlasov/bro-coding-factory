@@ -333,13 +333,11 @@ function Notify-Stop($kind, $title, $detail) {
     "- Если verdict PASS — посмотри tasks/.verdicts/, сделай ревью, затем harness/start.ps1 для следующей задачи.`n" +
     "- Если застряло — разберись с причиной, поправь, перезапусти harness/start.ps1.")
   try { [console]::beep(880, 250); Start-Sleep -Milliseconds 120; [console]::beep(660, 300) } catch { }
-  try {
-    Add-Type -AssemblyName System.Windows.Forms
-    $icon = if ($kind -eq 'ok') { 'Information' } else { 'Warning' }
-    [System.Windows.Forms.MessageBox]::Show(
-      "$detail`n`nПодробности — .bcf/REVIEW.md, .bcf/loop.log, .bcf/state/STATE.json",
-      "Ralph loop: $title", 'OK', $icon) | Out-Null
-  } catch { }
+  # Модального окна здесь больше нет (2026-09-09). Оно держало процесс цикла до нажатия OK:
+  # цепочка задач стояла по 27–47 минут после PASS, пока человек не заметил окно, а сам
+  # человек просил окнами его не дёргать. Сигнал остаётся в .bcf/REVIEW.md, в журнале и в
+  # коде возврата; run-all убрал своё окно ещё раньше по той же причине.
+  Log "[стоп] $title — подробности в .bcf/REVIEW.md"
 }
 
 # --- M-13/J (2026-05-27): three-level scope (iter / task / release) ---
