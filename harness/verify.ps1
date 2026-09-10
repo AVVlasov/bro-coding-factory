@@ -58,6 +58,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot 'lib\bcf-context.ps1')
+. (Join-Path $PSScriptRoot 'lib\tiers.ps1')
 $root = Get-BcfProjectRoot -Explicit $ProjectRoot
 Set-Location $root
 
@@ -851,12 +852,40 @@ $impactMode = ($planRegression -ne 'release')
 # Фаза C, и вердикт обязан это учитывать, иначе PASS выдаётся за проверку, которой не было.
 $missingTesters = @()
 
+# Запуск роли через CLI claude (бэкенд claude из graph.backends): промпт со stdin, ответ
+# одним JSON. Режим plan: тестер и судья только читают дерево. Общий для тестеров с
+# моделью «claude/<модель>» в config/agents.json и для судьи яруса.
+function Invoke-ClaudeRun($promptText, $label, $model) {
+  $pf = Join-Path $workDir "$Task-$label.prompt.txt"
+  $of = Join-Path $workDir "$Task-$label.out.txt"
+  $ef = Join-Path $workDir "$Task-$label.err.txt"
+  Set-Content -LiteralPath $pf -Value $promptText -Encoding UTF8
+  $inv = Get-BcfBackendInvocation -Cfg $Cfg -Backend 'claude'
+  $cmd = ($inv.Command -replace '--output-format\s+stream-json', '--output-format json') -replace '\{model\}', $model
+  $cmd = $cmd -replace '--permission-mode\s+\S+', '--permission-mode plan'
+  $utf8Prefix = "[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;`$OutputEncoding=[Text.Encoding]::UTF8;"
+  $inner = "$utf8Prefix$($inv.EnvPrefix) Get-Content -Raw -LiteralPath '$pf' | & $cmd"
+  $proc = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $inner) `
+    -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $of -RedirectStandardError $ef
+  if (-not $proc.WaitForExit($StepTimeoutSec * 1000)) {
+    try { $proc.Kill($true) } catch { }
+    return "[${label}: TIMEOUT после ${StepTimeoutSec}s — отчёт неполный, считать недостаточным доказательством]"
+  }
+  $raw = if (Test-Path $of) { Get-Content -Raw -LiteralPath $of } else { '' }
+  try {
+    $j = $raw | ConvertFrom-Json -ErrorAction Stop
+    if ($j.is_error) { return "[${label}: ошибка бэкенда — $([string]$j.result)]" }
+    return [string]$j.result
+  } catch { return $raw }
+}
+
 foreach ($t in $testers) {
   # Путь берём из config/agents.json (testers[].file), а собираем сами только если там
   # его нет. Схема объявляет это поле, и игнорировать его — значит требовать, чтобы
   # роли лежали ровно там, где угадывает код: переименовал файл в конфиге, а тестер
   # молча пропал.
   $agentFile = ''
+  $entry = $null
   if ($AgentsCfg -and $AgentsCfg.testers) {
     $entry = @($AgentsCfg.testers | Where-Object { $_.name -eq $t -and $_.file }) | Select-Object -First 1
     if ($entry) { $agentFile = Join-Path $root ([string]$entry.file -replace '/', [IO.Path]::DirectorySeparatorChar) }
@@ -920,8 +949,22 @@ $diffFull
     $reports[$t] = "[DryRun — тестер $t не запускался]"
   }
   else {
-    Log "Запуск тестера $t ..."
-    $reports[$t] = Invoke-Opencode $prompt $t
+    # Модель тестера из config/agents.json (testers[].model): «claude/<модель>» идёт через
+    # CLI claude, любая другая непустая — через opencode вместо общей модели тестеров.
+    # Владелец 2026-09-10: «пусть тестирует api sonnet, освободи qwen».
+    $testerModel = if ($entry -and $entry.model) { [string]$entry.model } else { '' }
+    if ($testerModel -match '^claude/(.+)$') {
+      Log "Запуск тестера $t (claude/$($Matches[1])) ..."
+      $reports[$t] = Invoke-ClaudeRun $prompt $t $Matches[1]
+    } elseif ($testerModel) {
+      Log "Запуск тестера $t ($testerModel) ..."
+      $_savedTesterModel = $Model; $Model = $testerModel
+      $reports[$t] = Invoke-Opencode $prompt $t
+      $Model = $_savedTesterModel
+    } else {
+      Log "Запуск тестера $t ..."
+      $reports[$t] = Invoke-Opencode $prompt $t
+    }
     Log "Тестер $t завершён."
   }
 }
@@ -1296,7 +1339,6 @@ if ($DryRun) {
 # Судья по ярусу задачи (lib/tiers.ps1): бэкенд claude зовётся напрямую с токеном из
 # пользовательского окружения; бэкенд meta значит внешний судья мета-слоя (модель, которой
 # нет в CLI), вердикт по гейтам, решение судьи дописывает мета-слой.
-. (Join-Path $PSScriptRoot 'lib\tiers.ps1')
 $judgeTierName = Get-BcfTaskTier -TaskFile $tf.FullName -Cfg $Cfg
 $judgeTier = if ($judgeTierName -and $Cfg) { Resolve-BcfTier -Cfg $Cfg -Tier $judgeTierName } else { $null }
 $judgeBackend = 'opencode'
@@ -1305,29 +1347,7 @@ if ($judgeTier -and $judgeTier.Judge) {
   if ($judgeTier.Judge.Model) { $JudgeModel = [string]$judgeTier.Judge.Model }
   Log "Ярус «$judgeTierName»: судья $judgeBackend/$JudgeModel"
 }
-function Invoke-ClaudeJudge($promptText, $label) {
-  $pf = Join-Path $workDir "$Task-$label.prompt.txt"
-  $of = Join-Path $workDir "$Task-$label.out.txt"
-  $ef = Join-Path $workDir "$Task-$label.err.txt"
-  Set-Content -LiteralPath $pf -Value $promptText -Encoding UTF8
-  $inv = Get-BcfBackendInvocation -Cfg $Cfg -Backend 'claude'
-  $cmd = ($inv.Command -replace '--output-format\s+stream-json', '--output-format json') -replace '\{model\}', $JudgeModel
-  $cmd = $cmd -replace '--permission-mode\s+\S+', '--permission-mode plan'
-  $utf8Prefix = "[Console]::InputEncoding=[Text.Encoding]::UTF8;[Console]::OutputEncoding=[Text.Encoding]::UTF8;`$OutputEncoding=[Text.Encoding]::UTF8;"
-  $inner = "$utf8Prefix$($inv.EnvPrefix) Get-Content -Raw -LiteralPath '$pf' | & $cmd"
-  $proc = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $inner) `
-    -WorkingDirectory $root -NoNewWindow -PassThru -RedirectStandardOutput $of -RedirectStandardError $ef
-  if (-not $proc.WaitForExit($StepTimeoutSec * 1000)) {
-    try { $proc.Kill($true) } catch { }
-    return "[${label}: TIMEOUT после ${StepTimeoutSec}s — отчёт неполный, считать недостаточным доказательством]"
-  }
-  $raw = if (Test-Path $of) { Get-Content -Raw -LiteralPath $of } else { '' }
-  try {
-    $j = $raw | ConvertFrom-Json -ErrorAction Stop
-    if ($j.is_error) { return "[${label}: ошибка бэкенда — $([string]$j.result)]" }
-    return [string]$j.result
-  } catch { return $raw }
-}
+function Invoke-ClaudeJudge($promptText, $label) { return (Invoke-ClaudeRun $promptText $label $JudgeModel) }
 Log "Запуск судьи $JudgeName (backend=$judgeBackend, model=$JudgeModel) ..."
 # Invoke-Opencode не принимает $JudgeModel параметром (он берёт $Model глобал),
 # поэтому временно подменяем $Model для этого вызова.

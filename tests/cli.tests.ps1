@@ -658,6 +658,22 @@ It 'гейт объёма учитывает файлы прошлых комм�
     Assert-Match $m.Value 'git diff --name-only \$mbScope -- ' 'файл, возвращённый к main, всё равно считается правкой'
 }
 
+# --- Тестер со своей моделью -------------------------------------------------------------
+#
+# config/agents.json объявляет testers[].model, но verify гонял всех тестеров одной моделью
+# из models.tester. Владелец 2026-09-10: «пусть тестирует api sonnet, освободи qwen».
+# «claude/<модель>» идёт через CLI claude в режиме plan, иная модель — через opencode.
+
+It 'тестер с моделью claude/<модель> идёт через CLI claude, остальные через opencode' {
+    $v = Get-Content -Raw (Join-Path $root 'harness\verify.ps1')
+    Assert-Match $v 'function Invoke-ClaudeRun\(\$promptText, \$label, \$model\)' 'нет общего запуска роли через claude'
+    Assert-Match $v "testerModel -match '\^claude/\(\.\+\)\$'" 'модель тестера вида claude/… не распознаётся'
+    Assert-Match $v 'Invoke-ClaudeRun \$prompt \$t \$Matches\[1\]' 'тестер claude не запускается через Invoke-ClaudeRun'
+    Assert-Match $v '\$_savedTesterModel = \$Model; \$Model = \$testerModel' 'иная модель тестера не подменяет модель opencode'
+    $ti = $v.IndexOf("lib\tiers.ps1"); $tr = $v.IndexOf('function Invoke-ClaudeRun')
+    Assert-True ($ti -gt 0 -and $ti -lt $tr) 'tiers.ps1 подключается после запуска тестеров — Get-BcfBackendInvocation недостижим'
+}
+
 # --- Находки приёмки входят в вердикт прогона ---------------------------------------------
 #
 # Гейты задач детерминированы и ловят своё; критики ловят то, чего гейт не видит. Пока их
