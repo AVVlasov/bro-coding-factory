@@ -1105,7 +1105,16 @@ $culprit
         if ($declChanged.Count -gt 0) { $prodChanges = @($prodChanges + $declChanged | Select-Object -Unique) }
       }
     } catch { }
-    if ((-not $forceRerun) -and $preIterTreeRef -and $prevIsNotPass) {
+    # Прошлый FAIL по объёму лечится правкой ВНЕ продуктовых путей (вернуть чужой файл к
+    # main), и детектор «код не менялся» её не видит: 2026-09-10 TASK-16 сняла лишний
+    # .gitignore, verify пропускался три итерации подряд, цикл умирал по «нет прогресса».
+    # Любая правка в дереве при таком вердикте это повод перепроверить.
+    $prevScopeFail = $false
+    if ($hasPrev -and $pTxt -match 'объём: правки вне секции') {
+      $anyChange = @(& git -C $root status --porcelain 2>$null | Where-Object { $_ -and $_.Trim() })
+      if ($anyChange.Count -gt 0) { $prevScopeFail = $true; Log "Прошлый вердикт: FAIL по объёму, в дереве есть правки — verify не пропускается." }
+    }
+    if ((-not $forceRerun) -and $preIterTreeRef -and $prevIsNotPass -and -not $prevScopeFail) {
       if (-not $prodChanges -or $prodChanges.Count -eq 0) {
         $skipVerify = $true
         Log "verify пропущен (product-code-unchanged + есть prev !PASS verdict): итерация не правила продуктовый код (src/, electron/, backend/ — tracked+untracked) относительно pre-iter snapshot $($preIterTreeRef.Substring(0,[Math]::Min(8,$preIterTreeRef.Length)))."
