@@ -616,6 +616,33 @@ It 'коллизии владения считаются без закрытых
     Assert-Match $m.Value '-not \$_\.Pass -and -not \$_\.Files\.Count' 'закрытая задача без объявленных файлов тянет ревизию плана'
 }
 
+# --- Общий файл не запирает очередь -----------------------------------------------------
+#
+# 2026-09-10, eye-of-god: packages/core/src/index.ts (точка входа пакета, только строки
+# экспорта) стоял в объёме семи задач, и планировщик пускал их по одной за волну при
+# потолке в 21 поток. Файл, куда задачи только добавляют строки, объявляется общим в
+# config/harness.json → ownership.shared: пересечением владения он не считается, а
+# расхождение строк при слиянии сводит арбитр.
+
+It 'общий файл владения не считается коллизией' {
+    . (Join-Path $root 'harness\lib\bcf-context.ps1')
+    $cfg = [pscustomobject]@{ ownership = [pscustomobject]@{ shared = @('packages/core/src/index.ts') } }
+    $shared = @(Get-BcfSharedFiles -Config $cfg)
+    Assert-True ($shared.Count -eq 1) 'общий файл из конфига не прочитан'
+    Assert-True (Test-BcfSharedFile -File 'packages\core\src\index.ts' -Shared $shared) 'путь с обратной косой не узнан как общий'
+    Assert-True (-not (Test-BcfSharedFile -File 'packages/core/src/shop.ts' -Shared $shared)) 'обычный файл принят за общий'
+    Assert-True (@(Get-BcfSharedFiles -Config $null).Count -eq 0) 'без конфига список общих файлов не пуст'
+
+    $g = Get-Content -Raw (Join-Path $root 'harness\graphs\queue.graph.ps1')
+    $m = [regex]::Match($g, '(?s)\$owner = @\{\}.*?\$undeclared = @\([^\r\n]*')
+    Assert-Match $m.Value 'Test-BcfSharedFile' 'граф очереди считает общий файл коллизией владения'
+    Assert-Match $g 'Общие файлы, куда задачи только добавляют строки' 'планировщик не знает про общие файлы и разведёт задачи по волнам'
+    $ts = Get-Content -Raw (Join-Path $root 'src\commands\tasks.ps1')
+    Assert-Match $ts 'Test-BcfSharedFile' 'bcf tasks показывает коллизию по общему файлу'
+    $tw = Get-Content -Raw (Join-Path $root 'src\commands\task.ps1')
+    Assert-Match $tw 'Test-BcfSharedFile' 'bcf task why показывает коллизию по общему файлу'
+}
+
 # --- Находки приёмки входят в вердикт прогона ---------------------------------------------
 #
 # Гейты задач детерминированы и ловят своё; критики ловят то, чего гейт не видит. Пока их

@@ -22,6 +22,7 @@
 # приёмки не продвигаются в integration.branch — см. Test-BcfTaskAcceptanceGate в
 # harness/lib/claims.ps1 и её вызов из Merge-TaskWorktree.
 
+. (Join-Path (Get-BcfHarness) 'lib\bcf-context.ps1')
 . (Join-Path (Get-BcfHarness) 'lib\claims.ps1')
 . (Join-Path (Get-BcfHarness) 'lib\team-bus.ps1')
 
@@ -301,7 +302,8 @@ switch ($sub) {
         # Коллизия — то, из-за чего задача поедет, но дорого и рискованно.
         foreach ($o in $all) {
             if ($o.Id -eq $t.Id -or $o.Pass) { continue }
-            $common = @($o.Files | Where-Object { $t.Files -contains $_ })
+            $sharedFiles = @(Get-BcfSharedFiles -Config $cfg)
+            $common = @($o.Files | Where-Object { $t.Files -contains $_ -and -not (Test-BcfSharedFile -File $_ -Shared $sharedFiles) })
             if (-not $common.Count) { continue }
             if (($t.Preds -contains $o.Id) -or ($o.Preds -contains $t.Id)) { continue }
             Write-BcfWarn "коллизия владения с $($o.Id): $($common -join ', ')"

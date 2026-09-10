@@ -152,9 +152,13 @@ foreach ($t in ($tasks | Sort-Object Num)) {
 # за собой ревизию плана на каждом прогоне.
 $owner = @{}
 $collisions = @()
+# Общие файлы (ownership.shared в config/harness.json): задачи только добавляют в них
+# строки, расхождение сводит арбитр при слиянии — пересечением владения это не считается.
+$sharedFiles = @(Get-BcfSharedFiles -Config $cfg)
 foreach ($t in $tasks) {
     if ($t.Pass) { continue }
     foreach ($fl in $t.Files) {
+        if (Test-BcfSharedFile -File $fl -Shared $sharedFiles) { continue }
         if ($owner.ContainsKey($fl)) { $collisions += "$fl — $($owner[$fl]) и $($t.Id)" }
         else { $owner[$fl] = $t.Id }
     }
@@ -172,6 +176,7 @@ $($tasks | ForEach-Object { "  $($_.Id): предшественники [$($_.Pr
 Обнаружено:
 - Пересечения владения файлами: $(if ($collisions.Count) { $collisions -join '; ' } else { 'нет' })
 - Задачи без объявленных файлов (их нельзя допустить к параллели, владение неизвестно): $(if ($undeclared.Count) { $undeclared -join ', ' } else { 'нет' })
+- Общие файлы, куда задачи только добавляют строки (пересечением НЕ считать, слияние сводит арбитр): $(if ($sharedFiles.Count) { $sharedFiles -join ', ' } else { 'нет' })
 
 Верни решение: какие задачи ОБЯЗАНЫ идти строго последовательно и почему.
 Учитывай смысл файлов, а не только совпадение имён.

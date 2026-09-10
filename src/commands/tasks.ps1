@@ -14,6 +14,7 @@ $asJson = $script:BcfArgs -contains '--json'
 # и у мастера. Своя копия здесь читала ДРУГОЕ поле, и на реальном проекте это дало
 # одиннадцать задач «готова» при пяти заблокированных плюс совет «запустить готовые».
 . (Join-Path $BcfRoot 'src\lib\queue.ps1')
+. (Join-Path (Get-BcfHarness) 'lib\bcf-context.ps1')
 
 $q = Get-BcfQueue -Project $project
 $prefix = $q.Prefix
@@ -109,10 +110,12 @@ if ($human.Count) {
 # одном файле без предшествования планировщик пустит в одну волну, и арбитр будет сводить
 # два независимых переписывания: ярус слияния дороже и рискованнее прогона по очереди.
 $owners = @{}
+$sharedFiles = @(Get-BcfSharedFiles -Config $(try { Get-BcfHarnessConfig -Project $project } catch { $null }))
 foreach ($t in $items) {
     if ($t.Pass) { continue }
     foreach ($f in $t.Files) {
         $k = ($f -replace '\\', '/').ToLower()
+        if (Test-BcfSharedFile -File $k -Shared $sharedFiles) { continue }
         if (-not $owners.ContainsKey($k)) { $owners[$k] = @() }
         $owners[$k] += $t
     }

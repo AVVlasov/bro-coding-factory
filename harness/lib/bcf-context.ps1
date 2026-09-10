@@ -236,3 +236,20 @@ function Get-BcfBash {
     }
     return ''
 }
+
+# Общие файлы владения (config/harness.json → ownership.shared). Файл, в который каждая
+# задача только ДОБАВЛЯЕТ строки (точка входа пакета со строками экспорта), не должен
+# запирать семь задач в очередь по одной: пересечение по нему не считается коллизией,
+# а расхождение строк при слиянии сводит арбитр. Замер 2026-09-10 (eye-of-god):
+# packages/core/src/index.ts стоял в объёме семи задач, планировщик пускал их по одной
+# за волну при потолке в 21 поток.
+function Get-BcfSharedFiles {
+    param($Config)
+    if (-not $Config -or -not $Config.ownership -or -not $Config.ownership.shared) { return @() }
+    return @($Config.ownership.shared | ForEach-Object { ([string]$_ -replace '\\', '/').Trim().ToLower() } | Where-Object { $_ })
+}
+function Test-BcfSharedFile {
+    param([string]$File, [string[]]$Shared)
+    if (-not $Shared -or -not $Shared.Count) { return $false }
+    return ($Shared -contains (($File -replace '\\', '/').Trim().ToLower()))
+}
