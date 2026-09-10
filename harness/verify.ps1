@@ -615,6 +615,23 @@ if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
   $changedAll = @()
   $changedAll += @(git diff --name-only $scopeBase 2>$null | Where-Object { $_ -and $_.Trim() })
   $changedAll += @(git ls-files --others --exclude-standard 2>$null | Where-Object { $_ -and $_.Trim() })
+  # Прошлые циклы той же ветки. База «дерево на старте цикла» не видит файлы, которые агент
+  # добавил в предыдущем прогоне: 2026-09-10 TASK-07 прошла гейт с package.json пакета и
+  # сквозным тестом вне объёма, их нашёл только судья яруса. Собственные коммиты ветки
+  # опознаются по трейлеру Task: (коммиты входов несут чужой номер, слияния файлов не дают).
+  if ($mbScope) {
+    $ownCommits = @(git log --format=%H "--grep=^Task: $Task`$" "$mbScope..HEAD" 2>$null | Where-Object { $_ -and $_.Trim() })
+    $ownFiles = @()
+    foreach ($oc in $ownCommits) {
+      $ownFiles += @(git diff-tree --no-commit-id --name-only -r $oc.Trim() 2>$null | Where-Object { $_ -and $_.Trim() })
+    }
+    # Файл, который агент добавил и в следующей итерации вернул к main, правкой не считается.
+    foreach ($of in @($ownFiles | Select-Object -Unique)) {
+      $still = @(git diff --name-only $mbScope -- $of.Trim() 2>$null | Where-Object { $_ -and $_.Trim() })
+      if ($still.Count) { $changedAll += $of }
+    }
+    if ($ownCommits.Count) { Log "Объём: учтены файлы $($ownCommits.Count) прошлых коммитов ветки с трейлером Task: $Task." }
+  }
   $changedAll = @($changedAll | ForEach-Object { $_.Trim().Replace('\', '/') } | Select-Object -Unique)
   $generated = @()
   if ($Cfg -and $Cfg.generatedFiles) { $generated = @($Cfg.generatedFiles | ForEach-Object { "$_".Replace('\', '/').TrimEnd('/') }) }
