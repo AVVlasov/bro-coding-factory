@@ -196,6 +196,28 @@ if ($sub -eq 'sync') {
     return
 }
 
+if ($sub -eq 'free') {
+    . (Join-Path $BcfRoot 'src\lib\openrouter.ps1')
+    $rows = Get-BcfOpenRouterFree -FromFile $fromFile
+    if ($null -eq $rows) { Write-BcfFail 'OpenRouter не ответил за 10 с — список бесплатных моделей недоступен'; exit 3 }
+    $cands = Get-BcfFreeCandidates -Rows $rows
+    if ($asJson) { @{ free = $rows; candidates = $cands } | ConvertTo-Json -Depth 5; return }
+    Write-Host ''
+    Write-BcfTitle 'БЕСПЛАТНЫЕ МОДЕЛИ OPENROUTER' "всего $($rows.Count); база сравнения qwen 3.8 27b, окно 98304"
+    foreach ($r in $rows) {
+        $sz = if ($r.ParamsB) { "$($r.ParamsB)B$(if ($r.ActiveB) { " (активных $($r.ActiveB)B)" })" } else { 'размер не в имени' }
+        Write-BcfLine ("    {0,-52} {1,-28} окно {2,-8} {3}" -f $r.Id, $sz, $r.Context, $r.Created) 'Gray'
+    }
+    Write-Host ''
+    if ($cands.Count) {
+        Write-BcfOk "кандидаты в воркеры (параметров больше 27B, окно не меньше 98304): $(@($cands | ForEach-Object { $_.Id }) -join ', ')"
+        Write-BcfNote 'размер это не качество: перед сменой воркера прогнать кандидата на одной лёгкой задаче и сравнить итерации до PASS'
+    } else {
+        Write-BcfDim 'кандидатов сильнее локального воркера по размеру нет'
+    }
+    return
+}
+
 Write-BcfFail "неизвестная подкоманда: $sub"
-Write-BcfNote 'доступно: list | sync [--from-file <json>] [--json]'
+Write-BcfNote 'доступно: list | sync [--from-file <json>] | free [--from-file <json>] [--json]'
 exit 2

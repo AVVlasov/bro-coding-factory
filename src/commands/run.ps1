@@ -284,6 +284,19 @@ switch ($mode) {
         # отдельным процессом, простоял 2 ч 20 мин на этом вопросе — ни строки в журнале,
         # ни одного агента, ни одной ошибки. Молчаливое ожидание неотличимо от работы.
         $a += '-Yes'
+        # Акции бесплатных моделей OpenRouter на каждом запуске (владелец 2026-09-10):
+        # одна строка с кандидатами сильнее локального воркера, сеть недоступна — молчим.
+        if (-not $dryPlan) {
+            try {
+                . (Join-Path $BcfRoot 'src\lib\openrouter.ps1')
+                $freeRows = Get-BcfOpenRouterFree -TimeoutSec 8
+                if ($null -ne $freeRows) {
+                    $freeCands = @(Get-BcfFreeCandidates -Rows $freeRows)
+                    if ($freeCands.Count) { Write-BcfNote "бесплатные модели OpenRouter крупнее локального воркера: $(@($freeCands | ForEach-Object { $_.Id }) -join ', ') — подробнее: bcf models free" }
+                    else { Write-BcfDim "бесплатных моделей OpenRouter крупнее локального воркера нет (всего бесплатных $($freeRows.Count))" }
+                }
+            } catch { }
+        }
         if ($budget -gt 0)     { $a += @('-Budget', $budget) }
         if ($conc -gt 0)       { $a += @('-Concurrency', $conc) }
         if ($resume)           { $a += @('-ResumeFromRunId', $resume) }

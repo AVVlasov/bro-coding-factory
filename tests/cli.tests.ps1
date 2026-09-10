@@ -674,6 +674,34 @@ It 'тестер с моделью claude/<модель> идёт через CLI
     Assert-True ($ti -gt 0 -and $ti -lt $tr) 'tiers.ps1 подключается после запуска тестеров — Get-BcfBackendInvocation недостижим'
 }
 
+# --- Бесплатные модели OpenRouter против локального воркера --------------------------------
+#
+# Владелец 2026-09-10: «openrouter опциональный, при каждом запуске нужно чекать акции на
+# бесплатные модели, если там есть что то достойнее qwen 3.8 27b то подключай ее как worker».
+# Размер читается из имени модели, кандидат это больше 27B и окно не меньше 98304.
+
+It 'bcf models free называет бесплатные модели крупнее локального воркера' {
+    . (Join-Path $root 'src\lib\openrouter.ps1')
+    $p = Get-BcfModelParamsB 'nvidia/nemotron-3-super-120b-a12b:free'
+    Assert-True ($p.Total -eq 120 -and $p.Active -eq 12) 'размер MoE из имени не прочитан'
+    Assert-True ((Get-BcfModelParamsB 'google/gemma-4-31b-it:free').Total -eq 31) 'размер плотной модели из имени не прочитан'
+    $fx = Join-Path $sandboxRoot 'or-free.json'
+    @{ data = @(
+        @{ id = 'nvidia/nemotron-3-super-120b-a12b:free'; name = 'Super'; context_length = 262144; created = 1773200000 },
+        @{ id = 'google/gemma-4-31b-it:free'; name = 'Gemma'; context_length = 262144; created = 1775000000 },
+        @{ id = 'liquid/lfm-2.5-2.6b:free'; name = 'LFM'; context_length = 65536; created = 1786000000 },
+        @{ id = 'openai/gpt-5.5'; name = 'paid'; context_length = 400000; created = 1786000000 }
+    ) } | ConvertTo-Json -Depth 4 | Set-Content $fx -Encoding UTF8
+    $rows = @(Get-BcfOpenRouterFree -FromFile $fx)
+    Assert-True ($rows.Count -eq 3) 'платная модель попала в список бесплатных или бесплатная потерялась'
+    $c = @(Get-BcfFreeCandidates -Rows $rows)
+    Assert-True (@($c | ForEach-Object { $_.Id }) -join ',' -eq 'nvidia/nemotron-3-super-120b-a12b:free,google/gemma-4-31b-it:free') "кандидаты не те: $(@($c | ForEach-Object { $_.Id }) -join ',')"
+    $out = & pwsh -NoProfile -File (Join-Path $root 'bin\bcf.ps1') models free --from-file $fx --json 2>&1 | Out-String
+    Assert-Match $out 'nemotron-3-super' 'bcf models free --json не отдал кандидата'
+    $r = Get-Content -Raw (Join-Path $root 'src\commands\run.ps1')
+    Assert-Match $r 'Get-BcfFreeCandidates' 'bcf run queue не проверяет бесплатные модели на старте'
+}
+
 # --- Находки приёмки входят в вердикт прогона ---------------------------------------------
 #
 # Гейты задач детерминированы и ловят своё; критики ловят то, чего гейт не видит. Пока их
