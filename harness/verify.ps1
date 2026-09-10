@@ -298,6 +298,18 @@ function Reap-Orphans {
     $isMine = $false
     foreach ($a in $ancestors) { if ($myRoots -contains $a) { $isMine = $true; break } }
     if ($isMine) { continue }
+    # Параллельные ярусы (2026-09-10): verify одной задачи убивал тестеров и сценарии
+    # verify ДРУГОЙ задачи, потому что «не мой потомок» читалось как «сирота». Сирота —
+    # это процесс, у которого в предках нет живой обвязки. Пока над процессом жив
+    # loop.ps1, verify.ps1, граф или bcf, он чей-то, и трогать его нельзя.
+    $owned = $false
+    foreach ($a in $ancestors) {
+      if ($a -le 4) { continue }
+      $ap = $all | Where-Object { [int]$_.ProcessId -eq $a } | Select-Object -First 1
+      if (-not $ap) { continue }
+      if ([string]$ap.CommandLine -match '(?i)loop\.ps1|verify\.ps1|graph\.ps1|\.graph\.ps1|bcf\.ps1|(^|\s)bcf\s+run') { $owned = $true; break }
+    }
+    if ($owned) { continue }
     try {
       Stop-Process -Id ([int]$p.ProcessId) -Force -ErrorAction Stop
       $reaped += [PSCustomObject]@{ Kind = $kind; Name = $p.Name; ProcessId = [int]$p.ProcessId; AgeMin = [math]::Round($ageMin, 1) }
