@@ -645,6 +645,14 @@ if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
     foreach ($d in $taskScopeDirs) { if ($f.StartsWith($d)) { $skip = $true; break } }
     if (-not $skip) { foreach ($d in $ignoredPrefixes) { if ($f.StartsWith($d)) { $skip = $true; break } } }
     if (-not $skip) { foreach ($g in $generated) { if ($f -eq $g -or $f.StartsWith($g + '/')) { $skip = $true; break } } }
+    # Файл, совпадающий с веткой интеграции, правкой задачи не является: агент вернул чужой
+    # файл к main (2026-09-10, TASK-16 и .gitignore), а база «дерево на старте цикла» видит
+    # в этом откате изменение.
+    if (-not $skip -and $mbScope) {
+      $vsMain = @(git diff --name-only $mbScope -- $f 2>$null | Where-Object { $_ -and $_.Trim() })
+      $untracked = @(git ls-files --others --exclude-standard -- $f 2>$null | Where-Object { $_ -and $_.Trim() })
+      if ($vsMain.Count -eq 0 -and $untracked.Count -eq 0) { $skip = $true }
+    }
     if (-not $skip) { $scopeViolations += $f }
   }
   if ($scopeViolations.Count -gt 0) {
