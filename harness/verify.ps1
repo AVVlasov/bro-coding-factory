@@ -1494,6 +1494,7 @@ testers:
 $testerLines
 notes: |
   Вердикт ДЕТЕРМИНИРОВАННЫЙ: $verdict — функция гейтов (checks/lint/contract-gate/journeys).
+  $(if ($gateFailures.Count) { "Провалены гейты: " + (($gateFailures | ForEach-Object { [string]$_ }) -join '; ') } else { 'Провалов гейтов нет.' })
   $(if ($journeyState -eq 'not-configured') {
     'ГРАНИЦА ЭТОГО ВЕРДИКТА: сквозные сценарии продукта не заведены (config/journeys.json).
   PASS означает «гейты задачи зелёные», а НЕ «продуктом можно пользоваться». Проверено
