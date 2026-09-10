@@ -650,7 +650,10 @@ if ($taskScopeFiles.Count -gt 0 -or $taskScopeDirs.Count -gt 0) {
     # файл к main (2026-09-10, TASK-16 и .gitignore), а база «дерево на старте цикла» видит
     # в этом откате изменение.
     if (-not $skip -and $mbScope) {
-      $vsMain = @(git diff --name-only $mbScope -- $f 2>$null | Where-Object { $_ -and $_.Trim() })
+      # Сравниваем с вершиной ветки интеграции, а не с точкой расхождения: конфиг, который
+      # владелец поменял в main после старта ветки и скопировал в рабочее дерево, иначе
+      # выглядит правкой задачи (2026-09-10, вывод qwen из тестеров на живых циклах).
+      $vsMain = @(git diff --name-only $intBranchScope -- $f 2>$null | Where-Object { $_ -and $_.Trim() })
       $untracked = @(git ls-files --others --exclude-standard -- $f 2>$null | Where-Object { $_ -and $_.Trim() })
       if ($vsMain.Count -eq 0 -and $untracked.Count -eq 0) { $skip = $true }
     }
