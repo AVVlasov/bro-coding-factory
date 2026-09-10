@@ -258,9 +258,30 @@ while ($true) {
         foreach ($g in $ser) {
             $inWave = @($ready | Where-Object { @($g.tasks) -contains $_.Id })
             if ($inWave.Count -gt 1) {
-                $keep = $inWave[0].Id
-                $ready = @($ready | Where-Object { $_.Id -eq $keep -or @($g.tasks) -notcontains $_.Id })
-                Write-GraphLog "волна $($wave + 1): из группы [$($g.tasks -join ' ')] пускаю только $keep"
+                # Группа планировщика читается по файлам, а не буквально. Планировщик
+                # 2026-09-10 вернул цепочку «TASK-16 → TASK-17 … TASK-26» с пояснением, что
+                # экраны между собой разведены и идут одной волной, а буквальное чтение
+                # пускало по одному экрану за волну. Внутри группы держим порядок только
+                # между задачами, у которых есть общий файл (общие файлы владения не в счёт);
+                # задача без пересечений с остальными членами волны идёт вместе с ними.
+                $kept = @()
+                foreach ($cand in $inWave) {
+                    $candFiles = @($cand.Files | Where-Object { -not (Test-BcfSharedFile -File $_ -Shared $sharedFiles) })
+                    $clash = $false
+                    foreach ($k in $kept) {
+                        foreach ($fl in $candFiles) { if (@($k.Files) -contains $fl) { $clash = $true; break } }
+                        if ($clash) { break }
+                    }
+                    if (-not $clash) { $kept += $cand }
+                }
+                $keepIds = @($kept | ForEach-Object { $_.Id })
+                $dropped = @($inWave | Where-Object { $keepIds -notcontains $_.Id } | ForEach-Object { $_.Id })
+                $ready = @($ready | Where-Object { $keepIds -contains $_.Id -or @($g.tasks) -notcontains $_.Id })
+                if ($dropped.Count) {
+                    Write-GraphLog "волна $($wave + 1): из группы [$($g.tasks -join ' ')] пускаю $($keepIds -join ', '); ждут общего файла: $($dropped -join ', ')"
+                } else {
+                    Write-GraphLog "волна $($wave + 1): группа [$($g.tasks -join ' ')] без общих файлов между готовыми — идут вместе: $($keepIds -join ', ')"
+                }
             }
         }
     }
